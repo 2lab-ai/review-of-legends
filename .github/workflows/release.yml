@@ -54,15 +54,19 @@ jobs:
           python-version: '3.13'
       - name: Validate the tag
         id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tag="$GITHUB_REF_NAME"
           if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
             echo "::error::$tag is not vMAJOR.MINOR.PATCH"; exit 1
           fi
-          git fetch --quiet origin main
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::$tag must point at a commit on main"; exit 1
+          # Through the API, not git: the checkout keeps no credentials.
+          # main is "ahead" of (or "identical" to) a commit it contains.
+          status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...main" --jq .status)
+          if [[ "$status" != ahead && "$status" != identical ]]; then
+            echo "::error::$tag must point at a commit on main (main is $status relative to it)"; exit 1
           fi
           echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
       - name: Build archive and formula
