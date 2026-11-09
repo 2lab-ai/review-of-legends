@@ -3992,7 +3992,7 @@ class RepositorySettingsTest(AppTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.config_path.write_text(json.dumps({
-            "repositories": ["acme-corp/Gamma", "2lab-ai/review-of-legends"],
+            "repositories": ["acme-corp/Gamma", "acme-corp/review-of-legends"],
             "repository_agents": {"acme-corp/Gamma": {"arch": True}},
             "agents": [
                 {"id": "a", "prompt_path": "../agents/a.md"},
@@ -4042,7 +4042,7 @@ class RepositorySettingsTest(AppTestCase):
         payload = response.json()
         self.assertEqual(payload["repositories"], [
             {"repo": "acme-corp/Gamma", "source": "config", "agents": ["a", "b", "c", "arch"], "added_by": None, "added_at": None, "problem": None},
-            {"repo": "2lab-ai/review-of-legends", "source": "config", "agents": ["a", "b", "c"], "added_by": None, "added_at": None, "problem": None},
+            {"repo": "acme-corp/review-of-legends", "source": "config", "agents": ["a", "b", "c"], "added_by": None, "added_at": None, "problem": None},
             {"repo": "acme-corp/MiniMoon", "source": "dashboard", "agents": ["a", "b", "c"],
              "added_by": ADMIN_EMAIL, "added_at": "2026-10-13T00:00:00+00:00", "problem": None},
         ])
@@ -4055,7 +4055,7 @@ class RepositorySettingsTest(AppTestCase):
         self.viewer_login(bare)
         bare_payload = bare.get("/api/settings/repositories").json()
         self.assertEqual([row["repo"] for row in bare_payload["repositories"]],
-                         ["acme-corp/Gamma", "2lab-ai/review-of-legends"])
+                         ["acme-corp/Gamma", "acme-corp/review-of-legends"])
         self.assertIn("dashboard store is unavailable", bare_payload["error"])
 
     def test_viewer_and_anonymous_cannot_add_or_remove(self) -> None:
@@ -4222,8 +4222,8 @@ class RepositorySettingsTest(AppTestCase):
     def test_a_repository_too_few_agents_would_review_is_refused_and_marked(self) -> None:
         # Every config repository switches the opt-in c on; an added one would get a and b only.
         self.config_path.write_text(json.dumps({
-            "repositories": ["acme-corp/Gamma", "2lab-ai/review-of-legends"],
-            "repository_agents": {"acme-corp/Gamma": {"c": True}, "2lab-ai/review-of-legends": {"c": True}},
+            "repositories": ["acme-corp/Gamma", "acme-corp/review-of-legends"],
+            "repository_agents": {"acme-corp/Gamma": {"c": True}, "acme-corp/review-of-legends": {"c": True}},
             "agents": [{"id": "a", "prompt_path": "../agents/a.md"}, {"id": "b", "prompt_path": "../agents/b.md"},
                        {"id": "c", "opt_in": True, "prompt_path": "../agents/c.md"}],
             "gh_bin": "gh",

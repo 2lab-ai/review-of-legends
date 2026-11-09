@@ -59,7 +59,7 @@ class RepositoryNameTest(unittest.TestCase):
 
 class MergeRepositoriesTest(unittest.TestCase):
     CONFIG = {
-        "repositories": ["acme-corp/Gamma", "2lab-ai/review-of-legends"],
+        "repositories": ["acme-corp/Gamma", "acme-corp/review-of-legends"],
         "agents": [{"id": "a"}, {"id": "b"}, {"id": "c"}],
     }
 
@@ -70,7 +70,7 @@ class MergeRepositoriesTest(unittest.TestCase):
             [(row["repo"], row["source"]) for row in rows],
             [
                 ("acme-corp/Gamma", "config"),
-                ("2lab-ai/review-of-legends", "config"),
+                ("acme-corp/review-of-legends", "config"),
                 ("acme-corp/MiniMoon", "dashboard"),
                 ("acme-corp/PlutoBo", "dashboard"),
             ],
