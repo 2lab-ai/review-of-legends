@@ -1,0 +1,9 @@
+{
+  "name": "rol-dashboard",
+  "private": true,
+  "type": "module",
+  "description": "Static operator console for the Review of Legends review service. No build step and no runtime dependencies: the browser loads these files directly. This manifest exists only so `node --test` treats the .js modules as ES modules; it is NOT a served asset.",
+  "scripts": {
+    "test": "node --test 'test-*.mjs'"
+  }
+}

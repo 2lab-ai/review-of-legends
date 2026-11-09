@@ -1,0 +1,156 @@
+{
+  "repositories": [
+    "example/project"
+  ],
+  "_repository_agents_comment": "opt_in agents run only where a repository switches them on here; a default agent can be switched off per repository the same way",
+  "repository_agents": {},
+  "_scheduler_comment": "The daemon re-reads this file and lists every repository's open PRs every watch_interval_seconds (conditional requests: an unchanged list costs no rate limit; below 300 calls left it lists every poll_interval_seconds instead). A PR's first review starts as soon as it is seen unless max_concurrent_reviews reviews (operator retries included) already run, the hard safety cap; updates of reviewed PRs run at most max_concurrent_update_reviews at a time. Each review runs up to max_parallel_agents agents, so up to max_concurrent_reviews x max_parallel_agents llmux calls can run at once. Drafts are reviewed once marked ready, unless review_drafts is true.",
+  "watch_interval_seconds": 20,
+  "max_concurrent_reviews": 8,
+  "max_concurrent_update_reviews": 2,
+  "review_drafts": false,
+  "_reviewed_status_comment": "reviewed_status: set the review-of-legends/reviewed/<base branch> commit status on every repository's PR heads, only ever success: once a review has been posted on the PR (any head), and on each later push at once. A run that posts nothing sets nothing. Require review-of-legends/reviewed/<branch> in each repository's ruleset; backend repositories also require review-of-legends/required/<branch>. false turns it off.",
+  "reviewed_status": true,
+  "_finding_lifecycle_comment": "merge_same_line: findings on one path:line share one inline comment (the worst priority leads, every agent's finding listed). skip_open_duplicates: a finding is not posted again on a line where the bot's earlier thread is still open and current (threads given for the reviewed head and base only; a renamed file by its current name), unless the new one is of a higher priority; the review body lists it under \"Not posted again: the line has an open earlier thread\". A P2/P3 an agent raises is not posted inline either when a person (the PR author, or an owner, member, collaborator or contributor; not another GitHub App) answered that agent's earlier thread in the same file and the thread is on the same line (and resolved) or, when its comment is that agent's alone and its latest answer does not start by saying it was fixed (\uc218\uc815\ud588, \ucd94\uac00\ud588, \u2026; fixed, added, done, \u2026), has a title that shares with the new one at least two words and at least half of the shorter title's words (an identifier or backticked span is one word; without prefixes, one-letter tokens, small words and the agents' template words such as add, missing, test, remove, helper; a title under another of simplify's remedy tags (delete:, stdlib:, native:, reuse:, yagni:, shrink:) never matches, other lenses such as db: and net: compare by words; resolved or not, outdated or not); the review body lists it with its text under \"Not posted again: answered on an earlier thread\". With a GitHub App, the agents also get the bot's earlier findings people answered, with the latest answer (shortened, or left out, before a finding on code still in the PR is dropped), in their prompt. resolve_outdated_threads: after a review is posted, the bot's own threads GitHub marks outdated, that nobody else answered, whose comment carries this format's metadata line with this review's instructions key (language, repository rules and agent prompts; older comments are left to people), that this review does not raise again (same file, same title, on an added line or not) whose agents all ran to the end this time and whose file's patch (under its current name, following GitHub's renames) the agents read in full are resolved, each read again right before and only while the PR is still on the reviewed head and base; the review body lists them under \"Resolving earlier threads\". A GitHub App resolves them only when its installation token carries Contents: write; with Contents read (or unknown permissions) they are listed under \"Looks fixed, for people to resolve\" with the reason and none is resolved. feedback_tally: with a GitHub App, each inline comment ends with a line asking for a thumbs-up or thumbs-down reaction, and the next review body counts the reactions on the bot's earlier findings of the PR per agent (\"Feedback on earlier findings\"). A missing key is true.",
+  "finding_lifecycle": {
+    "merge_same_line": true,
+    "skip_open_duplicates": true,
+    "resolve_outdated_threads": true,
+    "feedback_tally": true
+  },
+  "_mentions_comment": "PR authors talk to the bot with @review-of-legends comments (lang <code>, lang off, settings, or feedback); the daemon reads PR comments after each listing because GitHub never notifies an App's bot. default_reply_language (ko or en) is the language of replies and of the one-time welcome comment for an author who has not set one.",
+  "mentions": {
+    "default_reply_language": "en"
+  },
+  "poll_interval_seconds": 180,
+  "max_parallel_agents": 6,
+  "max_review_comments": 30,
+  "max_diff_chars": 180000,
+  "agent_timeout_seconds": 2300,
+  "clone_timeout_seconds": 900,
+  "min_successful_agents": 3,
+  "_auto_retry_comment": "A head whose review was not posted (quorum or a required agent failed, or the review raised: clone, diff fetch, GitHub API error) is retried by the poll loop at most auto_retry_attempts times in total, waiting auto_retry_backoff_seconds * 2^(failures-1) after each failure. A new push resets the count; an admin retry from the dashboard always runs.",
+  "auto_retry_attempts": 3,
+  "auto_retry_backoff_seconds": 600,
+  "review_existing_open_prs_on_first_run": false,
+  "state_path": "data/state.json",
+  "work_dir": "data/work",
+  "run_dir_retention_days": 14,
+  "sweep_legacy_work_dir": false,
+  "_run_dir_comment": "A review's PR clone is deleted when the review ends (posted, quorum failure, or any error). While no review is in flight (daemon start, resume from a pause, the start of every once) leftover clones are removed and run dirs older than run_dir_retention_days are deleted whole (0 disables pruning). While reviews run, an hourly prune also deletes the run dirs of PRs merged or closed since the daemon saw them open (every run dir recorded as that repository's; one with no record waits for retention). cleanup_run_dir: false keeps clones for a debugging session (the sweep then leaves clones alone too and closed PRs' run dirs stay; retention pruning still applies). sweep_legacy_work_dir: true also sweeps the pre-service-local default ~/.local/share/review-of-legends/runs with the same settings; turn it off once that directory is gone or if another configuration still owns it.",
+  "gh_bin": "gh",
+  "marker": "<!-- review-of-legends-bot -->",
+  "summary_marker": "<!-- review-of-legends-executive-summary -->",
+  "progress_marker": "<!-- review-of-legends-progress -->",
+  "visual_marker": "<!-- review-of-legends-visual-pr -->",
+  "progress_comment": {
+    "enabled": true
+  },
+  "dashboard": {
+    "_comment": "enabled: record reviews in the history store (data/dashboard/dashboard.sqlite3); author commands (@review-of-legends lang, settings, review, feedback) need it. public_url: the HTTPS origin of the optional web dashboard; commit statuses and retrigger badges link there when set.",
+    "enabled": true
+  },
+  "approval": {
+    "enabled": false
+  },
+  "model_policy": {
+    "model": "gpt-6-astra[1m]",
+    "effort": "xhigh",
+    "fallback_models": [
+      "grok-4.6"
+    ]
+  },
+  "agent_runner": {
+    "env_allowlist": [
+      "PATH",
+      "LANG",
+      "LC_ALL",
+      "LC_CTYPE",
+      "TERM"
+    ],
+    "isolate_home": true,
+    "command": [
+      "python3",
+      "{service_root}/code_review_service/llm_runner.py",
+      "--prompt-file",
+      "{prompt_file}",
+      "--response-file",
+      "{response_file}",
+      "--meta-file",
+      "{meta_file}",
+      "--base-url",
+      "http://localhost:3456",
+      "{model_policy_args}",
+      "--timeout",
+      "1500",
+      "--total-budget",
+      "2200",
+      "--fallback-reserve",
+      "300",
+      "--min-attempt-seconds",
+      "60",
+      "--model-ceiling",
+      "gpt-=900",
+      "--output-contract",
+      "{output_contract}",
+      "--max-tokens",
+      "100000"
+    ]
+  },
+  "agents": [
+    {
+      "id": "correctness",
+      "enabled": true,
+      "prompt_path": "../agents/correctness.md"
+    },
+    {
+      "id": "security",
+      "enabled": true,
+      "prompt_path": "../agents/security.md"
+    },
+    {
+      "id": "maintainability",
+      "enabled": true,
+      "prompt_path": "../agents/maintainability.md"
+    },
+    {
+      "id": "tests",
+      "enabled": true,
+      "prompt_path": "../agents/tests.md"
+    },
+    {
+      "id": "reliability",
+      "enabled": true,
+      "prompt_path": "../agents/reliability.md"
+    },
+    {
+      "id": "red-team",
+      "enabled": true,
+      "prompt_path": "../agents/red-team.md"
+    },
+    {
+      "id": "simplify",
+      "enabled": true,
+      "prompt_path": "../agents/simplify.md"
+    },
+    {
+      "id": "server-architect",
+      "enabled": true,
+      "opt_in": true,
+      "_comment": "required: if this agent does not finish (timeout, every model exhausted, invalid JSON) the review is not posted and the attempt fails; if it judges the patch incorrect or reports a P0/P1 the review is posted and the review-of-legends/required/<base branch> commit status fails (require that context in the branch's protection to block merging). The dashboard Settings page can override required and the prompt.",
+      "required": true,
+      "prompt_path": "../agents/server-architect.md"
+    }
+  ],
+  "executive_summary": {
+    "enabled": true,
+    "prompt_path": "../agents/executive-summary.md",
+    "timeout_seconds": 2300
+  },
+  "visual_outline": {
+    "_comment": "Runs once per PR before the reviewer agents (skipped when a comment with visual_marker already exists), same runner and model ladder as the reviewers.",
+    "enabled": true,
+    "prompt_path": "../agents/visual-outline.md",
+    "timeout_seconds": 2300
+  }
+}

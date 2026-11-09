@@ -1,0 +1,37 @@
+# Admin dashboard web tier (W3 of .prd/admin-dashboard/loop.md).
+#
+# These belong to the dashboard process ONLY. The review daemon stays stdlib-only
+# and keeps running under /usr/bin/python3 (service.sh:107), so this file is
+# installed into a separate virtualenv by the deployment installer (W5) and is
+# never a prerequisite for reviewing a pull request.
+#
+# Fully pinned, including transitive dependencies, so the deployed tree matches
+# what the test gate ran against. Versions below were installed and exercised
+# together by tests/test_dashboard_web.py (113 tests) on 2026-09-11.
+#
+#   python3 -m venv <venv> && <venv>/bin/pip install -r requirements-dashboard.txt
+#
+# Known deprecation notice with these pins: Authlib 1.8.0 and Starlette 1.6.0
+# both emit "the httpx module is deprecated; please use httpx2 instead" against
+# httpx 0.28.1. It is a warning, not a failure; moving to httpx2 is a contract
+# change (api-contract.md pins httpx 0.28.1), not a local decision.
+
+# Direct dependencies (named in .prd/admin-dashboard/api-contract.md).
+starlette==1.6.0
+uvicorn==0.52.4
+Authlib==1.8.0
+httpx==0.28.1
+itsdangerous==2.2.0
+
+# Transitive, pinned for reproducibility.
+anyio==4.15.1
+certifi==2026.7.22
+cffi==2.1.1
+click==8.5.0
+cryptography==50.0.1
+h11==0.16.0
+httpcore==1.0.9
+idna==3.19
+joserfc==1.7.5
+pycparser==3.0
+typing_extensions==4.16.0

@@ -1,0 +1,7 @@
+# Requires Homebrew on PATH before bundle registers these taps.
+# llmux and review-of-legends both come from the 2lab-ai tap.
+trust:
+  - 2lab-ai/tap
+xbrew:
+  - llmux
+  - review-of-legends

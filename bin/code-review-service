@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+set -eu
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+exec /usr/bin/python3 -m code_review_service --config "$ROOT/config/reviewer.json" "$@"

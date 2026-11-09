@@ -1,0 +1,16 @@
+# gitleaks configuration: the default rules, plus an allowlist of synthetic
+# fixtures. Test tokens are alphabet sequences or obviously fake words so a
+# real credential never matches these regexes.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "synthetic test fixtures"
+regexes = [
+  '''ghp_abcdefghijklmnopqrstuvwxyz0123456789''',
+  '''ghp_zyxwvutsrqponmlkjihgfedcba9876543210''',
+  '''^abcdefgh12345678\.?$''',
+]
+paths = [
+  '''(^|/)__pycache__/''',
+]

@@ -1,0 +1,133 @@
+name: Preview
+
+# Every push to main publishes a prerelease `preview-<YYYY-MM-DD-HHMM>-<sha12>`
+# with the source archive, SHA256SUMS and the `review-of-legends-preview`
+# formula (version YYYY.MM.DD.HHMM), as llmux's preview channel does. The tag
+# format is load-bearing: the formula derives its version from it.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preview-publish
+  cancel-in-progress: false
+
+jobs:
+  test:
+    # Nothing is published unless the suite passes on the daemon's minimum
+    # Python (3.9) and the current one.
+    strategy:
+      matrix:
+        python: ['3.9', '3.13']
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tests
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Compute build identity
+        id: plan
+        run: |
+          set -euo pipefail
+          stamp="$(date -u +%Y-%m-%d-%H%M)"
+          tag="preview-$stamp-$(git rev-parse --short=12 HEAD)"
+          version="${stamp:0:4}.${stamp:5:2}.${stamp:8:2}.${stamp:11:4}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Build archive and formula
+        run: python scripts/package-release.py "${{ steps.plan.outputs.version }}" --tag "${{ steps.plan.outputs.tag }}" --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: preview-dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: preview-dist
+          path: dist
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS dist/*.rb \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "$TAG" --notes "Preview build of $GITHUB_SHA. Not a stable release."
+      - name: Keep the newest 15 previews
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,isPrerelease,createdAt \
+            --jq '[.[] | select(.isPrerelease and (.tagName | startswith("preview-")))] | sort_by(.createdAt) | reverse | .[15:] | .[].tagName' |
+          while IFS= read -r old; do
+            gh release delete "$old" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          done
+
+  tap:
+    needs: [build, publish]
+    # Opt-in: set repository variable ROL_TAP_REPOSITORY (for example
+    # 2lab-ai/homebrew-tap) and secret TAP_DISPATCH_TOKEN (contents: write on
+    # that repository only). Once opted in, a failed tap push fails the run:
+    # a preview is not published until the tap points at it.
+    if: vars.ROL_TAP_REPOSITORY != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: preview-dist
+          path: dist
+      - name: Push the preview formula
+        env:
+          GH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
+          TAP: ${{ vars.ROL_TAP_REPOSITORY }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ -n "$GH_TOKEN" ]] || { echo "::error::TAP_DISPATCH_TOKEN is not set"; exit 1; }
+          gh auth setup-git
+          git clone --depth 1 "https://github.com/$TAP.git" tap
+          cp dist/review-of-legends-preview.rb tap/Formula/review-of-legends-preview.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/review-of-legends-preview.rb
+          git diff --cached --quiet && { echo "formula unchanged"; exit 0; }
+          git commit -m "review-of-legends-preview: $TAG"
+          for attempt in 1 2 3; do
+            git push origin HEAD && exit 0
+            git pull --rebase origin HEAD
+          done
+          echo "::error::could not push the preview formula to $TAP"; exit 1

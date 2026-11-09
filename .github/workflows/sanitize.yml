@@ -1,0 +1,59 @@
+name: Sanitize
+
+# Two scans of everything that is published:
+# - forbidden patterns: scripts/sanitize-scan.sh over full history with the
+#   maintainers' secret pattern list (names of private systems that must never
+#   land here). The patterns are a secret, so a hit names commits, never text.
+#   Fork PRs get no secrets and are skipped here; push to main scans them.
+# - credentials: gitleaks over full history.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sanitize-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  patterns:
+    if: >-
+      github.event_name == 'push' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Full-history forbidden-pattern scan
+        env:
+          SANITIZE_PATTERNS: ${{ secrets.SANITIZE_PATTERNS }}
+        # Fails closed (exit 2) when the secret is not set.
+        run: bash scripts/sanitize-scan.sh
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GITLEAKS_VERSION: 8.30.1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks
+        run: |
+          base="https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS_VERSION"
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSLO "$base/$tarball"
+          curl -fsSL "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt" | grep " $tarball\$" | sha256sum -c -
+          tar -xzf "$tarball" gitleaks
+      - name: Scan full history
+        run: ./gitleaks git --redact --no-banner --exit-code 1 .

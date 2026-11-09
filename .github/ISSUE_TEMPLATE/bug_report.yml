@@ -1,0 +1,16 @@
+name: Bug report
+description: Report a reproducible problem using sanitized data
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include rol version, OS, install method, and sanitized configuration. Never paste keys or private PR contents.
+    validations:
+      required: true

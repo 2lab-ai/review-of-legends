@@ -1,0 +1,7 @@
+name = "review-of-legends"
+description = "Self-hosted multi-agent GitHub pull request reviews"
+
+# Local recipe, not yet included in upstream xbrew.
+# Requires the Review of Legends public release and tap to be published.
+[macos]
+formula = "2lab-ai/tap/review-of-legends"

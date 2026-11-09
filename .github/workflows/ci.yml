@@ -1,0 +1,115 @@
+name: CI
+
+# The gate every PR and every push to main must pass. `make check` runs the
+# same commands locally. Hosted runners only: no repository code ever runs on
+# a self-hosted machine from this repository.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The daemon is stdlib-only and must run on macOS's stock
+          # /usr/bin/python3 (3.9): the self-hosted deployments run it there.
+          - os: macos-latest
+            python: system
+          - os: macos-latest
+            python: '3.13'
+          - os: ubuntu-latest
+            python: '3.9'
+          - os: ubuntu-latest
+            python: '3.13'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        if: matrix.python != 'system'
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Select interpreter
+        run: |
+          if [[ "${{ matrix.python }}" == system ]]; then
+            echo "PY=/usr/bin/python3" >> "$GITHUB_ENV"
+          else
+            echo "PY=python" >> "$GITHUB_ENV"
+          fi
+      - name: Compile with the daemon's interpreter
+        run: |
+          "$PY" --version
+          "$PY" -m compileall -q code_review_service scripts
+      - name: Unit tests
+        run: '"$PY" -m unittest discover -s tests'
+      - run: ./bin/rol --help
+
+  dashboard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm test
+        working-directory: dashboard
+
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r requirements-dashboard.txt
+      - run: python -m unittest tests.test_dashboard_web tests.test_pr_author_web tests.test_dashboard_deploy
+        env:
+          ROL_REQUIRE_DASHBOARD_DEPS: '1'
+
+  installation:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_ANALYTICS: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install local release archive with Homebrew and test installed setup
+        run: scripts/test-homebrew-install.sh
+      - name: Build the inspected xbrew revision
+        run: |
+          git init "$RUNNER_TEMP/xbrew"
+          git -C "$RUNNER_TEMP/xbrew" remote add origin https://github.com/2lab-ai/xbrew.git
+          git -C "$RUNNER_TEMP/xbrew" fetch --depth 1 origin 5978635097d606ec534f4e27cd6451b66f6c0398
+          git -C "$RUNNER_TEMP/xbrew" checkout --detach FETCH_HEAD
+          cargo build --locked --manifest-path "$RUNNER_TEMP/xbrew/Cargo.toml" --target-dir "$RUNNER_TEMP/xbrew-build"
+      - name: Test real xbrew against fake package-manager operations
+        run: python3 scripts/test-xbrew.py --xbrew "$RUNNER_TEMP/xbrew-build/debug/xbrew"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rol-local-distribution
+          path: ${{ runner.temp }}/rol-distribution/

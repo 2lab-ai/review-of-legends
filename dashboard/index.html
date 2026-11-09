@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>Review of Legends - operator console</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to main content</a>
+
+<header class="topbar" id="topbar">
+  <div class="topbar__inner">
+    <div class="topbar__identity">
+      <span class="wordmark">Review of Legends</span>
+      <span class="wordmark__sub">Operator console</span>
+    </div>
+    <div class="topbar__session" id="session" hidden>
+      <div class="stream" id="stream-indicator" aria-live="polite">
+        <span class="stream__label" id="stream-label">Stream idle</span>
+        <span class="stream__detail" id="stream-detail"></span>
+      </div>
+      <span class="session__email" id="session-email"></span>
+      <span class="session__role" id="session-role" hidden></span>
+      <button class="button button--quiet" id="signout" type="button">Sign out</button>
+    </div>
+  </div>
+  <nav class="nav" id="nav" aria-label="Dashboard sections" hidden>
+    <a class="nav__item" id="nav-active" href="#active">
+      <span class="nav__label">Active</span>
+      <span class="nav__count" id="count-active"></span>
+    </a>
+    <a class="nav__item" id="nav-attention" href="#attention">
+      <span class="nav__label">Needs attention</span>
+      <span class="nav__count" id="count-attention"></span>
+    </a>
+    <a class="nav__item" id="nav-history" href="#history">
+      <span class="nav__label">History</span>
+      <span class="nav__count" id="count-history"></span>
+    </a>
+    <a class="nav__item" id="nav-accounts" href="#accounts">
+      <span class="nav__label">Accounts</span>
+      <span class="nav__count" id="count-accounts"></span>
+    </a>
+    <a class="nav__item" id="nav-agents" href="#agents">
+      <span class="nav__label">Agents</span>
+      <span class="nav__count" id="count-agents"></span>
+    </a>
+    <a class="nav__item" id="nav-settings" href="#settings">
+      <span class="nav__label">Settings</span>
+      <span class="nav__count" id="count-settings"></span>
+    </a>
+  </nav>
+</header>
+
+<main class="main" id="main" tabindex="-1">
+  <p class="loading" id="boot">Checking the session...</p>
+</main>
+
+<footer class="footer">
+  <span id="footer-version">Review of Legends admin dashboard</span>
+</footer>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
