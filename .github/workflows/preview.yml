@@ -19,20 +19,25 @@ concurrency:
 jobs:
   test:
     # Nothing is published unless the suite passes on the daemon's minimum
-    # Python (3.9) and the current one.
+    # Python (macOS's stock /usr/bin/python3, 3.9) and the current one (3.13).
     strategy:
       matrix:
-        python: ['3.9', '3.13']
-    runs-on: ubuntu-latest
+        include:
+          - os: macos-latest
+            python: /usr/bin/python3
+          - os: ubuntu-latest
+            python: python
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - uses: actions/setup-python@v5
+        if: matrix.python == 'python'
         with:
-          python-version: ${{ matrix.python }}
-      - run: python -m unittest discover -s tests
+          python-version: '3.13'
+      - run: ${{ matrix.python }} -m unittest discover -s tests
 
   build:
     needs: test

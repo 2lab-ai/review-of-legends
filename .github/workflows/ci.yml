@@ -23,12 +23,12 @@ jobs:
         include:
           # The daemon is stdlib-only and must run on macOS's stock
           # /usr/bin/python3 (3.9): the self-hosted deployments run it there.
+          # That runner's /usr/bin/python3 is the 3.9 job (current Ubuntu
+          # images have no 3.9 for setup-python).
           - os: macos-latest
             python: system
           - os: macos-latest
             python: '3.13'
-          - os: ubuntu-latest
-            python: '3.9'
           - os: ubuntu-latest
             python: '3.13'
     runs-on: ${{ matrix.os }}

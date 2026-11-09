@@ -52,8 +52,8 @@ jobs:
         run: |
           base="https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS_VERSION"
           tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          curl -fsSLO "$base/$tarball"
-          curl -fsSL "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt" | grep " $tarball\$" | sha256sum -c -
+          curl -fsSLO --retry 5 --retry-all-errors "$base/$tarball"
+          curl -fsSL --retry 5 --retry-all-errors "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt" | grep " $tarball\$" | sha256sum -c -
           tar -xzf "$tarball" gitleaks
       - name: Scan full history
         run: ./gitleaks git --redact --no-banner --exit-code 1 .

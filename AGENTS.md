@@ -33,8 +33,8 @@ per head as a GitHub App. The optional dashboard (`code_review_service/dashboard
 
 - Conventional commits, lowercase subject (`fix: …`, `feat: …`, `docs: …`, `ci: …`).
 - `make check` must pass before every commit: compile on the local `python3`, the unit
-  suite, and the dashboard's Node tests. CI runs the same commands on Python 3.9 and 3.13,
-  macOS and Linux.
+  suite, and the dashboard's Node tests. CI runs the same commands on macOS's stock Python 3.9 and on
+  3.13, macOS and Linux.
 - Feature branches only; `main` is protected and every push to it publishes a preview.
 - **User-visible changes update their owning doc in the same PR** —
   [`rules/documents.md`](rules/documents.md). Otherwise write `docs: N/A — <why>` in the PR.

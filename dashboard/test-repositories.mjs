@@ -25,7 +25,7 @@ import { describeApiError } from './errors.js';
 const PAYLOAD = {
   repositories: [
     { repo: 'acme-corp/Gamma', source: 'config', agents: ['a', 'b', 'c', 'arch'], added_by: null, added_at: null },
-    { repo: '2lab-ai/review-of-legends', source: 'config', agents: ['a', 'b', 'c'], added_by: null, added_at: null },
+    { repo: 'acme-corp/review-of-legends', source: 'config', agents: ['a', 'b', 'c'], added_by: null, added_at: null },
     { repo: 'acme-corp/MiniMoon', source: 'dashboard', agents: ['a', 'b', 'c'], added_by: 'owner@company.example', added_at: '2026-10-13T00:00:00+00:00' },
   ],
   allowed_owners: ['acme-corp'],
@@ -45,7 +45,7 @@ describe('projectRepositorySettings', () => {
       repositories: [...PAYLOAD.repositories, { repo: 'no-slash' }, { repo: 'a/..x y' }, 'junk', null, { repo: 'acme-corp/x', source: 'other', agents: ['a', 7] }],
     });
     assert.deepEqual(projected.repositories.map((row) => row.repo), [
-      'acme-corp/Gamma', '2lab-ai/review-of-legends', 'acme-corp/MiniMoon', 'acme-corp/x',
+      'acme-corp/Gamma', 'acme-corp/review-of-legends', 'acme-corp/MiniMoon', 'acme-corp/x',
     ]);
     const last = projected.repositories[3];
     assert.equal(last.source, 'config', 'only "dashboard" marks an added repository');
