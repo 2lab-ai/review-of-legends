@@ -876,12 +876,12 @@ Add `"repositories": ["owner/name"]` to gate only those repositories. Without it
 
 **Who is approved.** The author of a pull request is approved when any of these holds:
 
-- They have write, maintain or admin permission on the repository.
+- They have write or admin permission on the repository. This is GitHub's base permission, so maintain and a custom role built on write count too.
 - Their login is listed in `.github/APPROVED_CONTRIBUTORS` on the default branch. The format is one login per line; `#` starts a comment.
 - They proved an email at a trusted domain. A trusted domain is either a `*@example.com` line in that file or an entry in `trusted_email_domains`.
 - They are one of `trusted_bots`, or one of `approved_logins`. `approved_logins` approves a login in every gated repository, for private repositories that carry no list file. Put the bot accounts of your own GitHub Apps that open pull requests in `trusted_bots` (`name[bot]`); a bot is never a collaborator, so without a line it is gated.
 
-A login in `.github/MAINTAINERS` counts only together with write access, as in herdr.
+Unlike herdr, there is no `.github/MAINTAINERS`: write access already approves.
 
 **What an unapproved author sees.**
 
@@ -893,9 +893,9 @@ A login in `.github/MAINTAINERS` counts only together with write access, as in h
 **Domain verification.** A commit email is never evidence: anyone can put any address in a commit.
 
 1. The contributor signs in to the dashboard with Google. The sign-in rules are those of *Admin dashboard*: a verified email, and a Workspace `hd` claim that matches a viewer domain.
-2. On the **Contributor** page they get a one-time code. A code lives 1 hour and is stored hashed.
+2. On the **Contributor** page they enter their GitHub login and get a one-time code **for that login**. A code lives 1 hour and is stored hashed. It works only in a comment by that login, so a code read off a public comment is worthless to anyone else.
 3. They comment `@review-of-legends verify <code>` on their pull request.
-4. The daemon binds the comment author's GitHub login to the signed-in email, and replies.
+4. The daemon binds the account to the signed-in email, and replies. The binding is to the login and to GitHub's immutable user id, so a renamed or reassigned login does not inherit it.
 
 From then on, any pull request by that login passes the gate when the email's domain is trusted. Removing the domain line removes the trust; the binding alone approves nothing.
 
@@ -909,7 +909,7 @@ From then on, any pull request by that login passes the gate when the email's do
 
 Opening the pull request needs Contents write. Without it, the reply asks a maintainer to add the line, and the signature is still recorded.
 
-**Fork CI.** Set the repository's Actions setting *Approval for running fork pull request workflows from contributors* to **Require approval for all external contributors**. For an approved author, the daemon then approves the waiting runs of the pull request's head commit (`POST /repos/{repo}/actions/runs/{id}/approve`). This needs the App's **Actions: read and write** permission. Without it the runs wait for a person, and `doctor` says so.
+**Fork CI.** Set the repository's Actions setting *Approval for running fork pull request workflows from contributors* to **Require approval for all external contributors**. For an approved author, the daemon then approves the pull request's waiting runs (`POST /repos/{repo}/actions/runs/{id}/approve`): only runs of its head commit from its own fork and branch. Another pull request at the same commit is not covered. It tries each head on every watch for 30 minutes after first seeing it, independently of the review, because workflows start at different times. This needs the App's **Actions: read and write** permission. Without it the runs wait for a person, and `doctor` says so.
 
 ## Commands
 

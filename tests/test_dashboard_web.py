@@ -562,8 +562,8 @@ class FakeDashboardStore:
     def calls_named(self, name: str) -> list[tuple[str, tuple[Any, ...], dict[str, Any]]]:
         return [call for call in self.calls if call[0] == name]
 
-    def create_contributor_code(self, email: str, code_hash: str, ttl_seconds: int = 3600) -> str:
-        self.calls.append(("create_contributor_code", (email, code_hash, ttl_seconds), {}))
+    def create_contributor_code(self, email: str, code_hash: str, login: str, ttl_seconds: int = 3600) -> str:
+        self.calls.append(("create_contributor_code", (email, code_hash, login, ttl_seconds), {}))
         return "2026-09-11T01:00:00+00:00"
 
 
@@ -6494,15 +6494,18 @@ class ContributorCodeTest(AppTestCase):
     def test_a_signed_in_account_gets_a_one_time_code_stored_hashed(self) -> None:
         client = self.make_client()
         identity = self.login(client)
-        response = client.post("/api/contributor/code", content="{}", headers=self.auth_headers(identity))
+        response = client.post(
+            "/api/contributor/code", content=json.dumps({"github_login": "@Octo-Cat"}), headers=self.auth_headers(identity)
+        )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.headers.get("cache-control"), "no-store")
         data = response.json()
         self.assertRegex(data["code"], r"^rol-[0-9a-f]{16}$")
         self.assertEqual(data["command"], "@review-of-legends verify " + data["code"])
         (call,) = self.store.calls_named("create_contributor_code")
-        email, code_hash, ttl = call[1]
+        email, code_hash, login, ttl = call[1]
         self.assertEqual(email, identity["email"].lower())
+        self.assertEqual((login, data["github_login"]), ("Octo-Cat", "Octo-Cat"))
         self.assertEqual(code_hash, contributors.code_hash(data["code"]))
         self.assertNotIn(data["code"], code_hash)
         self.assertEqual(ttl, contributors.VERIFY_CODE_TTL_SECONDS)
@@ -6513,6 +6516,9 @@ class ContributorCodeTest(AppTestCase):
         identity = self.login(client)
         wrong = client.post("/api/contributor/code", content="{}", headers=self.auth_headers(identity, **{"X-CSRF-Token": "x"}))
         self.assertEqual(wrong.status_code, 403)
+        for body in ({}, {"github_login": "not a login"}, {"github_login": "x[bot]"}, {"github_login": "ok", "extra": 1}):
+            refused = client.post("/api/contributor/code", content=json.dumps(body), headers=self.auth_headers(identity))
+            self.assertEqual(refused.status_code, 400, body)
         self.assertEqual(self.store.calls_named("create_contributor_code"), [])
 
 

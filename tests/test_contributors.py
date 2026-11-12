@@ -44,14 +44,14 @@ class DecideTest(unittest.TestCase):
     approved = c.parse_list("alice\n*@example.com\n")
     empty = c.parse_list("")
 
-    def decide(self, login, permission=None, identity=None, domains=(), maintainers=None):
+    def decide(self, login, permission=None, identity=None, domains=(), user_id=0):
         return c.decide(
             login,
             permission=permission,
             approved=self.approved,
-            maintainers=maintainers or self.empty,
             trusted_domains=domains,
             identity=identity,
+            user_id=user_id,
         )
 
     def test_write_permission_is_trusted(self) -> None:
@@ -65,8 +65,13 @@ class DecideTest(unittest.TestCase):
     def test_listed_login_any_case(self) -> None:
         self.assertEqual(c.Decision(True, "approved list"), self.decide("ALICE"))
 
-    def test_maintainer_without_write_is_not_trusted(self) -> None:
-        self.assertFalse(self.decide("carol", "read", maintainers=c.parse_list("carol\n")).trusted)
+    def test_a_binding_belongs_to_the_account_not_the_login(self) -> None:
+        identity = c.Identity("dave", "dave@example.com", 77)
+        self.assertTrue(self.decide("dave", identity=identity, user_id=77).trusted)
+        # The login was renamed away and someone else took it: no inherited trust.
+        self.assertFalse(self.decide("dave", identity=identity, user_id=78).trusted)
+        # Either side without an id falls back to the login.
+        self.assertTrue(self.decide("dave", identity=c.Identity("dave", "dave@example.com"), user_id=78).trusted)
 
     def test_verified_email_at_a_listed_domain(self) -> None:
         decision = self.decide("dave", identity=c.Identity("Dave", "dave@Example.com"))

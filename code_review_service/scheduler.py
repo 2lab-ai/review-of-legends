@@ -268,6 +268,8 @@ class ReviewScheduler:
         # The contributor gate (gate.py): who may be reviewed, decided with caches.
         self._gatekeeper = gate.Gatekeeper(clock=self._monotonic, log=_log)
         self._gate_writes = GATE_WRITES_PER_TICK
+        # (repo, number, head) -> when its fork CI approval window started.
+        self._ci_seen: Dict[Tuple[str, int, str], float] = {}
         self._threads: List[threading.Thread] = []
         # The dispatch and retry threads by name, so a stopped one can be started again.
         self._workers: Dict[str, Tuple[Callable[[], None], threading.Thread]] = {}
@@ -685,6 +687,7 @@ class ReviewScheduler:
                 if unstarted:
                     self._cursor_starts.setdefault(repo.lower(), mentions.github_time(self._github_now(repo)))
                 self._absorb(repo, prs)
+                self._approve_fork_ci(repo, prs)
                 self._note_open_prs(repo, prs)
                 # One command's reaction and reply stay reserved for the mention phase.
                 reserve = COMMAND_POSTS if self.store is not None else 0
@@ -886,8 +889,8 @@ class ReviewScheduler:
         An unapproved author's PR gets the gate comment (at most
         GATE_WRITES_PER_TICK comments per tick) and is reported as a skip, so
         it is logged once per head. A trust that cannot be read is a skip too:
-        fail closed, read again next tick. An approved author's waiting fork
-        CI runs are approved here.
+        fail closed, read again next tick. Fork CI is approved apart from this
+        (_approve_fork_ci), since a reviewed head still needs its runs.
         """
         client = self._watch_clients.get(repo) or self._client_factory(repo)
         kept = []
@@ -903,7 +906,6 @@ class ReviewScheduler:
                 try:
                     if self._gate_writes > 0 and self._gatekeeper.mark_approved(client, self.config, repo, pr, decision):
                         self._gate_writes -= 1
-                    self._gatekeeper.approve_fork_runs(client, self.config, repo, pr)
                 except Exception as exc:  # noqa: BLE001 - the review goes ahead; the next tick retries
                     _log("%s pr #%d: WARNING contributor gate follow-up failed: %s" % (repo, number, exc))
                 kept.append(item)
@@ -916,6 +918,38 @@ class ReviewScheduler:
                     _log("%s pr #%d: WARNING posting the contributor gate comment failed: %s" % (repo, number, exc))
             skips.append((key, number, head, "%s is not an approved contributor (contributor gate)" % (login or "the author")))
         return kept
+
+    def _approve_fork_ci(self, repo: str, prs: List[Dict[str, Any]]) -> None:
+        """Approve the waiting fork CI runs of approved authors' open PRs (contributor_gate).
+
+        Apart from review eligibility: workflows start at different times and
+        a reviewed head still needs its runs. Each head is tried every tick for
+        gate.CI_APPROVAL_WINDOW after the daemon first sees it; a failure is
+        logged and tried again next tick.
+        """
+        if not self._gatekeeper.applies(self.config, repo):
+            return
+        client = self._watch_clients.get(repo) or self._client_factory(repo)
+        now = self._monotonic()
+        live: Set[Tuple[str, int, str]] = set()
+        for pr in prs:
+            head = _head(pr)
+            if not head or svc.is_draft(pr) or not gate.is_fork(repo, pr):
+                continue
+            try:
+                key = (repo.lower(), int(pr["number"]), head)
+            except (KeyError, TypeError, ValueError):
+                continue
+            live.add(key)
+            if now - self._ci_seen.setdefault(key, now) > gate.CI_APPROVAL_WINDOW:
+                continue
+            try:
+                if self._gatekeeper.decide(client, self.config, repo, pr, self.store).trusted:
+                    self._gatekeeper.approve_fork_runs(client, self.config, repo, pr)
+            except Exception as exc:  # noqa: BLE001 - tried again next tick
+                _log("%s pr #%d: WARNING fork CI approval failed: %s" % (repo, key[1], exc))
+        for key in [k for k in self._ci_seen if k[0] == repo.lower() and k not in live]:
+            del self._ci_seen[key]
 
     def _baseline(self, repo: str, prs: List[Dict[str, Any]]) -> None:
         """First sight of a repository: record its open PRs, review none of them this tick."""

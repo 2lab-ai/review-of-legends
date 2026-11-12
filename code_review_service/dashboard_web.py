@@ -2534,21 +2534,33 @@ def create_app(
         """A one-time code binding a GitHub login to this session's verified email (contributor gate).
 
         Any signed-in account may ask: the sign-in already proved the email and
-        its Workspace domain. The code is returned once and stored hashed; the
-        daemon consumes it from a ``@review-of-legends verify <code>`` comment.
+        its Workspace domain. The body names the GitHub login the code is for
+        (``{"github_login": "..."}``); only that login's ``@review-of-legends
+        verify <code>`` comment consumes it. The code is returned once and
+        stored hashed.
         """
         session = await require_session(request)
         require_mutation_guards(request, session)
         active_store = require_store()
+        body = await _read_json_object(request)
+        unknown = sorted(str(key) for key in body if key != "github_login")
+        if unknown:
+            raise _bad_request("unknown fields: " + ", ".join(unknown))
+        github_login = str(body.get("github_login") or "").strip().lstrip("@")
+        if not LOGIN_PATTERN.fullmatch(github_login) or not contributors.LOGIN.fullmatch(github_login) or github_login.endswith("[bot]"):
+            raise _bad_request("github_login must be your GitHub login")
         email = str(session.get("email") or "").strip().lower()
         if not email or "@" not in email:
             raise HTTPException(status_code=403, detail="this session has no verified email")
         code = contributors.new_verify_code()
         expires_at = await run_in_threadpool(
-            active_store.create_contributor_code, email, contributors.code_hash(code),
+            active_store.create_contributor_code, email, contributors.code_hash(code), github_login,
             contributors.VERIFY_CODE_TTL_SECONDS,
         )
-        return _json({"code": code, "expires_at": expires_at, "command": "@review-of-legends verify " + code})
+        return _json({
+            "code": code, "expires_at": expires_at, "github_login": github_login,
+            "command": "@review-of-legends verify " + code,
+        })
 
     async def add_admin(request: Request) -> Response:
         session = await require_owner(request)

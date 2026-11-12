@@ -200,7 +200,7 @@ const state = {
   repositories: emptyRepositories(),
   admins: emptyAdmins(),
   retrigger: emptyRetrigger(),
-  contributor: { code: null, expiresAt: null, loading: false, error: null },
+  contributor: { login: '', code: null, codeLogin: null, expiresAt: null, loading: false, error: null },
   authors: emptyAuthors(),
   retryChoice: { model: '', effort: '' },
   events: [],
@@ -933,12 +933,20 @@ function renderShellChrome() {
 /** Contributor page: ask the server for a one-time verification code. */
 async function requestContributorCode() {
   if (state.contributor.loading) return;
+  const input = document.getElementById('contributor-login');
+  if (input) state.contributor.login = String(input.value || '');
+  if (!state.contributor.login.trim()) {
+    state.contributor.error = 'Enter your GitHub login first.';
+    render();
+    return;
+  }
   state.contributor.loading = true;
   state.contributor.error = null;
   render();
   try {
-    const data = await api.contributorCode();
+    const data = await api.contributorCode(state.contributor.login.trim().replace(/^@/, ''));
     state.contributor.code = data && typeof data.code === 'string' ? data.code : null;
+    state.contributor.codeLogin = data && typeof data.github_login === 'string' ? data.github_login : null;
     state.contributor.expiresAt = data && typeof data.expires_at === 'string' ? data.expires_at : null;
   } catch (error) {
     const described = describeApiError(error);
@@ -968,10 +976,14 @@ function renderMain() {
   if (route.view === 'contributor') {
     replace(dom.main, [renderContributor({
       email: state.identity ? state.identity.email : null,
+      login: state.contributor.login,
       code: state.contributor.code,
+      codeLogin: state.contributor.codeLogin,
       expiresAt: state.contributor.expiresAt,
       loading: state.contributor.loading,
       error: state.contributor.error,
+      // Kept in state without a re-render: re-rendering would replace the input mid-typing.
+      onLogin: (value) => { state.contributor.login = String(value || ''); },
       onRequest: () => requestContributorCode(),
     })]);
     return;

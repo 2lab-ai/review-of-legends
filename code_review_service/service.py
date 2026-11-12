@@ -2260,7 +2260,11 @@ class GitHubClient:
         return base64.b64decode(raw).decode("utf-8", errors="replace"), str(data.get("sha") or "")
 
     def collaborator_permission(self, login: str) -> str | None:
-        """The login's role on the repository (admin, maintain, write, triage, read), or None if unknown."""
+        """The login's base permission on the repository (admin, write, read, none), or None if unknown.
+
+        ``permission``, not ``role_name``: a custom repository role keeps its
+        base permission there (maintain reads as write, triage as read).
+        """
         try:
             data = self.request(
                 "GET", f"repos/{self.repo}/collaborators/{urllib.parse.quote(login)}/permission"
@@ -2271,8 +2275,8 @@ class GitHubClient:
             raise
         if not isinstance(data, dict):
             return None
-        role = data.get("role_name") or data.get("permission")
-        return str(role) if isinstance(role, str) and role else None
+        permission = data.get("permission")
+        return str(permission) if isinstance(permission, str) and permission else None
 
     def list_waiting_runs(self, head_sha: str) -> list[dict[str, Any]]:
         """Workflow runs of ``head_sha`` waiting for a maintainer's approval (fork pull requests)."""
@@ -2295,6 +2299,12 @@ class GitHubClient:
 
     def create_branch(self, branch: str, sha: str) -> Any:
         return self.request("POST", f"repos/{self.repo}/git/refs", {"ref": f"refs/heads/{branch}", "sha": sha})
+
+    def update_branch(self, branch: str, sha: str) -> Any:
+        """Point a branch the daemon owns at ``sha`` (forced: its old commits are its own)."""
+        return self.request(
+            "PATCH", f"repos/{self.repo}/git/refs/heads/{urllib.parse.quote(branch)}", {"sha": sha, "force": True}
+        )
 
     def put_file(self, path: str, branch: str, text: str, message: str, sha: str = "") -> Any:
         payload: dict[str, Any] = {

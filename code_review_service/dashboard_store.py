@@ -198,6 +198,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_source ON feedback (source_key);
 CREATE TABLE IF NOT EXISTS contributor_codes (
     code_hash  TEXT PRIMARY KEY,
     email      TEXT NOT NULL,
+    login      TEXT NOT NULL,
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
     used_at    TEXT,
@@ -208,6 +209,7 @@ CREATE TABLE IF NOT EXISTS contributor_identities (
     login         TEXT PRIMARY KEY,
     display_login TEXT NOT NULL,
     email         TEXT NOT NULL,
+    user_id       INTEGER NOT NULL DEFAULT 0,
     verified_at   TEXT NOT NULL,
     comment_url   TEXT NOT NULL DEFAULT ''
 );
@@ -1553,36 +1555,49 @@ class DashboardStore:
             return _feedback_dict(row)
 
     # ------------------------------------------------ contributor gate (gate.py)
-    # A verification code is shown once on the dashboard and stored hashed; a
-    # ``@review-of-legends verify <code>`` comment consumes it and binds the
-    # commenter's login to the signed-in email. Pledge signatures are kept for
+    # A verification code is shown once on the dashboard and stored hashed, for
+    # the one GitHub login the signed-in person named; only that login's
+    # ``@review-of-legends verify <code>`` comment consumes it, binding the
+    # account (login and immutable user id) to the signed-in email. A code read
+    # off a public comment is worthless to anyone else. Pledge signatures are kept for
     # the record and to find the pull request that was opened for them.
 
-    def create_contributor_code(self, email: str, code_hash: str, ttl_seconds: int = 3600) -> str:
-        """Store one code for ``email``; returns when it expires. Expired and used codes are pruned."""
+    def create_contributor_code(self, email: str, code_hash: str, login: str, ttl_seconds: int = 3600) -> str:
+        """Store one code for ``email`` and the GitHub ``login`` it is for; returns when it expires.
+
+        Expired and used codes are pruned.
+        """
         email = _require_text(email, "email").lower()
         code_hash = _require_text(code_hash, "code_hash")
+        login = _require_login(login).lower()
         now = dt.datetime.now(dt.timezone.utc)
         expires = (now + dt.timedelta(seconds=int(ttl_seconds))).isoformat(timespec="seconds")
         stamp = now.isoformat(timespec="seconds")
         with self._write() as conn:
             conn.execute("DELETE FROM contributor_codes WHERE expires_at < ? OR used_at IS NOT NULL", (stamp,))
             conn.execute(
-                "INSERT OR REPLACE INTO contributor_codes (code_hash, email, created_at, expires_at)"
-                " VALUES (?, ?, ?, ?)",
-                (code_hash, email, stamp, expires),
+                "INSERT OR REPLACE INTO contributor_codes (code_hash, email, login, created_at, expires_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (code_hash, email, login, stamp, expires),
             )
         return expires
 
-    def consume_contributor_code(self, code_hash: str, login: str, comment_url: str = "") -> Optional[str]:
-        """Use a live code once: bind ``login`` to its email and return the email; None if unknown, used or expired."""
+    def consume_contributor_code(
+        self, code_hash: str, login: str, comment_url: str = "", user_id: int = 0
+    ) -> Optional[str]:
+        """Use a live code once, by the login it was issued for: bind the account to its email and return the email.
+
+        None when the code is unknown, used, expired or issued for another login
+        (that comment does not use it up).
+        """
         code_hash = _require_text(code_hash, "code_hash")
         display = _require_login(login)
         now = _now()
         with self._write() as conn:
             row = conn.execute(
-                "SELECT email FROM contributor_codes WHERE code_hash = ? AND used_at IS NULL AND expires_at >= ?",
-                (code_hash, now),
+                "SELECT email FROM contributor_codes WHERE code_hash = ? AND used_at IS NULL AND expires_at >= ?"
+                " AND login = ?",
+                (code_hash, now, display.lower()),
             ).fetchone()
             if row is None:
                 return None
@@ -1592,21 +1607,22 @@ class DashboardStore:
                 (now, display.lower(), code_hash),
             )
             conn.execute(
-                "INSERT INTO contributor_identities (login, display_login, email, verified_at, comment_url)"
-                " VALUES (?, ?, ?, ?, ?) ON CONFLICT(login) DO UPDATE SET display_login = excluded.display_login,"
-                " email = excluded.email, verified_at = excluded.verified_at, comment_url = excluded.comment_url",
-                (display.lower(), display, email, now, self._bounded_text(comment_url) or ""),
+                "INSERT INTO contributor_identities (login, display_login, email, user_id, verified_at, comment_url)"
+                " VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(login) DO UPDATE SET display_login = excluded.display_login,"
+                " email = excluded.email, user_id = excluded.user_id, verified_at = excluded.verified_at,"
+                " comment_url = excluded.comment_url",
+                (display.lower(), display, email, int(user_id or 0), now, self._bounded_text(comment_url) or ""),
             )
             self._emit(conn, "contributor_verified", None, {"login": display.lower()})
             return email
 
     def contributor_identity(self, login: str) -> Optional[Dict[str, Any]]:
-        """``{login, email, verified_at, comment_url}`` bound to a login, or None."""
+        """``{login, email, user_id, verified_at, comment_url}`` bound to a login, or None."""
         if not isinstance(login, str) or not LOGIN_PATTERN.fullmatch(login):
             return None  # a bot account or nothing: never bound
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT display_login AS login, email, verified_at, comment_url FROM contributor_identities"
+                "SELECT display_login AS login, email, user_id, verified_at, comment_url FROM contributor_identities"
                 " WHERE login = ?",
                 (login.lower(),),
             ).fetchone()

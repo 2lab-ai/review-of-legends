@@ -7,12 +7,12 @@ its waiting fork CI runs, only when the author is an approved contributor:
 - a repository collaborator with write, maintain or admin permission;
 - a login listed in ``.github/APPROVED_CONTRIBUTORS`` on the default branch
   (one per line, ``#`` comments; the format herdr uses);
-- a login listed in ``.github/MAINTAINERS`` that also has write access;
 - a login whose verified email is at a trusted domain: a ``*@example.com`` line
   in ``APPROVED_CONTRIBUTORS`` or ``contributor_gate.trusted_email_domains``.
-  The email is proven on the dashboard (Google sign-in) and bound to the GitHub
-  login by a ``@review-of-legends verify <code>`` comment; a commit email is
-  never evidence, since anyone can set one;
+  The email is proven on the dashboard (Google sign-in); the code it issues
+  names the GitHub login it is for, and only that login's
+  ``@review-of-legends verify <code>`` comment binds it, to the account's
+  immutable user id. A commit email is never evidence, since anyone can set one;
 - a configured bot (``contributor_gate.trusted_bots``) or a login the
   deployment approves everywhere (``contributor_gate.approved_logins``).
 
@@ -34,10 +34,8 @@ import secrets
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 
 APPROVED_FILE = ".github/APPROVED_CONTRIBUTORS"
-MAINTAINERS_FILE = ".github/MAINTAINERS"
 PLEDGE_FILE = ".github/CONTRIBUTOR_PLEDGE.md"
 GATE_MARKER = "<!-- review-of-legends-contributor-gate -->"
-PLEDGE_PR_MARKER = "<!-- review-of-legends-contributor-pledge -->"
 WRITE_PERMISSIONS = ("admin", "maintain", "write")
 DEFAULT_TRUSTED_BOTS = ("dependabot[bot]", "renovate[bot]", "github-actions[bot]")
 
@@ -73,14 +71,16 @@ class Decision(NamedTuple):
 
 
 class Identity(NamedTuple):
-    """A GitHub login bound to an email proven on the dashboard."""
+    """A GitHub account bound to an email proven on the dashboard."""
 
     login: str
     email: str
+    # GitHub's immutable user id: a renamed or reassigned login never inherits the binding.
+    user_id: int = 0
 
 
 def parse_list(text: Optional[str]) -> ContributorList:
-    """Parse an APPROVED_CONTRIBUTORS / MAINTAINERS file. A missing file is an empty list."""
+    """Parse an APPROVED_CONTRIBUTORS file. A missing file is an empty list."""
     logins: Set[str] = set()
     domains: Set[str] = set()
     invalid: List[str] = []
@@ -174,16 +174,17 @@ def decide(
     *,
     permission: Optional[str],
     approved: ContributorList,
-    maintainers: ContributorList,
     trusted_domains: Iterable[str],
     identity: Optional[Identity],
     trusted_bots: Iterable[str] = DEFAULT_TRUSTED_BOTS,
+    user_id: int = 0,
 ) -> Decision:
     """Whether ``login`` is an approved contributor, and why.
 
-    ``permission`` is GitHub's collaborator permission for the login (None when
-    unknown or not a collaborator). ``identity`` is the dashboard-proven email
-    bound to the login, if any.
+    ``permission`` is GitHub's base collaborator permission for the login
+    (admin, write, read or none; None when unknown). ``identity`` is the
+    dashboard-proven email bound to the account, if any; it counts only for the
+    account it was bound to (``user_id``, when both sides know it).
     """
     lowered = (login or "").lower()
     if not lowered:
@@ -194,10 +195,12 @@ def decide(
         return Decision(True, "%s permission" % permission)
     if lowered in approved.logins:
         return Decision(True, "approved list")
-    # MAINTAINERS alone is not enough (herdr's rule): a maintainer also has write
-    # access, which the permission check above already accepted.
     domains = set(approved.domains) | {d.lower() for d in trusted_domains}
-    if identity is not None and identity.login.lower() == lowered:
+    same_account = identity is not None and (
+        identity.user_id and user_id and identity.user_id == user_id
+        or not (identity.user_id and user_id) and identity.login.lower() == lowered
+    )
+    if identity is not None and same_account:
         domain = email_domain(identity.email)
         if domain and domain in domains:
             return Decision(True, "verified email at %s" % domain)
@@ -272,6 +275,7 @@ def gate_comment(
     """The one comment an unapproved author's pull request gets (GATE_MARKER, upserted)."""
     domain_list = ", ".join("`@%s`" % d for d in sorted(domains))
     blob = "https://github.com/%s/blob/%s/" % (repo, default_branch)
+    verify = "@review-of-legends verify <code>"
     if lang == "ko":
         lines = [
             GATE_MARKER,
@@ -282,8 +286,8 @@ def gate_comment(
         ]
         if domain_list and dashboard_url:
             lines.append(
-                "- **회사 이메일 인증** (%s): [대시보드](%s/#contributor)에 Google로 로그인해 코드를 받은 뒤, "
-                "이 PR에 `@review-of-legends verify <코드>` 를 댓글로 남기세요." % (domain_list, dashboard_url.rstrip("/"))
+                "- **회사 이메일 인증** (%s): [대시보드](%s/#contributor)에 Google로 로그인해 GitHub 아이디 `%s`용 코드를 받은 뒤, "
+                "이 PR에 `@review-of-legends verify <코드>` 를 댓글로 남기세요." % (domain_list, dashboard_url.rstrip("/"), login)
             )
         if pledge:
             lines.append(
@@ -304,7 +308,7 @@ def gate_comment(
     if domain_list and dashboard_url:
         lines.append(
             "- **Verify your company email** (%s): sign in to the [dashboard](%s/#contributor) with Google, "
-            "get a code, and comment `@review-of-legends verify <code>` on this pull request." % (domain_list, dashboard_url.rstrip("/"))
+            "get a code for the GitHub login `%s`, and comment `%s` on this pull request." % (domain_list, dashboard_url.rstrip("/"), login, verify)
         )
     if pledge:
         lines.append(
@@ -330,7 +334,6 @@ def pledge_pull_request_body(
 ) -> str:
     return "\n".join(
         [
-            PLEDGE_PR_MARKER,
             "@%s signed the [contributor pledge](%s) on %s#%d." % (login, PLEDGE_FILE, repo, number),
             "",
             "- Login: `%s` (GitHub user id %d)" % (login, user_id),

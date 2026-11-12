@@ -15,7 +15,6 @@ author whose trust cannot be read is not reviewed this time). Python 3.9.
 
 from __future__ import annotations
 
-import datetime as dt
 import hashlib
 import threading
 import time
@@ -29,13 +28,13 @@ UNTRUSTED_TTL = 120.0
 LISTS_TTL = 60.0
 # Fork CI approval is refused (no Actions write): try that repository again after this.
 NO_PERMISSION_BACKOFF = 3600.0
+# How long after the daemon first sees a fork head it keeps approving that
+# head's waiting runs (workflows start at different times; a reviewed head
+# still needs its CI).
+CI_APPROVAL_WINDOW = 1800.0
 PLEDGE_BRANCH_PREFIX = "review-of-legends/contributor-"
 
 Logger = Callable[[str], None]
-
-
-def _now_iso() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
 def _status(exc: Exception) -> Optional[int]:
@@ -126,21 +125,23 @@ class Gatekeeper:
         approved, _ = self.lists(client, repo, default_branch(pr))
         if login.lower() in approved.logins:
             return c.Decision(True, "approved list")
+        user = pr.get("user") if isinstance(pr.get("user"), dict) else {}
+        user_id = user.get("id") if isinstance(user.get("id"), int) and not isinstance(user.get("id"), bool) else 0
         identity = None
         row = store.contributor_identity(login) if store is not None else None
         if isinstance(row, dict) and row.get("email"):
-            identity = c.Identity(str(row.get("login") or login), str(row["email"]))
+            identity = c.Identity(str(row.get("login") or login), str(row["email"]), int(row.get("user_id") or 0))
         if identity is not None:
             decision = c.decide(
-                login, permission=None, approved=approved, maintainers=c.parse_list(""),
-                trusted_domains=settings["trusted_email_domains"], identity=identity, trusted_bots=(),
+                login, permission=None, approved=approved, trusted_domains=settings["trusted_email_domains"],
+                identity=identity, trusted_bots=(), user_id=user_id,
             )
             if decision.trusted:
                 return decision
         permission = client.collaborator_permission(login)
         return c.decide(
-            login, permission=permission, approved=approved, maintainers=c.parse_list(""),
-            trusted_domains=settings["trusted_email_domains"], identity=identity, trusted_bots=(),
+            login, permission=permission, approved=approved, trusted_domains=settings["trusted_email_domains"],
+            identity=identity, trusted_bots=(), user_id=user_id,
         )
 
     def forget(self, login: str) -> None:
@@ -238,12 +239,21 @@ class Gatekeeper:
         with self._lock:
             if self._ci_backoff.get(repo.lower(), 0.0) > now:
                 return 0
-        head = str((pr.get("head") or {}).get("sha") or "")
-        if not head:
-            return 0
+        head_info = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+        head = str(head_info.get("sha") or "")
+        head_repo = head_info.get("repo") if isinstance(head_info.get("repo"), dict) else {}
+        source = str(head_repo.get("full_name") or "").lower()
+        branch = str(head_info.get("ref") or "")
+        if not head or not source:
+            return 0  # a deleted fork: nothing that is provably this PR's
         approved = 0
         try:
             for run in client.list_waiting_runs(head):
+                # Only this PR's runs: same commit, same fork and branch. Another
+                # PR (an unapproved author's) can point at the very same commit.
+                run_repo = run.get("head_repository") if isinstance(run.get("head_repository"), dict) else {}
+                if str(run_repo.get("full_name") or "").lower() != source or str(run.get("head_branch") or "") != branch:
+                    continue
                 client.approve_run(int(run["id"]))
                 approved += 1
         except Exception as exc:  # noqa: BLE001 - a missing permission must not stop reviews
@@ -279,7 +289,9 @@ class Gatekeeper:
         return self._pledge(client, store, config, repo, request, texts)
 
     def _verify(self, client: Any, store: Any, config: Dict[str, Any], repo: str, request: mentions.Request, texts: Dict[str, str]) -> str:
-        email = store.consume_contributor_code(c.code_hash(request.command.value), request.login, request.url)
+        email = store.consume_contributor_code(
+            c.code_hash(request.command.value), request.login, request.url, user_id=request.user_id,
+        )
         if not email:
             return mentions._reply(request, texts["verify_unknown"])
         self.forget(request.login)
@@ -326,11 +338,15 @@ class Gatekeeper:
         existing = client.open_pull_for_branch(branch)
         if existing is not None:
             return str(existing.get("html_url") or "")
+        base_sha = client.branch_sha(base)
         try:
-            client.create_branch(branch, client.branch_sha(base))
+            client.create_branch(branch, base_sha)
         except Exception as exc:  # noqa: BLE001 - 422: the branch is left from a declined pull request
             if _status(exc) != 422:
                 raise
+            # Start it again from the default branch: an old base would
+            # conflict, or carry back a list a maintainer has since changed.
+            client.update_branch(branch, base_sha)
         current = client.get_file(c.APPROVED_FILE, branch)
         text, sha = (current[0], current[1]) if current else (None, "")
         try:
@@ -344,7 +360,7 @@ class Gatekeeper:
             )
         body = c.pledge_pull_request_body(
             request.login, int(request.user_id or 0), repo, request.number, request.url,
-            str(signature.get("signed_at") or _now_iso()), str(signature.get("pledge_sha") or ""),
+            str(signature["signed_at"]), str(signature.get("pledge_sha") or ""),
         )
         pull = client.create_pull(branch, base, "chore: approve contributor @%s (pledge signed)" % request.login, body)
         return str(pull.get("html_url") or "")

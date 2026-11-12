@@ -75,7 +75,10 @@ class FakeGitHub:
     def list_waiting_runs(self, head_sha: str):
         if self.runs_error is not None:
             raise self.runs_error
-        return [{"id": run_id} for run_id in self.runs.get(head_sha, [])]
+        return [
+            {"id": run_id, "head_repository": {"full_name": source}, "head_branch": branch}
+            for run_id, source, branch in self.runs.get(head_sha, [])
+        ]
 
     def open_pull_for_branch(self, branch: str):
         return self.pulls.get(branch)
@@ -109,6 +112,12 @@ class FakeGitHub:
                 self.files[(path, branch)] = value
         self.writes.append(("branch", branch, sha))
 
+    def update_branch(self, branch: str, sha: str):
+        for (path, ref), value in list(self.files.items()):
+            if ref == "main":
+                self.files[(path, branch)] = value
+        self.writes.append(("reset", branch, sha))
+
     def put_file(self, path: str, branch: str, text: str, message: str, sha: str = ""):
         self.files[(path, branch)] = (text, "new-sha")
         self.writes.append(("put", path, branch, text, sha))
@@ -120,18 +129,19 @@ class FakeGitHub:
         return pull
 
 
-def make_pr(number: int, login: str, fork: bool = False, head: str = "a" * 40) -> Dict[str, Any]:
+def make_pr(number: int, login: str, fork: bool = False, head: str = "a" * 40, user_id: int = 0) -> Dict[str, Any]:
     head_repo = {"full_name": "someone/fork" if fork else REPO}
     return {
         "number": number,
         "state": "open",
-        "user": {"login": login, "type": "User"},
-        "head": {"sha": head, "repo": head_repo},
+        "user": {"login": login, "type": "User", "id": user_id or 5000 + number},
+        "head": {"sha": head, "ref": "topic", "repo": head_repo},
         "base": {"ref": "main", "repo": {"full_name": REPO, "default_branch": "main"}},
     }
 
 
-def request(number: int, login: str, line: str, user_id: int = 4242) -> mentions.Request:
+def request(number: int, login: str, line: str, user_id: int = 0) -> mentions.Request:
+    user_id = user_id or 5000 + number  # make_pr's author id: the commenter is the PR author
     return mentions.Request(
         kind=mentions.ISSUE, comment_id=900 + number, number=number, login=login,
         url="https://github.com/%s/pull/%d#issuecomment-%d" % (REPO, number, 900 + number),
@@ -174,6 +184,21 @@ class DecideTest(GateTestCase):
         self.assertEqual("this bot", self.decide(BOT).reason)
         self.assertEqual("trusted bot", self.decide("dependabot[bot]").reason)
 
+    def test_a_read_failure_propagates_and_is_not_cached(self) -> None:
+        calls = []
+
+        def broken(login):
+            calls.append(login)
+            raise status_error(502)
+
+        self.gh.collaborator_permission = broken
+        with self.assertRaises(svc.ServiceError):
+            self.decide("mallory")
+        del self.gh.collaborator_permission
+        self.gh.permissions["mallory"] = "write"
+        self.assertTrue(self.decide("mallory").trusted)
+        self.assertEqual(["mallory"], calls)
+
     def test_unknown_author_is_cached_for_the_untrusted_ttl(self) -> None:
         self.assertFalse(self.decide("mallory").trusted)
         self.assertFalse(self.decide("mallory").trusted)
@@ -184,12 +209,17 @@ class DecideTest(GateTestCase):
 
     def test_verified_email_at_a_listed_or_configured_domain(self) -> None:
         for login, email in (("dave", "dave@example.com"), ("erin", "erin@company.example")):
-            self.store.create_contributor_code(email, c.code_hash("rol-" + login + "0000"))
-            self.assertEqual(email, self.store.consume_contributor_code(c.code_hash("rol-" + login + "0000"), login))
+            self.store.create_contributor_code(email, c.code_hash("rol-" + login + "0000"), login)
+            self.assertEqual(email, self.store.consume_contributor_code(c.code_hash("rol-" + login + "0000"), login, user_id=5001))
             self.assertTrue(self.decide(login).trusted, login)
 
+    def test_a_binding_does_not_follow_a_reassigned_login(self) -> None:
+        self.store.create_contributor_code("dave@example.com", c.code_hash("rol-dave0000"), "dave")
+        self.store.consume_contributor_code(c.code_hash("rol-dave0000"), "dave", user_id=5001)
+        self.assertFalse(self.keeper.decide(self.gh, self.config, REPO, make_pr(1, "dave", user_id=9999), self.store).trusted)
+
     def test_verified_email_at_another_domain_is_not_enough(self) -> None:
-        self.store.create_contributor_code("frank@other.example", c.code_hash("rol-frank0000"))
+        self.store.create_contributor_code("frank@other.example", c.code_hash("rol-frank0000"), "frank")
         self.store.consume_contributor_code(c.code_hash("rol-frank0000"), "frank")
         self.assertFalse(self.decide("frank").trusted)
 
@@ -235,12 +265,18 @@ class CommentTest(GateTestCase):
 
 class ForkCiTest(GateTestCase):
     def test_waiting_runs_of_a_fork_head_are_approved(self) -> None:
-        self.gh.runs["a" * 40] = [11, 12]
+        self.gh.runs["a" * 40] = [(11, "someone/fork", "topic"), (12, "someone/fork", "topic")]
         self.assertEqual(2, self.keeper.approve_fork_runs(self.gh, self.config, REPO, make_pr(1, "alice", fork=True)))
         self.assertEqual([("approve", 11), ("approve", 12)], self.gh.writes)
 
+    def test_another_prs_runs_on_the_same_commit_are_not_approved(self) -> None:
+        # An unapproved author can open a pull request from another fork or branch at the very same commit.
+        self.gh.runs["a" * 40] = [(11, "someone/fork", "topic"), (12, "mallory/fork", "topic"), (13, "someone/fork", "other")]
+        self.assertEqual(1, self.keeper.approve_fork_runs(self.gh, self.config, REPO, make_pr(1, "alice", fork=True)))
+        self.assertEqual([("approve", 11)], self.gh.writes)
+
     def test_a_branch_of_the_repository_itself_is_left_alone(self) -> None:
-        self.gh.runs["a" * 40] = [11]
+        self.gh.runs["a" * 40] = [(11, REPO, "topic")]
         self.assertEqual(0, self.keeper.approve_fork_runs(self.gh, self.config, REPO, make_pr(1, "alice")))
 
     def test_a_refusal_backs_off_and_says_why(self) -> None:
@@ -248,14 +284,14 @@ class ForkCiTest(GateTestCase):
         self.assertEqual(0, self.keeper.approve_fork_runs(self.gh, self.config, REPO, make_pr(1, "alice", fork=True)))
         self.assertIn("Actions: read and write", self.logged[-1])
         self.gh.runs_error = None
-        self.gh.runs["a" * 40] = [11]
+        self.gh.runs["a" * 40] = [(11, "someone/fork", "topic")]
         self.assertEqual(0, self.keeper.approve_fork_runs(self.gh, self.config, REPO, make_pr(1, "alice", fork=True)))
         self.now += gate_mod.NO_PERMISSION_BACKOFF + 1
         self.assertEqual(1, self.keeper.approve_fork_runs(self.gh, self.config, REPO, make_pr(1, "alice", fork=True)))
 
     def test_switched_off(self) -> None:
         self.config = dict(GATE, contributor_gate={"enabled": True, "approve_fork_ci": False})
-        self.gh.runs["a" * 40] = [11]
+        self.gh.runs["a" * 40] = [(11, "someone/fork", "topic")]
         self.assertEqual(0, self.keeper.approve_fork_runs(self.gh, self.config, REPO, make_pr(1, "alice", fork=True)))
 
 
@@ -266,7 +302,7 @@ class CommandTest(GateTestCase):
 
     def test_verify_binds_and_approves_a_trusted_domain(self) -> None:
         code = c.new_verify_code()
-        self.store.create_contributor_code("mallory@company.example", c.code_hash(code))
+        self.store.create_contributor_code("mallory@company.example", c.code_hash(code), "mallory")
         self.assertFalse(self.keeper.decide(self.gh, self.config, REPO, make_pr(1, "mallory"), self.store).trusted)
         reply = self.answer(1, "mallory", "verify " + code)
         self.assertIn("company.example", reply)
@@ -275,6 +311,14 @@ class CommandTest(GateTestCase):
         self.assertTrue(self.keeper.decide(self.gh, self.config, REPO, make_pr(1, "mallory"), self.store).trusted)
         self.assertIn("already used", self.answer(1, "mallory", "verify " + code))  # used: refused
         self.assertIsNotNone(self.store.contributor_identity("Mallory"))
+
+    def test_a_code_read_off_a_public_comment_is_worthless_to_someone_else(self) -> None:
+        code = c.new_verify_code()
+        self.store.create_contributor_code("mallory@company.example", c.code_hash(code), "mallory")
+        self.answer(1, "eve", "verify " + code)
+        self.assertIsNone(self.store.contributor_identity("eve"))
+        # Not used up by eve: mallory still can.
+        self.assertIn("now reviewed", self.answer(1, "mallory", "verify " + code))
 
     def test_verify_with_an_unknown_code(self) -> None:
         reply = self.answer(1, "mallory", "verify rol-00000000")
@@ -290,9 +334,14 @@ class CommandTest(GateTestCase):
         self.assertEqual("alice\n*@example.com\nmallory  # pledge signed in %s#3\n" % REPO, put[3])
         self.assertEqual("list-sha", put[4])
         pull = self.gh.pulls[branch]
-        self.assertIn(c.PLEDGE_PR_MARKER, pull["body"])
         self.assertIn("pledge-sha", pull["body"])
-        self.assertIn("4242", pull["body"])
+        self.assertIn("5003", pull["body"])
+
+    def test_a_branch_left_from_a_declined_pull_request_starts_again_from_main(self) -> None:
+        self.gh.branch_error = status_error(422)
+        self.answer(3, "mallory", c.PLEDGE_SENTENCE)
+        self.assertIn(("reset", gate_mod.PLEDGE_BRANCH_PREFIX + "mallory", "f" * 40), self.gh.writes)
+        self.assertIn(gate_mod.PLEDGE_BRANCH_PREFIX + "mallory", self.gh.pulls)
         # Signing again (another comment) points at the same pull request, nothing new.
         writes = len(self.gh.writes)
         again = self.keeper.handle_command(self.gh, self.store, self.config, REPO, request(3, "mallory", c.PLEDGE_SENTENCE)._replace(comment_id=999))
@@ -325,7 +374,7 @@ class CommandTest(GateTestCase):
 
 class StoreAndParsingTest(GateTestCase):
     def test_an_expired_code_binds_nothing(self) -> None:
-        self.store.create_contributor_code("dave@example.com", c.code_hash("rol-dave0000"), ttl_seconds=-5)
+        self.store.create_contributor_code("dave@example.com", c.code_hash("rol-dave0000"), "dave", ttl_seconds=-5)
         self.assertIsNone(self.store.consume_contributor_code(c.code_hash("rol-dave0000"), "dave"))
         self.assertIsNone(self.store.contributor_identity("dave"))
 
@@ -379,6 +428,7 @@ class GatedListing(GitHub):
 class SchedulerGateTest(SchedulerTestCase):
     def setUp(self) -> None:
         super().setUp()
+        self.clock = 50_000.0
         self.listing = GatedListing()
         self.listing.gate.files[(c.APPROVED_FILE, "main")] = ("alice\n", "s")
 
@@ -386,13 +436,14 @@ class SchedulerGateTest(SchedulerTestCase):
         item = pr(number, head)
         item["user"] = {"login": login, "type": "User"}
         item["head"]["repo"] = {"full_name": "someone/fork"}
+        item["head"]["ref"] = "topic"
         item["base"]["repo"] = {"full_name": REPO, "default_branch": "main"}
         return item
 
     def test_only_approved_authors_are_queued_and_the_rest_get_the_gate_comment(self) -> None:
         scheduler = self.make(**GATE)
         scheduler.control()
-        self.listing.gate.runs["a" * 40] = [31]
+        self.listing.gate.runs["a" * 40] = [(31, "someone/fork", "topic")]
         self.listing.prs[REPO] = [self.authored(8, "a" * 40, "alice"), self.authored(9, "c" * 40, "mallory")]
         scheduler.tick()
         self.assertEqual([8], sorted(number for _, number in scheduler._queue))
@@ -406,16 +457,45 @@ class SchedulerGateTest(SchedulerTestCase):
         self.assertEqual(1, len([w for w in self.listing.gate.writes if w[0] == "comment"]))
         self.assertEqual([8], sorted(number for _, number in scheduler._queue))
 
+    def test_fork_ci_is_approved_after_the_review_too(self) -> None:
+        reviewed = {"8": {"head_sha": "a" * 40, "reviewed_at": "2026-10-13T10:00:00+00:00"}}
+        scheduler = self.make(reviewed=reviewed, monotonic=lambda: self.clock, **GATE)
+        scheduler.control()
+        self.listing.prs[REPO] = [self.authored(8, "a" * 40, "alice")]
+        scheduler.tick()
+        self.assertEqual({}, scheduler._queue)  # reviewed already
+        self.listing.gate.runs["a" * 40] = [(31, "someone/fork", "topic")]  # a workflow that started late
+        scheduler.tick()
+        self.assertIn(("approve", 31), self.listing.gate.writes)
+        # Past the window the head is left alone.
+        self.listing.gate.runs["a" * 40] = [(32, "someone/fork", "topic")]
+        self.clock += gate_mod.CI_APPROVAL_WINDOW + 1
+        scheduler.tick()
+        self.assertNotIn(("approve", 32), self.listing.gate.writes)
+
+    def test_a_gate_read_failure_skips_this_tick_and_recovers(self) -> None:
+        scheduler = self.make(monotonic=lambda: self.clock, **GATE)
+        scheduler.control()
+        self.listing.prs[REPO] = [self.authored(9, "c" * 40, "carol")]
+        self.listing.gate.permissions["carol"] = "write"
+        real = self.listing.gate.collaborator_permission
+        self.listing.gate.collaborator_permission = lambda login: (_ for _ in ()).throw(status_error(502))
+        scheduler.tick()
+        self.assertEqual({}, scheduler._queue)
+        self.assertTrue(any("contributor gate could not be read" in line for line in self.logged))
+        self.listing.gate.collaborator_permission = real
+        scheduler.tick()
+        self.assertEqual([9], sorted(number for _, number in scheduler._queue))
+
     def test_listing_the_author_lets_the_pr_in_and_notes_it(self) -> None:
-        scheduler = self.make(**GATE)
+        scheduler = self.make(monotonic=lambda: self.clock, **GATE)
         scheduler.control()
         self.listing.prs[REPO] = [self.authored(9, "c" * 40, "mallory")]
         scheduler.tick()
         self.assertEqual({}, scheduler._queue)
         self.listing.gate.files[(c.APPROVED_FILE, "main")] = ("alice\nmallory\n", "s2")
-        self.now += gate_mod.UNTRUSTED_TTL + 1
-        scheduler._gatekeeper._clock = lambda: self.now
-        scheduler._gatekeeper.forget_lists(REPO)
+        # No hand-holding: the caches expire by the gatekeeper's own clock.
+        self.clock += gate_mod.UNTRUSTED_TTL + 1
         scheduler.tick()
         self.assertEqual([9], sorted(number for _, number in scheduler._queue))
         self.assertIn("approved contributor", self.listing.gate.comments[9][0]["body"])

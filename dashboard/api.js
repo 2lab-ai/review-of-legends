@@ -85,9 +85,10 @@ export class ApiClient {
     return data;
   }
 
-  /** A one-time code for `@review-of-legends verify <code>` (contributor gate): `{code, expires_at, command}`. */
-  async contributorCode() {
-    return this.request('/api/contributor/code', { method: 'POST', body: {}, csrf: true });
+  /** A one-time code for `@review-of-legends verify <code>`, usable only by `githubLogin` (contributor gate):
+   *  `{code, expires_at, github_login, command}`. */
+  async contributorCode(githubLogin) {
+    return this.request('/api/contributor/code', { method: 'POST', body: { github_login: githubLogin }, csrf: true });
   }
 
   async me() {
