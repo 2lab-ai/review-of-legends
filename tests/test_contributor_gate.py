@@ -297,6 +297,13 @@ class CommentTest(GateTestCase):
         self.assertIn("@review-of-legends " + c.PLEDGE_SENTENCE, body)
         self.assertIn("`@company.example`", body)
         self.assertIn("https://reviews.example.com/#contributor", body)
+        # New instructions (another trusted domain): the same comment is updated once, nothing new is posted.
+        self.config = dict(GATE, contributor_gate={"enabled": True, "trusted_email_domains": ["company.example", "other.example"]})
+        self.assertTrue(self.keeper.post_gate_comment(self.gh, self.config, REPO, pull, self.store))
+        self.assertFalse(self.keeper.post_gate_comment(self.gh, self.config, REPO, pull, self.store))
+        self.assertEqual(1, len([w for w in self.gh.writes if w[0] == "comment"]))
+        self.assertEqual(1, len([w for w in self.gh.writes if w[0] == "update"]))
+        self.assertIn("`@other.example`", self.gh.comments[5][0]["body"])
 
     def test_a_copied_marker_by_someone_else_is_never_edited(self) -> None:
         self.gh.comments[5] = [{"id": 1, "body": c.GATE_MARKER + " copied", "user": {"login": "mallory"}}]
@@ -754,6 +761,24 @@ class SchedulerGateTest(SchedulerTestCase):
             self.clock += gate_mod.CI_APPROVAL_WINDOW / 2
         self.assertNotIn(("approve", 31), self.listing.gate.writes)
         # Hours later mallory is accepted: the run still goes.
+        self.listing.gate.files[(c.APPROVED_FILE, "main")] = ("alice\nmallory\n", "s2")
+        self.clock += gate_mod.UNTRUSTED_TTL + 1
+        scheduler.tick()
+        self.assertIn(("approve", 31), self.listing.gate.writes)
+
+    def test_a_draft_opened_later_on_the_same_commit_does_not_use_up_the_window(self) -> None:
+        scheduler = self.make(monotonic=lambda: self.clock, **GATE)
+        scheduler.control()
+        self.listing.prs[REPO] = [self.authored(8, "a" * 40, "alice")]
+        scheduler.tick()  # the window starts; nothing waits yet
+        draft = self.authored(9, "a" * 40, "mallory")
+        draft["draft"] = True
+        self.listing.prs[REPO].append(draft)
+        self.listing.gate.runs["a" * 40] = [(31, "someone/fork", "topic")]
+        for _ in range(3):
+            scheduler.tick()
+            self.clock += gate_mod.CI_APPROVAL_WINDOW / 2
+        self.assertNotIn(("approve", 31), self.listing.gate.writes)
         self.listing.gate.files[(c.APPROVED_FILE, "main")] = ("alice\nmallory\n", "s2")
         self.clock += gate_mod.UNTRUSTED_TTL + 1
         scheduler.tick()

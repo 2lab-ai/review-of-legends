@@ -42,7 +42,6 @@ class ParseListTest(unittest.TestCase):
 
 class DecideTest(unittest.TestCase):
     approved = c.parse_list("alice\n*@example.com\n")
-    empty = c.parse_list("")
 
     def decide(self, login, permission=None, identity=None, domains=(), user_id=0):
         return c.decide(
@@ -111,6 +110,11 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual([], settings["trusted_email_domains"])
         self.assertTrue(settings["approve_fork_ci"])
         self.assertIsNone(settings["repositories"])
+
+    def test_punycode_domains(self) -> None:
+        self.assertEqual("xn--e1afmkfd.xn--p1ai", c.normalize_domain("xn--e1afmkfd.xn--p1ai"))
+        self.assertEqual(frozenset({"xn--e1afmkfd.xn--p1ai"}), c.parse_list("*@xn--e1afmkfd.xn--p1ai\n").domains)
+        self.assertIsNone(c.normalize_domain("example.c0m"))
 
     def test_domains_are_normalized(self) -> None:
         settings = c.gate_settings({"contributor_gate": {"enabled": True, "trusted_email_domains": ["@Company.example", "*@b.example", "c.example"]}})

@@ -49,7 +49,8 @@ VERIFY_CODE_TTL_SECONDS = 3600
 # a GitHub App's bot account adds "[bot]" (zhuge-bot[bot]).
 LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}(?:\[bot\])?")
 # A domain line: *@example.com (an IDN must be written in punycode).
-DOMAIN_LINE = re.compile(r"\*@((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63})")
+# The last label: letters, or punycode (xn--...) for an internationalized top-level domain.
+DOMAIN_LINE = re.compile(r"\*@((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59}))")
 VERIFY_CODE = re.compile(r"rol-[a-z0-9]{6,32}")
 
 
