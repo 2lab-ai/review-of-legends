@@ -121,6 +121,8 @@ class Gatekeeper:
             return c.Decision(True, "this bot")
         if login.lower() in settings["trusted_bots"]:
             return c.Decision(True, "trusted bot")
+        if login.lower() in settings["approved_logins"]:
+            return c.Decision(True, "approved by the deployment")
         approved, _ = self.lists(client, repo, default_branch(pr))
         if login.lower() in approved.logins:
             return c.Decision(True, "approved list")

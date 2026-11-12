@@ -13,7 +13,8 @@ its waiting fork CI runs, only when the author is an approved contributor:
   The email is proven on the dashboard (Google sign-in) and bound to the GitHub
   login by a ``@review-of-legends verify <code>`` comment; a commit email is
   never evidence, since anyone can set one;
-- a configured bot (``contributor_gate.trusted_bots``).
+- a configured bot (``contributor_gate.trusted_bots``) or a login the
+  deployment approves everywhere (``contributor_gate.approved_logins``).
 
 Everyone else gets one gate comment that explains the two ways in: domain
 verification, and signing ``.github/CONTRIBUTOR_PLEDGE.md`` by commenting
@@ -140,6 +141,9 @@ def gate_settings(config: Dict[str, Any]) -> Dict[str, Any]:
     pledge_pr = raw.get("open_pledge_pull_request", True)
     if not isinstance(pledge_pr, bool):
         raise ValueError("config.contributor_gate.open_pledge_pull_request must be true or false")
+    logins = raw.get("approved_logins", []) or []
+    if not isinstance(logins, list) or not all(isinstance(x, str) and LOGIN.fullmatch(x.strip().lstrip("@")) for x in logins):
+        raise ValueError("config.contributor_gate.approved_logins must be a list of GitHub logins")
     repos = raw.get("repositories")
     if repos is not None and (not isinstance(repos, list) or not all(isinstance(r, str) and "/" in r for r in repos)):
         raise ValueError("config.contributor_gate.repositories must be a list of owner/name")
@@ -147,6 +151,10 @@ def gate_settings(config: Dict[str, Any]) -> Dict[str, Any]:
         "enabled": enabled,
         "trusted_email_domains": sorted(set(domains)),
         "trusted_bots": sorted({b.strip().lower() for b in bots}),
+        # Logins the deployment approves in every gated repository (beside each
+        # repository's own APPROVED_CONTRIBUTORS): for private repositories
+        # that carry no list file.
+        "approved_logins": sorted({x.strip().lstrip("@").lower() for x in logins}),
         "approve_fork_ci": approve_ci,
         "open_pledge_pull_request": pledge_pr,
         # None: every review repository; a list: only these (lowercased).

@@ -105,9 +105,14 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(["b.example", "c.example", "company.example"], settings["trusted_email_domains"])
 
     def test_bad_shapes_are_refused(self) -> None:
-        for block in ({"enabled": "yes"}, {"trusted_email_domains": ["not a domain"]}, {"trusted_bots": "x"}, {"repositories": ["noslash"]}, []):
+        for block in ({"enabled": "yes"}, {"trusted_email_domains": ["not a domain"]}, {"trusted_bots": "x"}, {"repositories": ["noslash"]},
+                      {"approved_logins": ["not a login!"]}, {"approved_logins": "alice"}, []):
             with self.subTest(block=block), self.assertRaises(ValueError):
                 c.gate_settings({"contributor_gate": block})
+
+    def test_approved_logins_are_normalized(self) -> None:
+        settings = c.gate_settings({"contributor_gate": {"approved_logins": ["@Alice", "release-bot[bot]"]}})
+        self.assertEqual(["alice", "release-bot[bot]"], settings["approved_logins"])
 
     def test_gate_applies_to_listed_repositories_only(self) -> None:
         settings = c.gate_settings({"contributor_gate": {"enabled": True, "repositories": ["Acme-Corp/Public"]}})

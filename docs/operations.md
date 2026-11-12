@@ -866,6 +866,7 @@ On a public repository anyone can open a pull request. With `contributor_gate.en
   "enabled": true,
   "trusted_email_domains": ["example.com"],
   "trusted_bots": ["dependabot[bot]", "renovate[bot]", "github-actions[bot]"],
+  "approved_logins": [],
   "approve_fork_ci": true,
   "open_pledge_pull_request": true
 }
@@ -878,7 +879,7 @@ Add `"repositories": ["owner/name"]` to gate only those repositories. Without it
 - They have write, maintain or admin permission on the repository.
 - Their login is listed in `.github/APPROVED_CONTRIBUTORS` on the default branch. The format is one login per line; `#` starts a comment.
 - They proved an email at a trusted domain. A trusted domain is either a `*@example.com` line in that file or an entry in `trusted_email_domains`.
-- They are one of `trusted_bots`.
+- They are one of `trusted_bots`, or one of `approved_logins`. `approved_logins` approves a login in every gated repository, for private repositories that carry no list file. Put the bot accounts of your own GitHub Apps that open pull requests in `trusted_bots` (`name[bot]`); a bot is never a collaborator, so without a line it is gated.
 
 A login in `.github/MAINTAINERS` counts only together with write access, as in herdr.
 

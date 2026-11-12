@@ -165,6 +165,11 @@ class DecideTest(GateTestCase):
         self.gh.permissions["carol"] = "write"
         self.assertEqual(c.Decision(True, "write permission"), self.decide("carol"))
 
+    def test_a_login_the_deployment_approves(self) -> None:
+        self.config = dict(GATE, contributor_gate={"enabled": True, "approved_logins": ["Grace"]})
+        self.assertEqual(c.Decision(True, "approved by the deployment"), self.decide("grace"))
+        self.assertEqual([], self.gh.permission_reads)
+
     def test_this_bot_and_trusted_bots(self) -> None:
         self.assertEqual("this bot", self.decide(BOT).reason)
         self.assertEqual("trusted bot", self.decide("dependabot[bot]").reason)
