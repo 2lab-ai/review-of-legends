@@ -28,7 +28,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from . import contributors
 from . import dashboard_execution
+from . import gate
 from . import mentions
 
 
@@ -340,6 +342,10 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ServiceError(
             "config.mentions.default_reply_language must be one of %s" % ", ".join(mentions.REPLY_LANGUAGES)
         )
+    try:
+        contributors.gate_settings(config)
+    except ValueError as exc:
+        raise ServiceError(str(exc)) from None
     dashboard = config.get("dashboard")
     public_url = dashboard.get("public_url") if isinstance(dashboard, dict) else None
     if public_url is not None and not (isinstance(public_url, str) and public_url.startswith("https://")):
@@ -2228,6 +2234,87 @@ class GitHubClient:
     def reply_to_review_comment(self, number: int, comment_id: int, body: str) -> Any:
         return self.request(
             "POST", f"repos/{self.repo}/pulls/{number}/comments/{comment_id}/replies", {"body": body}
+        )
+
+    # ------------------------------------------------- contributor gate (gate.py)
+
+    def get_file(self, path: str, ref: str) -> tuple[str, str] | None:
+        """``(text, blob sha)`` of one file at ``ref``, or None when it does not exist.
+
+        Conditional on the watch client, so an unchanged file costs a 304.
+        """
+        query = urllib.parse.urlencode({"ref": ref})
+        try:
+            data = self.request(
+                "GET", f"repos/{self.repo}/contents/{urllib.parse.quote(path)}?{query}", conditional=True
+            )
+        except ServiceError as exc:
+            if getattr(exc, "status_code", None) == 404:
+                return None
+            raise
+        if not isinstance(data, dict) or data.get("type") != "file":
+            return None
+        raw = data.get("content")
+        if data.get("encoding") != "base64" or not isinstance(raw, str):
+            raise ServiceError(f"GitHub returned {path} in an unexpected encoding")
+        return base64.b64decode(raw).decode("utf-8", errors="replace"), str(data.get("sha") or "")
+
+    def collaborator_permission(self, login: str) -> str | None:
+        """The login's role on the repository (admin, maintain, write, triage, read), or None if unknown."""
+        try:
+            data = self.request(
+                "GET", f"repos/{self.repo}/collaborators/{urllib.parse.quote(login)}/permission"
+            )
+        except ServiceError as exc:
+            if getattr(exc, "status_code", None) == 404:
+                return None
+            raise
+        if not isinstance(data, dict):
+            return None
+        role = data.get("role_name") or data.get("permission")
+        return str(role) if isinstance(role, str) and role else None
+
+    def list_waiting_runs(self, head_sha: str) -> list[dict[str, Any]]:
+        """Workflow runs of ``head_sha`` waiting for a maintainer's approval (fork pull requests)."""
+        query = urllib.parse.urlencode(
+            {"event": "pull_request", "status": "action_required", "head_sha": head_sha, "per_page": "100"}
+        )
+        data = self.request("GET", f"repos/{self.repo}/actions/runs?{query}")
+        runs = data.get("workflow_runs") if isinstance(data, dict) else None
+        return [run for run in runs or [] if isinstance(run, dict)]
+
+    def approve_run(self, run_id: int) -> Any:
+        return self.request("POST", f"repos/{self.repo}/actions/runs/{int(run_id)}/approve", {})
+
+    def branch_sha(self, branch: str) -> str:
+        data = self.request("GET", f"repos/{self.repo}/git/ref/heads/{urllib.parse.quote(branch)}")
+        sha = ((data or {}).get("object") or {}).get("sha") if isinstance(data, dict) else None
+        if not isinstance(sha, str) or not sha:
+            raise ServiceError(f"GitHub returned no commit for branch {branch}")
+        return sha
+
+    def create_branch(self, branch: str, sha: str) -> Any:
+        return self.request("POST", f"repos/{self.repo}/git/refs", {"ref": f"refs/heads/{branch}", "sha": sha})
+
+    def put_file(self, path: str, branch: str, text: str, message: str, sha: str = "") -> Any:
+        payload: dict[str, Any] = {
+            "message": message,
+            "content": base64.b64encode(text.encode("utf-8")).decode("ascii"),
+            "branch": branch,
+        }
+        if sha:
+            payload["sha"] = sha
+        return self.request("PUT", f"repos/{self.repo}/contents/{urllib.parse.quote(path)}", payload)
+
+    def open_pull_for_branch(self, branch: str) -> dict[str, Any] | None:
+        owner = self.repo.split("/", 1)[0]
+        query = urllib.parse.urlencode({"head": f"{owner}:{branch}", "state": "open", "per_page": "1"})
+        data = self.request("GET", f"repos/{self.repo}/pulls?{query}")
+        return data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else None
+
+    def create_pull(self, head: str, base: str, title: str, body: str) -> dict[str, Any]:
+        return self.request(
+            "POST", f"repos/{self.repo}/pulls", {"head": head, "base": base, "title": title, "body": body}
         )
 
 
@@ -7095,6 +7182,7 @@ def _run_once_locked(
         )
 
     pause_path = dashboard_execution.executor_pause_path(config, state_path)
+    gatekeeper = gate.Gatekeeper(log=log)
 
     def client_factory(repository: str) -> GitHubClient:
         return make_github_client(repository, config)
@@ -7187,6 +7275,18 @@ def _run_once_locked(
             if not args.pr and is_draft(pr) and not config.get("review_drafts", False):
                 # Reviewed once marked ready; an explicit --pr still reviews it.
                 continue
+            if not args.force and gatekeeper.applies(config, repository) and not head_already_reviewed(
+                current_repo_state, int(pr.get("number") or 0), str(pr.get("head", {}).get("sha") or "")
+            ):
+                # The contributor gate, as in the daemon; --force is the operator's override.
+                try:
+                    decision = gatekeeper.decide(client, config, repository, pr, store)
+                except ServiceError as exc:
+                    log(f"{repository} pr #{pr.get('number')}: skipping, contributor gate could not be read ({exc})")
+                    continue
+                if not decision.trusted:
+                    log(f"{repository} pr #{pr.get('number')}: skipping, {decision.reason} (contributor gate)")
+                    continue
             if not args.force:
                 # A head whose review keeps failing is not re-run every cycle
                 # (each attempt runs every agent). Operator retries skip this.
@@ -7445,6 +7545,24 @@ def run_doctor(args: argparse.Namespace) -> int:
             print(f"github app token: FAILED ({exc})")
         else:
             print("github app token: ok")
+    try:
+        gate_settings = contributors.gate_settings(config)
+    except ValueError:
+        gate_settings = {"enabled": False}
+    if gate_settings.get("enabled"):
+        scope = gate_settings["repositories"] or ["every review repository"]
+        print(
+            "contributor gate: on for %s; trusted domains: %s"
+            % (", ".join(scope), ", ".join(gate_settings["trusted_email_domains"]) or "none configured")
+        )
+        if app and app_ok:
+            granted = _github_app_permissions.get((int(app["app_id"]), int(app["installation_id"]))) or {}
+            for name, need in (("actions", "approve waiting fork CI runs"), ("contents", "open the pledge pull request")):
+                level = granted.get(name, "none")
+                state = "ok" if level == "write" else "%s (needs write to %s)" % (level, need)
+                print(f"contributor gate: app {name} permission: {state}")
+    else:
+        print("contributor gate: off")
 
     runner = config.get("agent_runner", {})
     command = runner.get("command") or []

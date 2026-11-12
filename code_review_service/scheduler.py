@@ -60,6 +60,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from . import dashboard_execution
+from . import gate
 from . import mentions
 from . import author_review
 from . import service as svc
@@ -81,6 +82,8 @@ PRUNE_INTERVAL_SECONDS = 3600.0
 MAX_REVIEWED_STATUS_POSTS_PER_TICK = 20
 # A command's content POSTs (a reaction and a reply), out of the same budget per tick.
 COMMAND_POSTS = 2
+# Contributor gate comments written per tick (gate.py): new and approved notes.
+GATE_WRITES_PER_TICK = 3
 # Watches in a row a command's GitHub copy may differ from the same listed
 # revision before it is passed over: an edit lists a new revision and starts
 # the count again, so only a difference that never goes away (a deleted
@@ -262,6 +265,9 @@ class ReviewScheduler:
         self._busy_logged = False
         self._seen_draft: Set[Key] = set()
         self._skip_logged: Dict[Key, Tuple[str, str]] = {}
+        # The contributor gate (gate.py): who may be reviewed, decided with caches.
+        self._gatekeeper = gate.Gatekeeper(clock=self._monotonic, log=_log)
+        self._gate_writes = GATE_WRITES_PER_TICK
         self._threads: List[threading.Thread] = []
         # The dispatch and retry threads by name, so a stopped one can be started again.
         self._workers: Dict[str, Tuple[Callable[[], None], threading.Thread]] = {}
@@ -658,6 +664,7 @@ class ReviewScheduler:
             return self.watch_interval
         repositories = self._repositories()
         self._ticks += 1
+        self._gate_writes = GATE_WRITES_PER_TICK
         lowest: Optional[int] = None
         status_budget = MAX_REVIEWED_STATUS_POSTS_PER_TICK
         listed: List[str] = []
@@ -822,6 +829,9 @@ class ReviewScheduler:
                 candidates.append((key, number, head, pr, kind, may_be_opened))
         if baselined_drafts:
             self._clear_draft_baselines(repo, baselined_drafts)
+        if candidates and self._gatekeeper.applies(self.config, repo):
+            # Network reads, outside every lock: an unapproved author is not queued.
+            candidates = self._gate_candidates(repo, candidates, skips)
         now = self._clock()
         with self._cond:
             for key in list(self._queue):
@@ -864,6 +874,48 @@ class ReviewScheduler:
             self._cond.notify_all()
         for _, number, _, reason in fresh_skips:
             _log("%s pr #%d: skipping, %s" % (repo, number, reason))
+
+    def _gate_candidates(
+        self,
+        repo: str,
+        candidates: List[Tuple[Key, int, str, Dict[str, Any], str, bool]],
+        skips: List[Tuple[Key, int, str, str]],
+    ) -> List[Tuple[Key, int, str, Dict[str, Any], str, bool]]:
+        """The candidates whose author is an approved contributor (contributor_gate).
+
+        An unapproved author's PR gets the gate comment (at most
+        GATE_WRITES_PER_TICK comments per tick) and is reported as a skip, so
+        it is logged once per head. A trust that cannot be read is a skip too:
+        fail closed, read again next tick. An approved author's waiting fork
+        CI runs are approved here.
+        """
+        client = self._watch_clients.get(repo) or self._client_factory(repo)
+        kept = []
+        for item in candidates:
+            key, number, head, pr, _, _ = item
+            login, _ = mentions.pr_author(pr)
+            try:
+                decision = self._gatekeeper.decide(client, self.config, repo, pr, self.store)
+            except Exception as exc:  # noqa: BLE001 - fail closed; the next tick reads again
+                skips.append((key, number, head, "contributor gate could not be read (%s)" % (exc,)))
+                continue
+            if decision.trusted:
+                try:
+                    if self._gate_writes > 0 and self._gatekeeper.mark_approved(client, self.config, repo, pr, decision):
+                        self._gate_writes -= 1
+                    self._gatekeeper.approve_fork_runs(client, self.config, repo, pr)
+                except Exception as exc:  # noqa: BLE001 - the review goes ahead; the next tick retries
+                    _log("%s pr #%d: WARNING contributor gate follow-up failed: %s" % (repo, number, exc))
+                kept.append(item)
+                continue
+            if self._gate_writes > 0:
+                try:
+                    if self._gatekeeper.post_gate_comment(client, self.config, repo, pr, self.store):
+                        self._gate_writes -= 1
+                except Exception as exc:  # noqa: BLE001 - commented again next tick
+                    _log("%s pr #%d: WARNING posting the contributor gate comment failed: %s" % (repo, number, exc))
+            skips.append((key, number, head, "%s is not an approved contributor (contributor gate)" % (login or "the author")))
+        return kept
 
     def _baseline(self, repo: str, prs: List[Dict[str, Any]]) -> None:
         """First sight of a repository: record its open PRs, review none of them this tick."""
@@ -1315,6 +1367,9 @@ class ReviewScheduler:
                         self.store, repo, request, self.config,
                         review=lambda command: author_review.apply(
                             self.store, repo, command, client, self._ledger_lookup,
+                        ),
+                        contributor=lambda command: self._gatekeeper.handle_command(
+                            client, self.store, self.config, repo, command,
                         ),
                     )
                 except ValueError as exc:

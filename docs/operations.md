@@ -681,8 +681,10 @@ and `review-of-legends/required/<base>` commit statuses) goes out as the App's i
 
 - Repository permissions the App needs: Contents read, Metadata read, Pull requests read and
   write, Issues read and write, Commit statuses read and write. Contents read and write is needed
-  only for the bot to resolve its own fixed threads (`resolve_outdated_threads`); with Contents read
-  it lists them for people instead. Contents write also lets the App's key push to every repository
+  only for the bot to resolve its own fixed threads (`resolve_outdated_threads`) and to open the
+  contributor-pledge pull request (*Contributor gate*); with Contents read it lists threads for
+  people instead and asks a maintainer to add a pledged login. Actions read and write lets the
+  contributor gate approve an approved author's waiting fork CI runs (`rol setup` asks for it). Contents write also lets the App's key push to every repository
   the App is installed on, so weigh that before granting it. Install it on every configured
   repository. No webhook: the daemon watches the PR lists and the PR comments (see *Scheduling* and
   *Talking to the bot*).
@@ -736,6 +738,8 @@ case does not matter, `[bot]` may follow the name):
 | `@review-of-legends lang` | Replies with your current language. An invalid code replies with the accepted forms and changes nothing. |
 | `@review-of-legends settings` | Replies with your settings and this list (`help`, `config`, or the mention alone, too). |
 | `@review-of-legends review` | A fresh review of this PR's current commit, **PR author only, once per head**. `rereview` and `retrigger` are aliases; the first word is case-insensitive. |
+| `@review-of-legends verify <code>` | Contributor gate: binds your GitHub login to the email you signed in to the dashboard with (the code is on its **Contributor** page, `#contributor`). See *Contributor gate*. |
+| `@review-of-legends I have read the Contributor Pledge and I agree to it.` | Contributor gate: signs `.github/CONTRIBUTOR_PLEDGE.md` (PR author only); the bot opens the pull request that adds you to `.github/APPROVED_CONTRIBUTORS`. See *Contributor gate*. |
 | `@review-of-legends <anything else>` | Feedback to the maintainers: the text from the mention to the end of the comment (up to 4,000 characters), with the repository, PR and comment link. |
 
 - **Author rereviews.** The bot reads the live PR and compares the commenter's GitHub login
@@ -852,6 +856,59 @@ change with the login and row id only, never the text.
 **Config** (`config/reviewer.json`): `mentions.default_reply_language`, `"ko"` (default) or
 `"en"`: the language of replies and of the welcome comment for someone who has not set one.
 Any other value fails at config load.
+
+## Contributor gate
+
+On a public repository anyone can open a pull request. With `contributor_gate.enabled`, the daemon reviews a pull request, and approves its waiting fork CI runs, only when its author is an **approved contributor**. The list lives in the repository itself, in the format [herdr](https://github.com/herdrdev/herdr) uses.
+
+```json
+"contributor_gate": {
+  "enabled": true,
+  "trusted_email_domains": ["example.com"],
+  "trusted_bots": ["dependabot[bot]", "renovate[bot]", "github-actions[bot]"],
+  "approve_fork_ci": true,
+  "open_pledge_pull_request": true
+}
+```
+
+Add `"repositories": ["owner/name"]` to gate only those repositories. Without it, the gate covers every review repository.
+
+**Who is approved.** The author of a pull request is approved when any of these holds:
+
+- They have write, maintain or admin permission on the repository.
+- Their login is listed in `.github/APPROVED_CONTRIBUTORS` on the default branch. The format is one login per line; `#` starts a comment.
+- They proved an email at a trusted domain. A trusted domain is either a `*@example.com` line in that file or an entry in `trusted_email_domains`.
+- They are one of `trusted_bots`.
+
+A login in `.github/MAINTAINERS` counts only together with write access, as in herdr.
+
+**What an unapproved author sees.**
+
+- The pull request is not reviewed. Its fork CI stays waiting for approval.
+- It gets one comment (marker `review-of-legends-contributor-gate`) that lists the ways in.
+- The daemon checks the pull request again on every watch. Reading the list costs a conditional request (a `304` when nothing changed).
+- When the author becomes approved, the comment says so and the review starts.
+
+**Domain verification.** A commit email is never evidence: anyone can put any address in a commit.
+
+1. The contributor signs in to the dashboard with Google. The sign-in rules are those of *Admin dashboard*: a verified email, and a Workspace `hd` claim that matches a viewer domain.
+2. On the **Contributor** page they get a one-time code. A code lives 1 hour and is stored hashed.
+3. They comment `@review-of-legends verify <code>` on their pull request.
+4. The daemon binds the comment author's GitHub login to the signed-in email, and replies.
+
+From then on, any pull request by that login passes the gate when the email's domain is trusted. Removing the domain line removes the trust; the binding alone approves nothing.
+
+**Contributor pledge.**
+
+1. The repository carries `.github/CONTRIBUTOR_PLEDGE.md`.
+2. The author comments `@review-of-legends I have read the Contributor Pledge and I agree to it.` on their pull request. Case, extra spaces and the final period do not matter.
+3. The daemon records the signature in the history store: login, user id, comment link, time, and the pledge file's blob SHA.
+4. It opens a pull request that adds the login to `APPROVED_CONTRIBUTORS`, with the record in its body.
+5. Merging that pull request is the maintainer's acceptance. Closing it declines.
+
+Opening the pull request needs Contents write. Without it, the reply asks a maintainer to add the line, and the signature is still recorded.
+
+**Fork CI.** Set the repository's Actions setting *Approval for running fork pull request workflows from contributors* to **Require approval for all external contributors**. For an approved author, the daemon then approves the waiting runs of the pull request's head commit (`POST /repos/{repo}/actions/runs/{id}/approve`). This needs the App's **Actions: read and write** permission. Without it the runs wait for a person, and `doctor` says so.
 
 ## Commands
 

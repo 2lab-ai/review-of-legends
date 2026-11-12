@@ -85,6 +85,11 @@ export class ApiClient {
     return data;
   }
 
+  /** A one-time code for `@review-of-legends verify <code>` (contributor gate): `{code, expires_at, command}`. */
+  async contributorCode() {
+    return this.request('/api/contributor/code', { method: 'POST', body: {}, csrf: true });
+  }
+
   async me() {
     const data = await this.request('/api/me', { method: 'GET' });
     const identity = data && typeof data === 'object' ? data : {};

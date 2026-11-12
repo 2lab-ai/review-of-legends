@@ -75,6 +75,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised on the daemon
     OAuthError = OAuth = RedirectResponse = TestClient = None  # type: ignore[assignment]
     dashboard_web = None  # type: ignore[assignment]
 
+from code_review_service import contributors
 from code_review_service import dashboard_auth
 from code_review_service import dashboard_execution as dx
 from code_review_service import service as svc
@@ -560,6 +561,10 @@ class FakeDashboardStore:
 
     def calls_named(self, name: str) -> list[tuple[str, tuple[Any, ...], dict[str, Any]]]:
         return [call for call in self.calls if call[0] == name]
+
+    def create_contributor_code(self, email: str, code_hash: str, ttl_seconds: int = 3600) -> str:
+        self.calls.append(("create_contributor_code", (email, code_hash, ttl_seconds), {}))
+        return "2026-09-11T01:00:00+00:00"
 
 
 class StoreWithoutRetryListing(FakeDashboardStore):
@@ -6481,6 +6486,34 @@ class ServiceSummaryTest(AppTestCase):
                 self.assertEqual(
                     method("/api/summary", headers={"X-Service-Token": SERVICE_TOKEN}).status_code, 405
                 )
+
+
+class ContributorCodeTest(AppTestCase):
+    """POST /api/contributor/code: the contributor gate's domain verification (gate.py)."""
+
+    def test_a_signed_in_account_gets_a_one_time_code_stored_hashed(self) -> None:
+        client = self.make_client()
+        identity = self.login(client)
+        response = client.post("/api/contributor/code", content="{}", headers=self.auth_headers(identity))
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers.get("cache-control"), "no-store")
+        data = response.json()
+        self.assertRegex(data["code"], r"^rol-[0-9a-f]{16}$")
+        self.assertEqual(data["command"], "@review-of-legends verify " + data["code"])
+        (call,) = self.store.calls_named("create_contributor_code")
+        email, code_hash, ttl = call[1]
+        self.assertEqual(email, identity["email"].lower())
+        self.assertEqual(code_hash, contributors.code_hash(data["code"]))
+        self.assertNotIn(data["code"], code_hash)
+        self.assertEqual(ttl, contributors.VERIFY_CODE_TTL_SECONDS)
+
+    def test_anonymous_and_cross_site_requests_get_nothing(self) -> None:
+        client = self.make_client()
+        self.assertEqual(client.post("/api/contributor/code", content="{}").status_code, 401)
+        identity = self.login(client)
+        wrong = client.post("/api/contributor/code", content="{}", headers=self.auth_headers(identity, **{"X-CSRF-Token": "x"}))
+        self.assertEqual(wrong.status_code, 403)
+        self.assertEqual(self.store.calls_named("create_contributor_code"), [])
 
 
 if __name__ == "__main__":

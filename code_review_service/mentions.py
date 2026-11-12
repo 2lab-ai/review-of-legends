@@ -23,8 +23,8 @@ Both kinds of comment are answered in one order, oldest update first
 to the reviewer, summary and outline prompts, and posts ``welcome_body`` once per
 author. Replies and the welcome are written in Korean or English.
 
-A leaf: it imports nothing from this package, so service.py, scheduler.py and
-the store can all import it. It talks to nothing either; GitHub clients and the
+A leaf: it imports nothing from this package but contributors.py (another
+leaf), so service.py, scheduler.py and the store can all import it. It talks to nothing either; GitHub clients and the
 store are passed in. Python 3.9, stdlib only (the daemon runs on /usr/bin/python3).
 """
 
@@ -36,6 +36,8 @@ import hashlib
 import re
 import urllib.parse
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
+
+from . import contributors
 
 BOT_NAME = "review-of-legends"
 WELCOME_MARKER = "<!-- review-of-legends-welcome -->"
@@ -107,6 +109,11 @@ LANG_SHOW = "lang-show"
 LANG_INVALID = "lang-invalid"
 SETTINGS = "settings"
 FEEDBACK = "feedback"
+# The contributor gate (gate.py): signing the pledge, binding a verified email.
+PLEDGE = "pledge"
+VERIFY = "verify"
+VERIFY_INVALID = "verify-invalid"
+CONTRIBUTOR_KINDS = (PLEDGE, VERIFY, VERIFY_INVALID)
 
 Logger = Callable[[str], None]
 
@@ -135,6 +142,8 @@ class Request(NamedTuple):
     updated: str = ""
     # GitHub's GraphQL id of the comment: where its edit history is read (edited_by_others).
     node_id: str = ""
+    # The commenter's GitHub user id (a pledge signature records it).
+    user_id: int = 0
 
 
 # ------------------------------------------------------------------ language
@@ -224,6 +233,11 @@ def parse_command(command: str, feedback: str = "") -> Command:
     if not words:
         return Command(SETTINGS)
     head = words[0].lower().rstrip(":")
+    if contributors.is_pledge(command):
+        return Command(PLEDGE)
+    if head == "verify":
+        code = contributors.parse_verify(command)
+        return Command(VERIFY, code) if code else Command(VERIFY_INVALID, " ".join(words[1:]))
     if head in REVIEW_WORDS:
         return Command(REVIEW)
     if head == "lang":
@@ -308,6 +322,7 @@ def request_from(comment: Any, kind: str, bot_login: str) -> Optional[Request]:
         reply_to=(_int(comment.get("in_reply_to_id")) or comment_id) if kind == REVIEW else comment_id,
         updated=str(comment.get("updated_at") or comment.get("created_at") or ""),
         node_id=str(comment.get("node_id") or ""),
+        user_id=_int(user.get("id")) or 0,
     )
 
 
@@ -504,6 +519,7 @@ def edited_by_others(edits: Any, login: str) -> bool:
 def apply_command(
     store: Any, repo: str, request: Request, config: Dict[str, Any],
     review: Optional[Callable[[Request], Tuple[str, str]]] = None,
+    contributor: Optional[Callable[[Request], str]] = None,
 ) -> str:
     """Do what the command asks in the store and return the reply body.
 
@@ -520,6 +536,11 @@ def apply_command(
     nothing, and the reply says which language stands.
     """
     command = request.command
+    if command.kind in CONTRIBUTOR_KINDS:
+        # The contributor gate (gate.Gatekeeper.handle_command) answers these itself.
+        if contributor is None:
+            raise RuntimeError("contributor command handler is unavailable")
+        return contributor(request)
     if command.kind in (LANG, LANG_CLEAR):
         value = command.value if command.kind == LANG else None
         row = store.set_author_language(

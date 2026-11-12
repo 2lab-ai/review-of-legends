@@ -53,6 +53,14 @@
   "approval": {
     "enabled": false
   },
+  "contributor_gate": {
+    "_comment": "enabled: review a pull request (and approve its waiting fork CI runs) only when its author is an approved contributor: write access, a login in .github/APPROVED_CONTRIBUTORS on the default branch, a verified email at a trusted domain (a *@domain line there, or trusted_email_domains), or trusted_bots. Others get one gate comment offering domain verification (dashboard) and the contributor pledge (.github/CONTRIBUTOR_PLEDGE.md). repositories: limit the gate to these owner/name; absent = every review repository. See docs/operations.md 'Contributor gate'.",
+    "enabled": false,
+    "trusted_email_domains": [],
+    "trusted_bots": ["dependabot[bot]", "renovate[bot]", "github-actions[bot]"],
+    "approve_fork_ci": true,
+    "open_pledge_pull_request": true
+  },
   "model_policy": {
     "model": "gpt-6-astra[1m]",
     "effort": "xhigh",
