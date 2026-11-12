@@ -62,6 +62,9 @@ class FakeGitHub:
         self.prs: Dict[int, Dict[str, Any]] = {}
         self.pulls: Dict[str, Dict[str, Any]] = {}
         self.commits: Dict[str, tuple] = {}  # sha -> (parent, path, text)
+        self.main_sha = "f" * 40  # the default branch's tip; a test moves it when main changes
+        self.head_pulls: List[Dict[str, Any]] = []  # pulls_for_head: every PR from the fork branch, closed too
+        self.run_state: Dict[int, Dict[str, Any]] = {}
         self._next_id = 100
 
     # reads
@@ -69,7 +72,8 @@ class FakeGitHub:
         return BOT
 
     def get_file(self, path: str, ref: str):
-        return self.files.get((path, "main" if ref == self.branch_sha("main") else ref))
+        # main's tip reads main; any other sha (an old tip) reads nothing.
+        return self.files.get((path, "main" if ref == self.main_sha else ref))
 
     def collaborator_permission(self, login: str):
         self.permission_reads.append(login)
@@ -93,7 +97,13 @@ class FakeGitHub:
         return self.pulls.get(branch)
 
     def branch_sha(self, branch: str) -> str:
-        return "f" * 40
+        return self.main_sha if branch == "main" else "b" * 40
+
+    def pulls_for_head(self, owner: str, branch: str):
+        return [p for p in self.head_pulls if p["head"]["repo"]["full_name"].split("/")[0] == owner and p["head"]["ref"] == branch]
+
+    def get_run(self, run_id: int):
+        return self.run_state.get(run_id, {"id": run_id, "conclusion": "action_required"})
 
     # writes
     def create_issue_comment(self, number: int, body: str):
@@ -128,7 +138,7 @@ class FakeGitHub:
             if ref == "main":
                 self.files[(path, branch)] = value
         parent, path, text = self.commits[sha]
-        assert parent == self.branch_sha("main"), "built on an old base"
+        assert parent == self.main_sha, "built on an old base"
         self.files[(path, branch)] = (text, "blob-" + sha)
 
     def create_branch(self, branch: str, sha: str):
@@ -146,6 +156,11 @@ class FakeGitHub:
         self.pulls[head] = pull
         self.writes.append(("pull", head, base, title))
         return pull
+
+
+def gate_mod_writes() -> int:
+    from code_review_service import scheduler as sched
+    return sched.GATE_WRITES_PER_TICK
 
 
 def make_pr(number: int, login: str, fork: bool = False, head: str = "a" * 40, user_id: int = 0) -> Dict[str, Any]:
@@ -223,6 +238,18 @@ class DecideTest(GateTestCase):
         self.assertTrue(self.keeper.decide(self.gh, self.config, REPO, make_pr(1, "dave", user_id=1), self.store).trusted)
         self.gh.permissions["dave"] = "read"
         self.assertFalse(self.keeper.decide(self.gh, self.config, REPO, make_pr(1, "dave", user_id=2), self.store).trusted)
+
+    def test_a_removed_domain_line_revokes_a_cached_trust_after_the_trusted_ttl(self) -> None:
+        code = c.new_verify_code()
+        self.store.create_contributor_code("dave@example.com", c.code_hash(code), "dave")
+        self.store.consume_contributor_code(c.code_hash(code), "dave", "https://x/1", user_id=5007)
+        self.assertTrue(self.keeper.decide(self.gh, self.config, REPO, make_pr(7, "dave"), self.store).trusted)
+        self.gh.files[(c.APPROVED_FILE, "main")] = ("alice\n", "list-sha-2")  # *@example.com removed
+        self.now += gate_mod.TRUSTED_TTL - 1
+        self.assertTrue(self.keeper.decide(self.gh, self.config, REPO, make_pr(7, "dave"), self.store).trusted)
+        self.now += 2
+        self.assertFalse(self.keeper.decide(self.gh, self.config, REPO, make_pr(7, "dave"), self.store).trusted)
+        self.assertIsNotNone(self.store.contributor_identity("dave"))  # the binding stays; it approves nothing alone
 
     def test_unknown_author_is_cached_for_the_untrusted_ttl(self) -> None:
         self.assertFalse(self.decide("mallory").trusted)
@@ -320,6 +347,44 @@ class ForkCiTest(GateTestCase):
         self.now += gate_mod.NO_PERMISSION_BACKOFF + 1
         self.assertEqual(1, self.keeper.approve_fork_runs(self.gh, self.config, REPO, make_pr(1, "alice", fork=True)))
 
+    def test_an_unlinked_run_waits_while_a_closed_pr_of_an_unapproved_author_shares_the_commit(self) -> None:
+        self.gh.runs["a" * 40] = [(11, "someone/fork", "topic")]
+        closed = make_pr(2, "mallory", fork=True)
+        closed["state"] = "closed"
+        closed["base"]["ref"] = "release"
+        self.gh.head_pulls = [make_pr(1, "alice", fork=True), closed]
+        self.assertEqual(0, self.keeper.approve_fork_runs(self.gh, self.config, REPO, make_pr(1, "alice", fork=True), self.store))
+        self.assertIn("#2 (mallory) shares the commit", self.logged[-1])
+        # A run GitHub links to this PR is provably its own: approved.
+        listed = self.gh.list_waiting_runs
+        self.gh.list_waiting_runs = lambda head: [dict(run, pull_requests=[{"number": 1}]) for run in listed(head)]
+        self.assertEqual(1, self.keeper.approve_fork_runs(self.gh, self.config, REPO, make_pr(1, "alice", fork=True), self.store))
+        self.assertFalse(self.keeper.ci_blocked(REPO))
+
+    def test_an_unlinked_run_goes_when_every_pr_at_the_commit_is_approved(self) -> None:
+        self.gh.runs["a" * 40] = [(11, "someone/fork", "topic")]
+        other = make_pr(2, "bob", fork=True)
+        other["state"] = "closed"
+        old = make_pr(3, "mallory", fork=True, head="d" * 40)  # an earlier commit of the branch
+        self.gh.permissions["bob"] = "write"
+        self.gh.head_pulls = [make_pr(1, "alice", fork=True), other, old]
+        self.assertEqual(1, self.keeper.approve_fork_runs(self.gh, self.config, REPO, make_pr(1, "alice", fork=True), self.store))
+
+    def test_a_shared_run_is_approved_once(self) -> None:
+        # Two approved PRs share the run; GitHub's listing still shows it for the second.
+        self.gh.runs["a" * 40] = [(11, "someone/fork", "topic")]
+        self.assertEqual(1, self.keeper.approve_fork_runs(self.gh, self.config, REPO, make_pr(1, "alice", fork=True)))
+        self.assertEqual(0, self.keeper.approve_fork_runs(self.gh, self.config, REPO, make_pr(2, "alice", fork=True)))
+        self.assertEqual([("approve", 11)], self.gh.writes)
+
+    def test_a_run_someone_approved_meanwhile_is_no_refusal(self) -> None:
+        self.gh.runs["a" * 40] = [(11, "someone/fork", "topic"), (12, "someone/fork", "topic")]
+        self.gh.approve_errors[11] = status_error(403)
+        self.gh.run_state[11] = {"id": 11, "status": "queued", "conclusion": None}
+        self.assertEqual(1, self.keeper.approve_fork_runs(self.gh, self.config, REPO, make_pr(1, "alice", fork=True)))
+        self.assertFalse(self.keeper.ci_blocked(REPO))
+        self.assertIn(("approve", 12), self.gh.writes)
+
     def test_a_run_gone_before_its_approval_is_skipped_without_a_backoff(self) -> None:
         self.gh.runs["a" * 40] = [(11, "someone/fork", "topic"), (12, "someone/fork", "topic")]
         self.gh.approve_errors[11] = status_error(404)
@@ -361,7 +426,8 @@ class CommandTest(GateTestCase):
         self.assertIn("now reviewed", reply)
         # The cached refusal is gone: trusted at once.
         self.assertTrue(self.keeper.decide(self.gh, self.config, REPO, make_pr(1, "mallory"), self.store).trusted)
-        self.assertIn("already used", self.answer(1, "mallory", "verify " + code))  # used: refused
+        other = request(1, "mallory", "verify " + code)._replace(comment_id=990, url="https://github.com/%s/pull/1#issuecomment-990" % REPO)
+        self.assertIn("already used", self.keeper.handle_command(self.gh, self.store, self.config, REPO, other))  # used: refused
         self.assertIsNotNone(self.store.contributor_identity("Mallory"))
 
     def test_a_code_read_off_a_public_comment_is_worthless_to_someone_else(self) -> None:
@@ -371,6 +437,23 @@ class CommandTest(GateTestCase):
         self.assertIsNone(self.store.contributor_identity("eve"))
         # Not used up by eve: mallory still can.
         self.assertIn("now reviewed", self.answer(1, "mallory", "verify " + code))
+
+    def test_a_failed_read_leaves_the_code_for_the_retry_and_a_replay_gets_the_same_answer(self) -> None:
+        code = c.new_verify_code()
+        self.store.create_contributor_code("mallory@company.example", c.code_hash(code), "mallory")
+        self.gh.prs[1] = make_pr(1, "mallory")
+        real = self.gh.get_pr
+        self.gh.get_pr = lambda number: (_ for _ in ()).throw(status_error(502))
+        with self.assertRaises(svc.ServiceError):
+            self.answer(1, "mallory", "verify " + code)
+        self.assertIsNone(self.store.contributor_identity("mallory"))
+        self.gh.get_pr = real
+        self.assertIn("now reviewed", self.answer(1, "mallory", "verify " + code))
+        # The same comment handled again (its reply failed to post): the same answer.
+        self.assertIn("now reviewed", self.answer(1, "mallory", "verify " + code))
+        # Another comment with the used code: refused.
+        other = request(1, "mallory", "verify " + code)._replace(comment_id=990, url="https://github.com/%s/pull/1#issuecomment-990" % REPO)
+        self.assertIn("already used", self.keeper.handle_command(self.gh, self.store, self.config, REPO, other))
 
     def test_verify_with_an_unknown_code(self) -> None:
         reply = self.answer(1, "mallory", "verify rol-00000000")
@@ -393,11 +476,12 @@ class CommandTest(GateTestCase):
         branch = gate_mod.PLEDGE_BRANCH_PREFIX + "mallory"
         # The old branch still lists a login a maintainer has since removed from main.
         self.gh.files[(c.APPROVED_FILE, branch)] = ("alice\nobsolete\nmallory\n", "old-sha")
+        self.gh.main_sha = "e" * 40  # main moved on since that branch was cut
         self.gh.files[(c.APPROVED_FILE, "main")] = ("alice\nzed\n", "list-sha-2")
         self.gh.branch_error = status_error(422)
         self.answer(3, "mallory", c.PLEDGE_SENTENCE)
         wanted = "alice\nzed\nmallory  # pledge signed in %s#3\n" % REPO
-        self.assertIn(("commit", "f" * 40, c.APPROVED_FILE, wanted), self.gh.writes)
+        self.assertIn(("commit", "e" * 40, c.APPROVED_FILE, wanted), self.gh.writes)
         self.assertEqual("point", [w for w in self.gh.writes if w[0] in ("branch", "point")][0][0])
         self.assertEqual(wanted, self.gh.files[(c.APPROVED_FILE, branch)][0])
         self.assertIn(branch, self.gh.pulls)
@@ -410,14 +494,15 @@ class CommandTest(GateTestCase):
     def test_signing_again_rebuilds_a_pull_request_a_merged_sibling_put_in_conflict(self) -> None:
         branch = gate_mod.PLEDGE_BRANCH_PREFIX + "mallory"
         self.answer(3, "mallory", c.PLEDGE_SENTENCE)
-        # Another contributor's pledge pull request is merged: main gained a line at the same place.
+        # Another contributor's pledge pull request is merged: main moved and gained a line at the same place.
+        self.gh.main_sha = "e" * 40
         self.gh.files[(c.APPROVED_FILE, "main")] = ("alice\n*@example.com\nzed  # pledge signed\n", "list-sha-2")
         writes = len(self.gh.writes)
         again = self.keeper.handle_command(self.gh, self.store, self.config, REPO, request(3, "mallory", c.PLEDGE_SENTENCE)._replace(comment_id=999))
         self.assertIn("pull/77", again)
         new = self.gh.writes[writes:]
         wanted = "alice\n*@example.com\nzed  # pledge signed\nmallory  # pledge signed in %s#3\n" % REPO
-        self.assertEqual([("commit", "f" * 40, c.APPROVED_FILE, wanted)], new[:1])
+        self.assertEqual([("commit", "e" * 40, c.APPROVED_FILE, wanted)], new[:1])
         self.assertEqual(["commit", "point"], [w[0] for w in new])  # no second pull request
         self.assertEqual(wanted, self.gh.files[(c.APPROVED_FILE, branch)][0])
 
@@ -508,7 +593,7 @@ class GatedListing(GitHub):
         class Client:
             def __getattr__(self, name: str) -> Any:
                 if name in ("get_file", "collaborator_permission", "list_issue_comments", "update_issue_comment",
-                            "list_waiting_runs", "approve_run"):
+                            "list_waiting_runs", "approve_run", "pulls_for_head", "get_run"):
                     return getattr(gate, name)
                 if name == "create_issue_comment":
                     return gate.create_issue_comment
@@ -637,8 +722,11 @@ class SchedulerGateTest(SchedulerTestCase):
         self.assertEqual(numbers, sorted(self.listing.gate.comments))
         self.listing.gate.files[(c.APPROVED_FILE, "main")] = ("alice\nmallory\n", "s2")
         self.clock += gate_mod.UNTRUSTED_TTL + 1
+        updates = len([w for w in self.listing.gate.writes if w[0] == "update"])
         scheduler.tick()
         self.assertEqual(numbers, sorted(number for _, number in scheduler._queue))
+        self.assertEqual(updates + gate_mod_writes(), len([w for w in self.listing.gate.writes if w[0] == "update"]))
+        self.assertNotIn("is an approved contributor", self.listing.gate.comments[12][0]["body"])
         # The last one waits for budget; its head is reviewed (no longer a candidate) before the next tick.
         scheduler._queue.clear()
         with svc.STATE_LOCK:
@@ -649,6 +737,20 @@ class SchedulerGateTest(SchedulerTestCase):
         self.assertEqual({}, scheduler._queue)
         for n in numbers:
             self.assertIn("is an approved contributor", self.listing.gate.comments[n][0]["body"], n)
+
+    def test_failing_comment_writes_use_up_the_tick_budget(self) -> None:
+        scheduler = self.make(monotonic=lambda: self.clock, **GATE)
+        scheduler.control()
+        self.listing.prs[REPO] = [self.authored(n, ("%x" % n) * 40, "mallory") for n in (9, 10, 11, 12, 13)]
+        attempts: List[int] = []
+
+        def failing(number: int, body: str):
+            attempts.append(number)
+            raise status_error(502)
+
+        self.listing.gate.create_issue_comment = failing
+        scheduler.tick()
+        self.assertEqual(gate_mod_writes(), len(attempts))
 
     def test_an_author_requested_review_is_refused_for_an_unapproved_author(self) -> None:
         scheduler = self.make(monotonic=lambda: self.clock, **GATE)

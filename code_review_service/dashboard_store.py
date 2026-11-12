@@ -1588,11 +1588,13 @@ class DashboardStore:
         """Use a live code once, by the login it was issued for: bind the account to its email and return the email.
 
         None when the code is unknown, used, expired or issued for another login
-        (that comment does not use it up).
+        (that comment does not use it up). The comment that used it, handled
+        again (its reply failed), gets the email again and changes nothing.
         """
         code_hash = _require_text(code_hash, "code_hash")
         display = _require_login(login)
         now = _now()
+        comment_url = self._bounded_text(comment_url) or ""
         with self._write() as conn:
             row = conn.execute(
                 "SELECT email FROM contributor_codes WHERE code_hash = ? AND used_at IS NULL AND expires_at >= ?"
@@ -1600,7 +1602,14 @@ class DashboardStore:
                 (code_hash, now, display.lower()),
             ).fetchone()
             if row is None:
-                return None
+                if not comment_url:
+                    return None
+                replay = conn.execute(
+                    "SELECT k.email FROM contributor_codes k JOIN contributor_identities i ON i.login = k.used_by"
+                    " WHERE k.code_hash = ? AND k.used_by = ? AND i.comment_url = ? AND i.email = k.email",
+                    (code_hash, display.lower(), comment_url),
+                ).fetchone()
+                return str(replay["email"]) if replay is not None else None
             email = str(row["email"])
             conn.execute(
                 "UPDATE contributor_codes SET used_at = ?, used_by = ? WHERE code_hash = ?",
@@ -1611,7 +1620,7 @@ class DashboardStore:
                 " VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(login) DO UPDATE SET display_login = excluded.display_login,"
                 " email = excluded.email, user_id = excluded.user_id, verified_at = excluded.verified_at,"
                 " comment_url = excluded.comment_url",
-                (display.lower(), display, email, int(user_id or 0), now, self._bounded_text(comment_url) or ""),
+                (display.lower(), display, email, int(user_id or 0), now, comment_url),
             )
             self._emit(conn, "contributor_verified", None, {"login": display.lower()})
             return email

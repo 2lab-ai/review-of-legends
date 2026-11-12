@@ -904,16 +904,9 @@ class ReviewScheduler:
                 skips.append((key, number, head, "contributor gate could not be read (%s)" % (exc,)))
                 continue
             if decision.trusted:
-                if self._gate_writes <= 0:
-                    # The review goes ahead; its note follows (_settle_gate_comments).
-                    self._gatekeeper.defer_approved(repo, number)
-                else:
-                    try:
-                        if self._gatekeeper.mark_approved(client, self.config, repo, pr, decision):
-                            self._gate_writes -= 1
-                    except Exception as exc:  # noqa: BLE001 - the review goes ahead; the next tick retries
-                        self._gatekeeper.defer_approved(repo, number)
-                        _log("%s pr #%d: WARNING contributor gate follow-up failed: %s" % (repo, number, exc))
+                # The review goes ahead; a gate comment left from before turns
+                # into the approved note in _settle_gate_comments.
+                self._gatekeeper.defer_approved(repo, number)
                 kept.append(item)
                 continue
             if self._gate_writes > 0:
@@ -921,6 +914,8 @@ class ReviewScheduler:
                     if self._gatekeeper.post_gate_comment(client, self.config, repo, pr, self.store):
                         self._gate_writes -= 1
                 except Exception as exc:  # noqa: BLE001 - commented again next tick
+                    # Charged too: a timeout may have written, and a failing GitHub must not take every candidate's turn.
+                    self._gate_writes -= 1
                     _log("%s pr #%d: WARNING posting the contributor gate comment failed: %s" % (repo, number, exc))
             skips.append((key, number, head, "%s is not an approved contributor (contributor gate)" % (login or "the author")))
         return kept
@@ -936,9 +931,10 @@ class ReviewScheduler:
     def _settle_gate_comments(self, repo: str, prs: List[Dict[str, Any]]) -> None:
         """Turn the gate comment of a PR whose author is approved now into the approved note.
 
-        For the PRs _gate_candidates could not settle: the write budget ran
-        out, the write failed, or the head was reviewed before a later tick
-        (it is no review candidate then). Within the same budget.
+        The one place that writes it, within the tick's write budget: for the
+        PRs _gate_candidates let in, and for those whose note had to wait (the
+        budget ran out, the write failed) even once their head is reviewed and
+        no longer a review candidate. Each PR is checked once per process.
         """
         if not self._gatekeeper.applies(self.config, repo):
             return
@@ -961,6 +957,7 @@ class ReviewScheduler:
                 if decision.trusted and self._gatekeeper.mark_approved(client, self.config, repo, pr, decision):
                     self._gate_writes -= 1
             except Exception as exc:  # noqa: BLE001 - tried again next tick
+                self._gate_writes -= 1
                 _log("%s pr #%d: WARNING contributor gate follow-up failed: %s" % (repo, number, exc))
 
     def _approve_fork_ci(self, repo: str, prs: List[Dict[str, Any]]) -> None:
@@ -1027,7 +1024,7 @@ class ReviewScheduler:
             if now - start > gate.CI_APPROVAL_WINDOW:
                 continue
             try:
-                self._gatekeeper.approve_fork_runs(client, self.config, repo, pr)
+                self._gatekeeper.approve_fork_runs(client, self.config, repo, pr, self.store)
             except Exception as exc:  # noqa: BLE001 - tried again next tick
                 self._ci_seen[key] = now
                 _log("%s pr #%d: WARNING fork CI approval failed: %s" % (repo, key[1], exc))

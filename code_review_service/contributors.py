@@ -127,7 +127,10 @@ def gate_settings(config: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(enabled, bool):
         raise ValueError("config.contributor_gate.enabled must be true or false")
     domains: List[str] = []
-    for value in raw.get("trusted_email_domains", []) or []:
+    listed = raw.get("trusted_email_domains", [])
+    if not isinstance(listed, list):
+        raise ValueError("config.contributor_gate.trusted_email_domains must be a list of domains")
+    for value in listed:
         domain = normalize_domain(value)
         if domain is None:
             raise ValueError("config.contributor_gate.trusted_email_domains: %r is not a domain" % (value,))

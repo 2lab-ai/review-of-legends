@@ -2298,6 +2298,15 @@ class GitHubClient:
             runs.extend(run for run in page or [] if isinstance(run, dict))
         return runs
 
+    def get_run(self, run_id: int) -> dict[str, Any]:
+        return self.request("GET", f"repos/{self.repo}/actions/runs/{int(run_id)}")
+
+    def pulls_for_head(self, owner: str, branch: str) -> list[dict[str, Any]]:
+        """Pull requests, open and closed, from ``owner:branch`` (the newest 100)."""
+        query = urllib.parse.urlencode({"head": f"{owner}:{branch}", "state": "all", "per_page": "100"})
+        data = self.request("GET", f"repos/{self.repo}/pulls?{query}")
+        return [item for item in data or [] if isinstance(item, dict)] if isinstance(data, list) else []
+
     def approve_run(self, run_id: int) -> Any:
         return self.request("POST", f"repos/{self.repo}/actions/runs/{int(run_id)}/approve", {})
 

@@ -33,6 +33,8 @@ NO_PERMISSION_BACKOFF = 3600.0
 # still needs its CI).
 CI_APPROVAL_WINDOW = 1800.0
 PLEDGE_BRANCH_PREFIX = "review-of-legends/contributor-"
+# Run ids remembered as approved (PRs sharing a run see it listed a while longer).
+APPROVED_RUNS_KEPT = 1000
 
 Logger = Callable[[str], None]
 
@@ -72,6 +74,8 @@ class Gatekeeper:
         self._approved_deferred: Set[Tuple[str, int]] = set()
         # repo -> when fork CI approval may be tried again after a refusal
         self._ci_backoff: Dict[str, float] = {}
+        # ids of the runs this process approved, oldest first (a dict keeps the order)
+        self._approved_runs: Dict[int, None] = {}
         # (repo, list blob sha) whose ignored lines were already logged
         self._warned_lists: Set[Tuple[str, str]] = set()
 
@@ -269,12 +273,18 @@ class Gatekeeper:
         with self._lock:
             return self._ci_backoff.get(repo.lower(), 0.0)
 
-    def approve_fork_runs(self, client: Any, config: Dict[str, Any], repo: str, pr: Dict[str, Any]) -> int:
+    def approve_fork_runs(
+        self, client: Any, config: Dict[str, Any], repo: str, pr: Dict[str, Any], store: Any = None
+    ) -> int:
         """Approve this PR's waiting fork workflow runs; the number approved.
 
-        The caller has checked that every open PR sharing this fork, branch and
-        commit has an approved author (a run cannot be told apart between
-        them). A run that names its pull requests must name this one.
+        Only runs of its commit from its fork and branch. A run that names its
+        pull requests must name this one. A run that names none (GitHub often
+        leaves fork runs unassociated) is approved only when every pull
+        request ever opened from that fork branch at this commit, open or
+        closed, has an approved author: the run may be any of theirs. The
+        caller checks the open ones without an API call; the closed ones are
+        read here.
         """
         settings = c.gate_settings(config)
         if not settings["approve_fork_ci"] or not is_fork(repo, pr):
@@ -289,7 +299,7 @@ class Gatekeeper:
         branch = str(head_info.get("ref") or "")
         if not head or not source:
             return 0  # a deleted fork: nothing that is provably this PR's
-        approved = 0
+        number = int(pr["number"])
         try:
             runs = client.list_waiting_runs(head)
         except Exception as exc:  # noqa: BLE001 - a missing permission must not stop reviews
@@ -297,6 +307,7 @@ class Gatekeeper:
                 self._refused(repo, now, exc)
                 return 0
             raise
+        mine = []
         for run in runs:
             # Only this PR's runs: same commit, same fork and branch. Another
             # PR (an unapproved author's) can point at the very same commit.
@@ -304,24 +315,69 @@ class Gatekeeper:
             if str(run_repo.get("full_name") or "").lower() != source or str(run.get("head_branch") or "") != branch:
                 continue
             numbers = {item.get("number") for item in run.get("pull_requests") or [] if isinstance(item, dict)}
-            if numbers and int(pr["number"]) not in numbers:
+            if numbers and number not in numbers:
                 continue
+            with self._lock:
+                if int(run["id"]) in self._approved_runs:
+                    continue  # approved a moment ago for a PR sharing it; the listing lags
+            mine.append((run, bool(numbers)))
+        if any(not named for _, named in mine) and not self._siblings_trusted(client, config, repo, pr, store, source, branch, head):
+            mine = [(run, named) for run, named in mine if named]
+        approved = 0
+        for run, _ in mine:
+            run_id = int(run["id"])
             try:
-                client.approve_run(int(run["id"]))
+                client.approve_run(run_id)
             except Exception as exc:  # noqa: BLE001 - see below
                 status = _status(exc)
                 if status == 404:
                     # Listed a moment ago: the run was deleted or re-run since, not a missing permission.
-                    self._log("%s pr #%d: fork CI run %s is gone; skipped" % (repo, int(pr["number"]), run.get("id")))
+                    self._log("%s pr #%d: fork CI run %s is gone; skipped" % (repo, number, run_id))
                     continue
                 if status == 403:
+                    if not self._still_waiting(client, run_id):
+                        # Approved by someone else meanwhile: GitHub refuses a run that no longer waits.
+                        continue
                     self._refused(repo, now, exc)
                     break
                 raise
+            self._remember_run(run_id)
             approved += 1
         if approved:
-            self._log("%s pr #%d: approved %d waiting fork CI run(s) of %s" % (repo, int(pr["number"]), approved, head[:12]))
+            self._log("%s pr #%d: approved %d waiting fork CI run(s) of %s" % (repo, number, approved, head[:12]))
         return approved
+
+    def _siblings_trusted(
+        self, client: Any, config: Dict[str, Any], repo: str, pr: Dict[str, Any], store: Any,
+        source: str, branch: str, head: str,
+    ) -> bool:
+        """Every other PR from this fork branch at this commit, closed ones too, has an approved author."""
+        owner = source.split("/", 1)[0]
+        for other in client.pulls_for_head(owner, branch):
+            other_head = other.get("head") if isinstance(other.get("head"), dict) else {}
+            if str(other_head.get("sha") or "") != head or other.get("number") == pr.get("number"):
+                continue
+            other_repo = other_head.get("repo") if isinstance(other_head.get("repo"), dict) else {}
+            if str(other_repo.get("full_name") or "").lower() != source:
+                continue
+            if not self.decide(client, config, repo, other, store).trusted:
+                self._log("%s pr #%d: fork CI runs not linked to a pull request stay waiting: #%s (%s) shares the commit"
+                          % (repo, int(pr["number"]), other.get("number"), mentions.pr_author(other)[0] or "?"))
+                return False
+        return True
+
+    def _still_waiting(self, client: Any, run_id: int) -> bool:
+        try:
+            run = client.get_run(run_id)
+        except Exception:  # noqa: BLE001 - unknown: treat the refusal as one
+            return True
+        return isinstance(run, dict) and run.get("conclusion") == "action_required"
+
+    def _remember_run(self, run_id: int) -> None:
+        with self._lock:
+            self._approved_runs[run_id] = None
+            while len(self._approved_runs) > APPROVED_RUNS_KEPT:
+                self._approved_runs.pop(next(iter(self._approved_runs)))
 
     def _refused(self, repo: str, now: float, exc: Exception) -> None:
         with self._lock:
@@ -348,6 +404,10 @@ class Gatekeeper:
         return self._pledge(client, store, config, repo, request, texts)
 
     def _verify(self, client: Any, store: Any, config: Dict[str, Any], repo: str, request: mentions.Request, texts: Dict[str, str]) -> str:
+        # The GitHub reads first: a read that fails leaves the code unused for
+        # the retry. The same comment again (its reply failed) gets the same answer.
+        pr = client.get_pr(request.number)
+        approved, _ = self.lists(client, repo, default_branch(pr))
         email = store.consume_contributor_code(
             c.code_hash(request.command.value), request.login, request.url, user_id=request.user_id,
         )
@@ -355,8 +415,6 @@ class Gatekeeper:
             return mentions._reply(request, texts["verify_unknown"])
         self.forget(request.login)
         domain = c.email_domain(email) or "?"
-        pr = client.get_pr(request.number)
-        approved, _ = self.lists(client, repo, default_branch(pr))
         trusted = set(approved.domains) | set(c.gate_settings(config)["trusted_email_domains"])
         message = texts["verified_ok" if domain in trusted else "verified_untrusted"] % {"domain": domain}
         return mentions._reply(request, message)

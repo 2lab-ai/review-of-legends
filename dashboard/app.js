@@ -933,8 +933,6 @@ function renderShellChrome() {
 /** Contributor page: ask the server for a one-time verification code. */
 async function requestContributorCode() {
   if (state.contributor.loading) return;
-  const input = document.getElementById('contributor-login');
-  if (input) state.contributor.login = String(input.value || '');
   if (!state.contributor.login.trim()) {
     state.contributor.error = 'Enter your GitHub login first.';
     render();
