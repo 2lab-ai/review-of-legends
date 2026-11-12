@@ -115,6 +115,7 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual("xn--e1afmkfd.xn--p1ai", c.normalize_domain("xn--e1afmkfd.xn--p1ai"))
         self.assertEqual(frozenset({"xn--e1afmkfd.xn--p1ai"}), c.parse_list("*@xn--e1afmkfd.xn--p1ai\n").domains)
         self.assertIsNone(c.normalize_domain("example.c0m"))
+        self.assertIsNone(c.normalize_domain("example.xn--p1ai-"))  # a DNS label never ends in a hyphen
 
     def test_domains_are_normalized(self) -> None:
         settings = c.gate_settings({"contributor_gate": {"enabled": True, "trusted_email_domains": ["@Company.example", "*@b.example", "c.example"]}})
