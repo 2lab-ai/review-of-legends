@@ -1025,6 +1025,10 @@ class ReviewScheduler:
             head_info = pr.get("head") or {}
             group = groups[(str(((head_info.get("repo") or {}).get("full_name")) or "").lower(), str(head_info.get("ref") or ""), key[2])]
             if not all(trusted.get(int(other["number"])) for other in group):
+                # Held back for a sibling's author (a draft opened later,
+                # say): the window starts again, so that author's acceptance
+                # still counts.
+                self._ci_seen[key] = now
                 continue
             if self._gatekeeper.ci_blocked(repo):
                 continue

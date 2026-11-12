@@ -719,7 +719,8 @@ class FreshReadTest(SchedulerTestCase):
         self.listing.live[(REPO, 8)] = pr(8, "a" * 40, state="closed")
         self.listing.live[(REPO, 9)] = {**pr(9, "c" * 40, state="closed"), "merged_at": "2026-10-13T10:10:00Z"}
         self.assert_not_started(scheduler, "owner/repo pr #8: not started, closed, not open")
-        self.assertIn("owner/repo pr #9: not started, merged", self.logged)
+        # #9 is read after #8 on the dispatch thread: wait for its line too.
+        self.assertTrue(wait_for(lambda: "owner/repo pr #9: not started, merged" in self.logged), self.logged)
 
     def test_a_head_pushed_after_it_was_queued_is_the_one_reviewed(self) -> None:
         scheduler = self.queued(pr(8, "a" * 40))
