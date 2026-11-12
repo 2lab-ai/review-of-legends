@@ -39,6 +39,9 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tupl
 from .mentions import LANGUAGE_CODE_PATTERN, MAX_FEEDBACK_CHARS
 
 TRUNCATION_MARKER = "...[truncated]"
+# A used contributor verification code is kept this long, so the comment that
+# used it can be handled again (a failed reply) and answered the same.
+USED_CODE_KEPT_SECONDS = 86400
 
 # ``skipped`` is import-only: a legacy baseline entry recorded to *suppress* a
 # first-run review. A live attempt never reaches it.
@@ -194,6 +197,39 @@ CREATE TABLE IF NOT EXISTS feedback (
     source_key  TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_source ON feedback (source_key);
+
+CREATE TABLE IF NOT EXISTS contributor_codes (
+    code_hash  TEXT PRIMARY KEY,
+    email      TEXT NOT NULL,
+    login      TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at    TEXT,
+    used_by    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS contributor_identities (
+    login         TEXT PRIMARY KEY,
+    display_login TEXT NOT NULL,
+    email         TEXT NOT NULL,
+    user_id       INTEGER NOT NULL DEFAULT 0,
+    verified_at   TEXT NOT NULL,
+    comment_url   TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS pledge_signatures (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo        TEXT NOT NULL,
+    pr          INTEGER NOT NULL,
+    login       TEXT NOT NULL,
+    user_id     INTEGER NOT NULL DEFAULT 0,
+    comment_url TEXT NOT NULL DEFAULT '',
+    pledge_sha  TEXT NOT NULL DEFAULT '',
+    signed_at   TEXT NOT NULL,
+    pull_url    TEXT,
+    source_key  TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pledge_source ON pledge_signatures (source_key);
 """
 
 #: Operator settings the store keeps for the review daemon (dashboard-set).
@@ -1520,6 +1556,125 @@ class DashboardStore:
             self._emit(conn, "feedback_added", None, {"feedback_id": feedback_id, "login": display.lower()})
             row = conn.execute("SELECT * FROM feedback WHERE id = ?", (feedback_id,)).fetchone()
             return _feedback_dict(row)
+
+    # ------------------------------------------------ contributor gate (gate.py)
+    # A verification code is shown once on the dashboard and stored hashed, for
+    # the one GitHub login the signed-in person named; only that login's
+    # ``@review-of-legends verify <code>`` comment consumes it, binding the
+    # account (login and immutable user id) to the signed-in email. A code read
+    # off a public comment is worthless to anyone else. Pledge signatures are kept for
+    # the record and to find the pull request that was opened for them.
+
+    def create_contributor_code(self, email: str, code_hash: str, login: str, ttl_seconds: int = 3600) -> str:
+        """Store one code for ``email`` and the GitHub ``login`` it is for; returns when it expires.
+
+        Expired unused codes are pruned, and used ones a day after their use:
+        until then the comment that used one can be handled again (its reply
+        failed) and get the same answer.
+        """
+        email = _require_text(email, "email").lower()
+        code_hash = _require_text(code_hash, "code_hash")
+        login = _require_login(login).lower()
+        now = dt.datetime.now(dt.timezone.utc)
+        expires = (now + dt.timedelta(seconds=int(ttl_seconds))).isoformat(timespec="seconds")
+        stamp = now.isoformat(timespec="seconds")
+        with self._write() as conn:
+            used_before = (now - dt.timedelta(seconds=USED_CODE_KEPT_SECONDS)).isoformat(timespec="seconds")
+            conn.execute(
+                "DELETE FROM contributor_codes WHERE (used_at IS NULL AND expires_at < ?) OR used_at < ?",
+                (stamp, used_before),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO contributor_codes (code_hash, email, login, created_at, expires_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (code_hash, email, login, stamp, expires),
+            )
+        return expires
+
+    def consume_contributor_code(
+        self, code_hash: str, login: str, comment_url: str = "", user_id: int = 0
+    ) -> Optional[str]:
+        """Use a live code once, by the login it was issued for: bind the account to its email and return the email.
+
+        None when the code is unknown, used, expired or issued for another login
+        (that comment does not use it up). The comment that used it, handled
+        again (its reply failed), gets the email again and changes nothing.
+        """
+        code_hash = _require_text(code_hash, "code_hash")
+        display = _require_login(login)
+        now = _now()
+        comment_url = self._bounded_text(comment_url) or ""
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT email FROM contributor_codes WHERE code_hash = ? AND used_at IS NULL AND expires_at >= ?"
+                " AND login = ?",
+                (code_hash, now, display.lower()),
+            ).fetchone()
+            if row is None:
+                if not comment_url:
+                    return None
+                replay = conn.execute(
+                    "SELECT k.email FROM contributor_codes k JOIN contributor_identities i ON i.login = k.used_by"
+                    " WHERE k.code_hash = ? AND k.used_by = ? AND i.comment_url = ? AND i.email = k.email",
+                    (code_hash, display.lower(), comment_url),
+                ).fetchone()
+                return str(replay["email"]) if replay is not None else None
+            email = str(row["email"])
+            conn.execute(
+                "UPDATE contributor_codes SET used_at = ?, used_by = ? WHERE code_hash = ?",
+                (now, display.lower(), code_hash),
+            )
+            conn.execute(
+                "INSERT INTO contributor_identities (login, display_login, email, user_id, verified_at, comment_url)"
+                " VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(login) DO UPDATE SET display_login = excluded.display_login,"
+                " email = excluded.email, user_id = excluded.user_id, verified_at = excluded.verified_at,"
+                " comment_url = excluded.comment_url",
+                (display.lower(), display, email, int(user_id or 0), now, comment_url),
+            )
+            self._emit(conn, "contributor_verified", None, {"login": display.lower()})
+            return email
+
+    def contributor_identity(self, login: str) -> Optional[Dict[str, Any]]:
+        """``{login, email, user_id, verified_at, comment_url}`` bound to a login, or None."""
+        if not isinstance(login, str) or not LOGIN_PATTERN.fullmatch(login):
+            return None  # a bot account or nothing: never bound
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT display_login AS login, email, user_id, verified_at, comment_url FROM contributor_identities"
+                " WHERE login = ?",
+                (login.lower(),),
+            ).fetchone()
+            return None if row is None else dict(row)
+
+    def record_pledge(
+        self, repo: str, pr: int, login: str, user_id: int, comment_url: str, pledge_sha: str,
+        source_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Record a pledge signature; the same ``source_key`` returns the stored row unchanged."""
+        repo = _require_text(repo, "repo")
+        pr = _require_pr(pr)
+        display = _require_login(login)
+        source_key = _optional_text(source_key, "source_key")
+        with self._write() as conn:
+            cursor = conn.execute(
+                "INSERT INTO pledge_signatures (repo, pr, login, user_id, comment_url, pledge_sha, signed_at, source_key)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(source_key) DO NOTHING",
+                (repo, pr, display, int(user_id or 0), self._bounded_text(comment_url) or "",
+                 str(pledge_sha or ""), _now(), source_key),
+            )
+            if cursor.rowcount:
+                self._emit(conn, "pledge_signed", None, {"login": display.lower(), "repo": repo, "pr": pr})
+                row = conn.execute("SELECT * FROM pledge_signatures WHERE id = ?", (int(cursor.lastrowid),)).fetchone()
+            else:
+                row = conn.execute("SELECT * FROM pledge_signatures WHERE source_key = ?", (source_key,)).fetchone()
+            return dict(row)
+
+    def set_pledge_pull(self, signature_id: int, pull_url: str) -> None:
+        with self._write() as conn:
+            conn.execute(
+                "UPDATE pledge_signatures SET pull_url = ? WHERE id = ?",
+                (self._bounded_text(pull_url) or None, int(signature_id)),
+            )
 
     def list_feedback(
         self, limit: int = 50, before_id: Optional[int] = None, after_id: Optional[int] = None

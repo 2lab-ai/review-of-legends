@@ -11,7 +11,7 @@
  */
 
 export const QUEUE_VIEWS = ['active', 'attention', 'history'];
-export const VIEWS = [...QUEUE_VIEWS, 'accounts', 'agents', 'settings', 'run', 'retrigger'];
+export const VIEWS = [...QUEUE_VIEWS, 'accounts', 'agents', 'settings', 'run', 'retrigger', 'contributor'];
 export const DEFAULT_VIEW = 'active';
 
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;

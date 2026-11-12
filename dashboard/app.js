@@ -90,6 +90,7 @@ import { renderQueue } from './view-queue.js';
 import { renderRunDetail } from './view-run.js';
 import { renderSignIn } from './view-signin.js';
 import { renderRetrigger } from './view-retrigger.js';
+import { renderContributor } from './view-contributor.js';
 import {
   acknowledgeRefusal,
   beginRetriggerLoad,
@@ -199,6 +200,7 @@ const state = {
   repositories: emptyRepositories(),
   admins: emptyAdmins(),
   retrigger: emptyRetrigger(),
+  contributor: { login: '', code: null, codeLogin: null, expiresAt: null, loading: false, error: null },
   authors: emptyAuthors(),
   retryChoice: { model: '', effort: '' },
   events: [],
@@ -928,6 +930,31 @@ function renderShellChrome() {
   dom.streamLabel.parentElement.dataset.phase = described.phase;
 }
 
+/** Contributor page: ask the server for a one-time verification code. */
+async function requestContributorCode() {
+  if (state.contributor.loading) return;
+  if (!state.contributor.login.trim()) {
+    state.contributor.error = 'Enter your GitHub login first.';
+    render();
+    return;
+  }
+  state.contributor.loading = true;
+  state.contributor.error = null;
+  render();
+  try {
+    const data = await api.contributorCode(state.contributor.login.trim().replace(/^@/, ''));
+    state.contributor.code = data && typeof data.code === 'string' ? data.code : null;
+    state.contributor.codeLogin = data && typeof data.github_login === 'string' ? data.github_login : null;
+    state.contributor.expiresAt = data && typeof data.expires_at === 'string' ? data.expires_at : null;
+  } catch (error) {
+    const described = describeApiError(error);
+    state.contributor.error = [described.title, described.detail].filter(Boolean).join(': ') || 'Could not get a code.';
+  } finally {
+    state.contributor.loading = false;
+    render();
+  }
+}
+
 function renderMain() {
   if (state.phase === 'booting') {
     replace(dom.main, []);
@@ -944,6 +971,16 @@ function renderMain() {
   }
 
   const route = state.route;
+  if (route.view === 'contributor') {
+    replace(dom.main, [renderContributor({
+      ...state.contributor,
+      email: state.identity ? state.identity.email : null,
+      // Kept in state without a re-render: re-rendering would replace the input mid-typing.
+      onLogin: (value) => { state.contributor.login = String(value || ''); },
+      onRequest: () => requestContributorCode(),
+    })]);
+    return;
+  }
   if (route.view === 'accounts') {
     replace(dom.main, [renderAccounts({
       usage: state.usage.data,
@@ -1204,6 +1241,9 @@ function onRouteChange() {
     }
     // The dispatch state comes from the queue, so the card can link the new attempt.
     if (!state.retries.loaded) loadRetries();
+  } else if (route.view === 'contributor') {
+    // Nothing to load: the code is requested by the button.
+    render();
   } else {
     const bucket = currentBucket();
     const model = state.buckets[bucket];

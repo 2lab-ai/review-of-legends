@@ -9,6 +9,7 @@ Connect your own llmux accounts, choose GitHub repositories, and let the bot pos
 - **Seven review perspectives:** correctness, security, maintainability, tests, reliability, red-team, and simplification. Enable the optional server architect per repository.
 - **Reviews that follow the conversation:** merge findings on the same line, avoid repeating open findings, respect earlier answers, and tally feedback. Resolving outdated threads requires optional Contents write permission.
 - **Visible progress:** a live PR comment reports each agent's progress; a visual outline explains the change and a separate summary synthesizes the results.
+- **A contributor gate for public repositories:** review, and approve fork CI for, only approved contributors listed in the repository's own `.github/APPROVED_CONTRIBUTORS`; company accounts get in by verifying their email domain, anyone else by signing a contributor pledge that a maintainer accepts with one merge.
 - **Continuous review without a webhook server:** poll open PRs, skip drafts, review new commits, cap concurrency, and retry failed attempts with backoff.
 - **Your models and rules:** use llmux's ChatGPT/Codex accounts, configure fallback models, tune prompts, and incorporate repository rules from the PR's base revision.
 - **Controlled merge checks:** minimum reviewer quorum and optional required reviewers. Automatic approval is off by default. The `reviewed/<branch>` status records review history, not proof that the latest head passed.

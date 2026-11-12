@@ -60,6 +60,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from . import dashboard_execution
+from . import gate
 from . import mentions
 from . import author_review
 from . import service as svc
@@ -81,6 +82,8 @@ PRUNE_INTERVAL_SECONDS = 3600.0
 MAX_REVIEWED_STATUS_POSTS_PER_TICK = 20
 # A command's content POSTs (a reaction and a reply), out of the same budget per tick.
 COMMAND_POSTS = 2
+# Contributor gate comments written per tick (gate.py): new and approved notes.
+GATE_WRITES_PER_TICK = 3
 # Watches in a row a command's GitHub copy may differ from the same listed
 # revision before it is passed over: an edit lists a new revision and starts
 # the count again, so only a difference that never goes away (a deleted
@@ -262,6 +265,13 @@ class ReviewScheduler:
         self._busy_logged = False
         self._seen_draft: Set[Key] = set()
         self._skip_logged: Dict[Key, Tuple[str, str]] = {}
+        # The contributor gate (gate.py): who may be reviewed, decided with caches.
+        self._gatekeeper = gate.Gatekeeper(clock=self._monotonic, log=_log)
+        self._gate_writes = GATE_WRITES_PER_TICK
+        # (repo, number) -> when its gate comment was last tried (the least recent goes first).
+        self._gate_tried: Dict[Key, float] = {}
+        # (repo, number, head) -> when its fork CI approval window started.
+        self._ci_seen: Dict[Tuple[str, int, str], float] = {}
         self._threads: List[threading.Thread] = []
         # The dispatch and retry threads by name, so a stopped one can be started again.
         self._workers: Dict[str, Tuple[Callable[[], None], threading.Thread]] = {}
@@ -658,6 +668,7 @@ class ReviewScheduler:
             return self.watch_interval
         repositories = self._repositories()
         self._ticks += 1
+        self._gate_writes = GATE_WRITES_PER_TICK
         lowest: Optional[int] = None
         status_budget = MAX_REVIEWED_STATUS_POSTS_PER_TICK
         listed: List[str] = []
@@ -678,6 +689,8 @@ class ReviewScheduler:
                 if unstarted:
                     self._cursor_starts.setdefault(repo.lower(), mentions.github_time(self._github_now(repo)))
                 self._absorb(repo, prs)
+                self._settle_gate_comments(repo, prs)
+                self._approve_fork_ci(repo, prs)
                 self._note_open_prs(repo, prs)
                 # One command's reaction and reply stay reserved for the mention phase.
                 reserve = COMMAND_POSTS if self.store is not None else 0
@@ -822,6 +835,9 @@ class ReviewScheduler:
                 candidates.append((key, number, head, pr, kind, may_be_opened))
         if baselined_drafts:
             self._clear_draft_baselines(repo, baselined_drafts)
+        if candidates and self._gatekeeper.applies(self.config, repo):
+            # Network reads, outside every lock: an unapproved author is not queued.
+            candidates = self._gate_candidates(repo, candidates, skips)
         now = self._clock()
         with self._cond:
             for key in list(self._queue):
@@ -864,6 +880,172 @@ class ReviewScheduler:
             self._cond.notify_all()
         for _, number, _, reason in fresh_skips:
             _log("%s pr #%d: skipping, %s" % (repo, number, reason))
+
+    def _gate_candidates(
+        self,
+        repo: str,
+        candidates: List[Tuple[Key, int, str, Dict[str, Any], str, bool]],
+        skips: List[Tuple[Key, int, str, str]],
+    ) -> List[Tuple[Key, int, str, Dict[str, Any], str, bool]]:
+        """The candidates whose author is an approved contributor (contributor_gate).
+
+        An unapproved author's PR gets the gate comment (at most
+        GATE_WRITES_PER_TICK comments per tick) and is reported as a skip, so
+        it is logged once per head. A trust that cannot be read is a skip too:
+        fail closed, read again next tick. Fork CI is approved apart from this
+        (_approve_fork_ci), since a reviewed head still needs its runs.
+        """
+        client = self._watch_clients.get(repo) or self._client_factory(repo)
+        kept = []
+        gated = []
+        for item in candidates:
+            key, number, head, pr, _, _ = item
+            login, _ = mentions.pr_author(pr)
+            try:
+                decision = self._gatekeeper.decide(client, self.config, repo, pr, self.store)
+            except Exception as exc:  # noqa: BLE001 - fail closed; the next tick reads again
+                skips.append((key, number, head, "contributor gate could not be read (%s)" % (exc,)))
+                continue
+            if decision.trusted:
+                # The review goes ahead; a gate comment left from before turns
+                # into the approved note in _settle_gate_comments.
+                self._gatekeeper.defer_approved(repo, number)
+                kept.append(item)
+                continue
+            gated.append(item)
+            skips.append((key, number, head, "%s is not an approved contributor (contributor gate)" % (login or "the author")))
+        # The least recently tried first: a comment that keeps failing does not take every tick's turn.
+        gated.sort(key=lambda item: self._gate_tried.get(item[0], 0.0))
+        for key, number, _, pr, _, _ in gated:
+            if self._gate_writes <= 0:
+                break
+            self._gate_tried[key] = self._clock()
+            try:
+                if self._gatekeeper.post_gate_comment(client, self.config, repo, pr, self.store):
+                    self._gate_writes -= 1
+            except Exception as exc:  # noqa: BLE001 - commented again next tick
+                # Charged too: a timeout may have written, and a failing GitHub must not take every candidate's turn.
+                self._gate_writes -= 1
+                _log("%s pr #%d: WARNING posting the contributor gate comment failed: %s" % (repo, number, exc))
+        return kept
+
+    def _author_review(self, client: Any, repo: str, request: mentions.Request) -> Tuple[str, str]:
+        """``@review-of-legends review``: refused for an author the contributor gate does not approve."""
+        if self._gatekeeper.applies(self.config, repo):
+            pr = client.get_pr(request.number)
+            if not self._gatekeeper.decide(client, self.config, repo, pr, self.store).trusted:
+                return "gated", ""
+        return author_review.apply(self.store, repo, request, client, self._ledger_lookup)
+
+    def _settle_gate_comments(self, repo: str, prs: List[Dict[str, Any]]) -> None:
+        """Turn the gate comment of a PR whose author is approved now into the approved note.
+
+        The one place that writes it, within the tick's write budget: for the
+        PRs _gate_candidates let in, and for those whose note had to wait (the
+        budget ran out, the write failed) even once their head is reviewed and
+        no longer a review candidate. Each PR is checked once per process.
+        """
+        if not self._gatekeeper.applies(self.config, repo):
+            return
+        by_number: Dict[int, Dict[str, Any]] = {}
+        for pr in prs:
+            try:
+                by_number[int(pr["number"])] = pr
+            except (KeyError, TypeError, ValueError):
+                continue
+        for key in [k for k in self._gate_tried if k[0] == repo.lower() and k[1] not in by_number]:
+            del self._gate_tried[key]
+        pending = self._gatekeeper.unsettled(repo, set(by_number))
+        if not pending:
+            return
+        client = self._watch_clients.get(repo) or self._client_factory(repo)
+        for number in sorted(pending):
+            if self._gate_writes <= 0:
+                return
+            pr = by_number[number]
+            try:
+                decision = self._gatekeeper.decide(client, self.config, repo, pr, self.store)
+                if decision.trusted and self._gatekeeper.mark_approved(client, self.config, repo, pr, decision):
+                    self._gate_writes -= 1
+            except Exception as exc:  # noqa: BLE001 - tried again next tick
+                self._gate_writes -= 1
+                _log("%s pr #%d: WARNING contributor gate follow-up failed: %s" % (repo, number, exc))
+
+    def _approve_fork_ci(self, repo: str, prs: List[Dict[str, Any]]) -> None:
+        """Approve the waiting fork CI runs of approved authors' open PRs (contributor_gate).
+
+        Apart from review eligibility: workflows start at different times and
+        a reviewed head still needs its runs. Each head is tried every tick for
+        gate.CI_APPROVAL_WINDOW from when its author is first seen approved (a
+        pledge accepted hours later still gets its CI); while approval backs
+        off after a refusal the window does not run. A failure is logged and
+        tried again next tick, and restarts the window (an Actions outage does
+        not use it up).
+
+        Drafts get no CI approval, but they count among the PRs sharing a
+        run: an unapproved author's draft on an approved PR's fork, branch and
+        commit keeps that run waiting.
+        """
+        if not self._gatekeeper.applies(self.config, repo):
+            return
+        client = self._watch_clients.get(repo) or self._client_factory(repo)
+        now = self._monotonic()
+        live: Set[Tuple[str, int, str]] = set()
+        forks = []
+        for pr in prs:
+            head = _head(pr)
+            if not head or not gate.is_fork(repo, pr):
+                continue
+            try:
+                forks.append(((repo.lower(), int(pr["number"]), head), pr))
+            except (KeyError, TypeError, ValueError):
+                continue
+        # A run is told apart only by fork, branch and commit: PRs that share
+        # all three (even into other base branches) are approved together or
+        # not at all.
+        groups: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
+        for _, pr in forks:
+            head_info = pr.get("head") or {}
+            source = str(((head_info.get("repo") or {}).get("full_name")) or "").lower()
+            groups.setdefault((source, str(head_info.get("ref") or ""), _head(pr)), []).append(pr)
+        trusted: Dict[int, bool] = {}
+        for key, pr in forks:
+            live.add(key)
+            try:
+                trusted[key[1]] = self._gatekeeper.decide(client, self.config, repo, pr, self.store).trusted
+            except Exception as exc:  # noqa: BLE001 - tried again next tick
+                trusted[key[1]] = False
+                _log("%s pr #%d: WARNING fork CI approval skipped, contributor gate could not be read: %s" % (repo, key[1], exc))
+        for key, pr in forks:
+            if not trusted.get(key[1]) or svc.is_draft(pr):
+                # The window starts when the author is approved (and the PR
+                # ready), not while the PR waits for that.
+                self._ci_seen.pop(key, None)
+                continue
+            head_info = pr.get("head") or {}
+            group = groups[(str(((head_info.get("repo") or {}).get("full_name")) or "").lower(), str(head_info.get("ref") or ""), key[2])]
+            if not all(trusted.get(int(other["number"])) for other in group):
+                continue
+            if self._gatekeeper.ci_blocked(repo):
+                continue
+            # Backing off is not trying: a window that a refusal interrupted
+            # starts again when the backoff ends.
+            start = max(self._ci_seen.setdefault(key, now), self._gatekeeper.ci_backoff_end(repo))
+            self._ci_seen[key] = start
+            if now - start > gate.CI_APPROVAL_WINDOW:
+                continue
+            try:
+                self._gatekeeper.approve_fork_runs(client, self.config, repo, pr, self.store)
+            except Exception as exc:  # noqa: BLE001 - tried again next tick
+                self._ci_seen[key] = now
+                _log("%s pr #%d: WARNING fork CI approval failed: %s" % (repo, key[1], exc))
+                continue
+            if self._gatekeeper.waits_on_others(repo, key[1]):
+                # Held back for another PR's author (a closed one, say): the
+                # window starts again, so that author's acceptance still counts.
+                self._ci_seen[key] = now
+        for key in [k for k in self._ci_seen if k[0] == repo.lower() and k not in live]:
+            del self._ci_seen[key]
 
     def _baseline(self, repo: str, prs: List[Dict[str, Any]]) -> None:
         """First sight of a repository: record its open PRs, review none of them this tick."""
@@ -1313,8 +1495,9 @@ class ReviewScheduler:
                 try:
                     body = mentions.apply_command(
                         self.store, repo, request, self.config,
-                        review=lambda command: author_review.apply(
-                            self.store, repo, command, client, self._ledger_lookup,
+                        review=lambda command: self._author_review(client, repo, command),
+                        contributor=lambda command: self._gatekeeper.handle_command(
+                            client, self.store, self.config, repo, command,
                         ),
                     )
                 except ValueError as exc:

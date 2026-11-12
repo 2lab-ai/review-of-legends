@@ -59,6 +59,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+from . import contributors
 from . import dashboard_auth
 from . import mentions
 from . import service as svc
@@ -2529,6 +2530,35 @@ def create_app(
             payload["error"] = "The saved admin list cannot be read; only the owner is admin until it is repaired."
         return _json(payload)
 
+    async def contributor_code(request: Request) -> Response:
+        """A one-time code binding a GitHub login to this session's verified email (contributor gate).
+
+        Any signed-in account may ask: the sign-in already proved the email and
+        its Workspace domain. The body names the GitHub login the code is for
+        (``{"github_login": "..."}``); only that login's ``@review-of-legends
+        verify <code>`` comment consumes it. The code is returned once and
+        stored hashed.
+        """
+        session = await require_session(request)
+        require_mutation_guards(request, session)
+        active_store = require_store()
+        body = await _read_json_object(request)
+        unknown = sorted(str(key) for key in body if key != "github_login")
+        if unknown:
+            raise _bad_request("unknown fields: " + ", ".join(unknown))
+        github_login = str(body.get("github_login") or "").strip().lstrip("@")
+        if not LOGIN_PATTERN.fullmatch(github_login) or not contributors.LOGIN.fullmatch(github_login) or github_login.endswith("[bot]"):
+            raise _bad_request("github_login must be your GitHub login")
+        email = str(session.get("email") or "").strip().lower()
+        if not email or "@" not in email:
+            raise HTTPException(status_code=403, detail="this session has no verified email")
+        code = contributors.new_verify_code()
+        expires_at = await run_in_threadpool(
+            active_store.create_contributor_code, email, contributors.code_hash(code), github_login,
+            contributors.VERIFY_CODE_TTL_SECONDS,
+        )
+        return _json({"code": code, "expires_at": expires_at, "github_login": github_login})
+
     async def add_admin(request: Request) -> Response:
         session = await require_owner(request)
         require_mutation_guards(request, session)
@@ -3009,6 +3039,7 @@ def create_app(
         # ``path``: the server decodes %2F before routing, and an address's local
         # part may legally carry a "/".
         Route("/api/settings/admins/{email:path}", remove_admin, methods=["DELETE"]),
+        Route("/api/contributor/code", contributor_code, methods=["POST"]),
         Route("/api/authors", list_authors, methods=["GET"]),
         Route("/api/feedback", list_feedback, methods=["GET"]),
         Route("/api/events", events, methods=["GET"]),

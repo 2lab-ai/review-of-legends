@@ -96,7 +96,7 @@ def manifest(callback: str, name: str = "Review of Legends") -> dict:
     return {"name": name, "url": REPOSITORY, "redirect_url": callback,
             "hook_attributes": {"url": "https://example.com/unused", "active": False},
             "public": False, "default_events": [],
-            "default_permissions": {"contents": "read", "metadata": "read",
+            "default_permissions": {"contents": "read", "metadata": "read", "actions": "write",
                                     "pull_requests": "write", "issues": "write", "statuses": "write"}}
 
 
