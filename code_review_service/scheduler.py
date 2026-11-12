@@ -687,6 +687,7 @@ class ReviewScheduler:
                 if unstarted:
                     self._cursor_starts.setdefault(repo.lower(), mentions.github_time(self._github_now(repo)))
                 self._absorb(repo, prs)
+                self._settle_gate_comments(repo, prs)
                 self._approve_fork_ci(repo, prs)
                 self._note_open_prs(repo, prs)
                 # One command's reaction and reply stay reserved for the mention phase.
@@ -903,11 +904,16 @@ class ReviewScheduler:
                 skips.append((key, number, head, "contributor gate could not be read (%s)" % (exc,)))
                 continue
             if decision.trusted:
-                try:
-                    if self._gate_writes > 0 and self._gatekeeper.mark_approved(client, self.config, repo, pr, decision):
-                        self._gate_writes -= 1
-                except Exception as exc:  # noqa: BLE001 - the review goes ahead; the next tick retries
-                    _log("%s pr #%d: WARNING contributor gate follow-up failed: %s" % (repo, number, exc))
+                if self._gate_writes <= 0:
+                    # The review goes ahead; its note follows (_settle_gate_comments).
+                    self._gatekeeper.defer_approved(repo, number)
+                else:
+                    try:
+                        if self._gatekeeper.mark_approved(client, self.config, repo, pr, decision):
+                            self._gate_writes -= 1
+                    except Exception as exc:  # noqa: BLE001 - the review goes ahead; the next tick retries
+                        self._gatekeeper.defer_approved(repo, number)
+                        _log("%s pr #%d: WARNING contributor gate follow-up failed: %s" % (repo, number, exc))
                 kept.append(item)
                 continue
             if self._gate_writes > 0:
@@ -927,6 +933,36 @@ class ReviewScheduler:
                 return "gated", ""
         return author_review.apply(self.store, repo, request, client, self._ledger_lookup)
 
+    def _settle_gate_comments(self, repo: str, prs: List[Dict[str, Any]]) -> None:
+        """Turn the gate comment of a PR whose author is approved now into the approved note.
+
+        For the PRs _gate_candidates could not settle: the write budget ran
+        out, the write failed, or the head was reviewed before a later tick
+        (it is no review candidate then). Within the same budget.
+        """
+        if not self._gatekeeper.applies(self.config, repo):
+            return
+        by_number: Dict[int, Dict[str, Any]] = {}
+        for pr in prs:
+            try:
+                by_number[int(pr["number"])] = pr
+            except (KeyError, TypeError, ValueError):
+                continue
+        pending = self._gatekeeper.unsettled(repo, set(by_number))
+        if not pending:
+            return
+        client = self._watch_clients.get(repo) or self._client_factory(repo)
+        for number in sorted(pending):
+            if self._gate_writes <= 0:
+                return
+            pr = by_number[number]
+            try:
+                decision = self._gatekeeper.decide(client, self.config, repo, pr, self.store)
+                if decision.trusted and self._gatekeeper.mark_approved(client, self.config, repo, pr, decision):
+                    self._gate_writes -= 1
+            except Exception as exc:  # noqa: BLE001 - tried again next tick
+                _log("%s pr #%d: WARNING contributor gate follow-up failed: %s" % (repo, number, exc))
+
     def _approve_fork_ci(self, repo: str, prs: List[Dict[str, Any]]) -> None:
         """Approve the waiting fork CI runs of approved authors' open PRs (contributor_gate).
 
@@ -935,7 +971,12 @@ class ReviewScheduler:
         gate.CI_APPROVAL_WINDOW from when its author is first seen approved (a
         pledge accepted hours later still gets its CI); while approval backs
         off after a refusal the window does not run. A failure is logged and
-        tried again next tick.
+        tried again next tick, and restarts the window (an Actions outage does
+        not use it up).
+
+        Drafts get no CI approval, but they count among the PRs sharing a
+        run: an unapproved author's draft on an approved PR's fork, branch and
+        commit keeps that run waiting.
         """
         if not self._gatekeeper.applies(self.config, repo):
             return
@@ -945,7 +986,7 @@ class ReviewScheduler:
         forks = []
         for pr in prs:
             head = _head(pr)
-            if not head or svc.is_draft(pr) or not gate.is_fork(repo, pr):
+            if not head or not gate.is_fork(repo, pr):
                 continue
             try:
                 forks.append(((repo.lower(), int(pr["number"]), head), pr))
@@ -968,8 +1009,9 @@ class ReviewScheduler:
                 trusted[key[1]] = False
                 _log("%s pr #%d: WARNING fork CI approval skipped, contributor gate could not be read: %s" % (repo, key[1], exc))
         for key, pr in forks:
-            if not trusted.get(key[1]):
-                # The window starts when the author is approved, not while the PR waits for that.
+            if not trusted.get(key[1]) or svc.is_draft(pr):
+                # The window starts when the author is approved (and the PR
+                # ready), not while the PR waits for that.
                 self._ci_seen.pop(key, None)
                 continue
             head_info = pr.get("head") or {}
@@ -987,6 +1029,7 @@ class ReviewScheduler:
             try:
                 self._gatekeeper.approve_fork_runs(client, self.config, repo, pr)
             except Exception as exc:  # noqa: BLE001 - tried again next tick
+                self._ci_seen[key] = now
                 _log("%s pr #%d: WARNING fork CI approval failed: %s" % (repo, key[1], exc))
         for key in [k for k in self._ci_seen if k[0] == repo.lower() and k not in live]:
             del self._ci_seen[key]

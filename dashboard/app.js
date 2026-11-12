@@ -975,13 +975,8 @@ function renderMain() {
   const route = state.route;
   if (route.view === 'contributor') {
     replace(dom.main, [renderContributor({
+      ...state.contributor,
       email: state.identity ? state.identity.email : null,
-      login: state.contributor.login,
-      code: state.contributor.code,
-      codeLogin: state.contributor.codeLogin,
-      expiresAt: state.contributor.expiresAt,
-      loading: state.contributor.loading,
-      error: state.contributor.error,
       // Kept in state without a re-render: re-rendering would replace the input mid-typing.
       onLogin: (value) => { state.contributor.login = String(value || ''); },
       onRequest: () => requestContributorCode(),

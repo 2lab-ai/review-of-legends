@@ -68,6 +68,8 @@ class Gatekeeper:
         self._commented: Dict[Tuple[str, int], str] = {}
         # (repo, number) whose comment was already checked once trusted
         self._approved_checked: Set[Tuple[str, int]] = set()
+        # (repo, number) of an approved author whose approved note waits for the write budget
+        self._approved_deferred: Set[Tuple[str, int]] = set()
         # repo -> when fork CI approval may be tried again after a refusal
         self._ci_backoff: Dict[str, float] = {}
         # (repo, list blob sha) whose ignored lines were already logged
@@ -161,11 +163,10 @@ class Gatekeeper:
                 del self._decisions[key]
 
     def forget_lists(self, repo: str) -> None:
+        """Read the repository's lists afresh next time; cached decisions stay (they expire on their own)."""
         with self._lock:
             for key in [k for k in self._lists if k[0] == repo.lower()]:
                 del self._lists[key]
-            for key in [k for k in self._decisions if k[0] == repo.lower()]:
-                del self._decisions[key]
 
     # --------------------------------------------------------------- comments
 
@@ -235,7 +236,27 @@ class Gatekeeper:
         with self._lock:
             self._approved_checked.add(key)
             self._commented.pop(key, None)
+            self._approved_deferred.discard(key)
         return wrote
+
+    def defer_approved(self, repo: str, number: int) -> None:
+        """The approved note of this PR waits for a later tick's write budget."""
+        with self._lock:
+            self._approved_deferred.add((repo.lower(), int(number)))
+
+    def unsettled(self, repo: str, open_numbers: Set[int]) -> Set[int]:
+        """Open PRs of ``repo`` whose gate comment may still need the approved note.
+
+        Those this process commented on or deferred, not yet checked once
+        trusted. Closed PRs are dropped from the bookkeeping here.
+        """
+        lowered = repo.lower()
+        with self._lock:
+            for key in [k for k in self._commented if k[0] == lowered and k[1] not in open_numbers]:
+                del self._commented[key]
+            self._approved_deferred = {k for k in self._approved_deferred if k[0] != lowered or k[1] in open_numbers}
+            keys = set(k for k in self._commented if k[0] == lowered) | set(k for k in self._approved_deferred if k[0] == lowered)
+            return {k[1] for k in keys if k not in self._approved_checked}
 
     # ---------------------------------------------------------------- fork CI
 
@@ -270,29 +291,42 @@ class Gatekeeper:
             return 0  # a deleted fork: nothing that is provably this PR's
         approved = 0
         try:
-            for run in client.list_waiting_runs(head):
-                # Only this PR's runs: same commit, same fork and branch. Another
-                # PR (an unapproved author's) can point at the very same commit.
-                run_repo = run.get("head_repository") if isinstance(run.get("head_repository"), dict) else {}
-                if str(run_repo.get("full_name") or "").lower() != source or str(run.get("head_branch") or "") != branch:
-                    continue
-                numbers = {item.get("number") for item in run.get("pull_requests") or [] if isinstance(item, dict)}
-                if numbers and int(pr["number"]) not in numbers:
-                    continue
-                client.approve_run(int(run["id"]))
-                approved += 1
+            runs = client.list_waiting_runs(head)
         except Exception as exc:  # noqa: BLE001 - a missing permission must not stop reviews
             if _status(exc) in (403, 404):
-                with self._lock:
-                    self._ci_backoff[repo.lower()] = now + NO_PERMISSION_BACKOFF
-                self._log(
-                    "%s: WARNING cannot approve fork CI runs (the App needs Actions: read and write): %s" % (repo, exc)
-                )
-                return approved
+                self._refused(repo, now, exc)
+                return 0
             raise
+        for run in runs:
+            # Only this PR's runs: same commit, same fork and branch. Another
+            # PR (an unapproved author's) can point at the very same commit.
+            run_repo = run.get("head_repository") if isinstance(run.get("head_repository"), dict) else {}
+            if str(run_repo.get("full_name") or "").lower() != source or str(run.get("head_branch") or "") != branch:
+                continue
+            numbers = {item.get("number") for item in run.get("pull_requests") or [] if isinstance(item, dict)}
+            if numbers and int(pr["number"]) not in numbers:
+                continue
+            try:
+                client.approve_run(int(run["id"]))
+            except Exception as exc:  # noqa: BLE001 - see below
+                status = _status(exc)
+                if status == 404:
+                    # Listed a moment ago: the run was deleted or re-run since, not a missing permission.
+                    self._log("%s pr #%d: fork CI run %s is gone; skipped" % (repo, int(pr["number"]), run.get("id")))
+                    continue
+                if status == 403:
+                    self._refused(repo, now, exc)
+                    break
+                raise
+            approved += 1
         if approved:
             self._log("%s pr #%d: approved %d waiting fork CI run(s) of %s" % (repo, int(pr["number"]), approved, head[:12]))
         return approved
+
+    def _refused(self, repo: str, now: float, exc: Exception) -> None:
+        with self._lock:
+            self._ci_backoff[repo.lower()] = now + NO_PERMISSION_BACKOFF
+        self._log("%s: WARNING cannot approve fork CI runs (the App needs Actions: read and write): %s" % (repo, exc))
 
     # --------------------------------------------------------------- commands
 
@@ -334,6 +368,7 @@ class Gatekeeper:
             return mentions._reply(request, texts["pledge_author"])
         branch = default_branch(pr)
         self.forget_lists(repo)
+        self.forget(request.login)
         approved, pledge_sha = self.lists(client, repo, branch)
         if not pledge_sha:
             return mentions._reply(request, texts["pledge_none"])
@@ -349,6 +384,10 @@ class Gatekeeper:
             return mentions._reply(request, texts["pledge_recorded_manual"] % {"login": request.login})
         try:
             url = self._open_pledge_pull(client, repo, branch, request, signature)
+        except ValueError:
+            # add_login refused: the default branch lists the signer already (listed since the read above).
+            self.forget_lists(repo)
+            return mentions._reply(request, texts["pledge_listed"])
         except Exception as exc:  # noqa: BLE001 - recorded; a maintainer can add the line by hand
             if _status(exc) in (403, 404, 422):
                 self._log("%s pr #%d: WARNING could not open the pledge pull request for %s (the App needs Contents: read and write): %s"
@@ -359,35 +398,38 @@ class Gatekeeper:
         return mentions._reply(request, texts["pledge_pr"] % {"url": url})
 
     def _open_pledge_pull(self, client: Any, repo: str, base: str, request: mentions.Request, signature: Dict[str, Any]) -> str:
+        """Open (or refresh) the pull request that adds the signer to the approved list.
+
+        Its one commit is always built on the default branch as it is now: a
+        branch left from a declined pull request, or an open one that a merged
+        sibling pledge has since put in conflict, is pointed at a new commit
+        rather than reset, so an open pull request never shows an empty diff.
+        """
         branch = PLEDGE_BRANCH_PREFIX + request.login.lower()
+        base_sha = client.branch_sha(base)
+        current = client.get_file(c.APPROVED_FILE, base_sha)
+        message = "chore: approve contributor @%s (pledge signed)" % request.login
+        wanted = c.add_login(
+            current[0] if current else None, request.login, "pledge signed in %s#%d" % (repo, request.number),
+        )
         existing = client.open_pull_for_branch(branch)
         if existing is not None:
+            on_branch = client.get_file(c.APPROVED_FILE, branch)
+            if on_branch is None or on_branch[0] != wanted:
+                client.update_branch(branch, client.commit_file(base_sha, c.APPROVED_FILE, wanted, message))
             return str(existing.get("html_url") or "")
-        base_sha = client.branch_sha(base)
+        commit = client.commit_file(base_sha, c.APPROVED_FILE, wanted, message)
         try:
-            client.create_branch(branch, base_sha)
+            client.create_branch(branch, commit)
         except Exception as exc:  # noqa: BLE001 - 422: the branch is left from a declined pull request
             if _status(exc) != 422:
                 raise
-            # Start it again from the default branch: an old base would
-            # conflict, or carry back a list a maintainer has since changed.
-            client.update_branch(branch, base_sha)
-        current = client.get_file(c.APPROVED_FILE, branch)
-        text, sha = (current[0], current[1]) if current else (None, "")
-        try:
-            updated = c.add_login(text, request.login, "pledge signed in %s#%d" % (repo, request.number))
-        except ValueError:
-            updated = None  # already on the branch from an earlier attempt
-        if updated is not None:
-            client.put_file(
-                c.APPROVED_FILE, branch, updated,
-                "chore: approve contributor @%s (pledge signed)" % request.login, sha,
-            )
+            client.update_branch(branch, commit)
         body = c.pledge_pull_request_body(
             request.login, int(request.user_id or 0), repo, request.number, request.url,
             str(signature["signed_at"]), str(signature.get("pledge_sha") or ""),
         )
-        pull = client.create_pull(branch, base, "chore: approve contributor @%s (pledge signed)" % request.login, body)
+        pull = client.create_pull(branch, base, message, body)
         return str(pull.get("html_url") or "")
 
 

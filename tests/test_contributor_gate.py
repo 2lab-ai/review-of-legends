@@ -8,6 +8,8 @@ watch client that also answers the gate's calls.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -26,6 +28,7 @@ from code_review_service import gate as gate_mod
 from code_review_service import mentions
 from code_review_service import service as svc
 from code_review_service.dashboard_store import DashboardStore
+from tests.shipped_config import load_shipped_config
 from tests.test_scheduler import REPO, GitHub, SchedulerTestCase, pr
 
 BOT = "review-of-legends[bot]"
@@ -55,8 +58,10 @@ class FakeGitHub:
         self.runs: Dict[str, List[int]] = {}
         self.runs_error: Optional[Exception] = None
         self.branch_error: Optional[Exception] = None
+        self.approve_errors: Dict[int, Exception] = {}
         self.prs: Dict[int, Dict[str, Any]] = {}
         self.pulls: Dict[str, Dict[str, Any]] = {}
+        self.commits: Dict[str, tuple] = {}  # sha -> (parent, path, text)
         self._next_id = 100
 
     # reads
@@ -64,7 +69,7 @@ class FakeGitHub:
         return BOT
 
     def get_file(self, path: str, ref: str):
-        return self.files.get((path, ref))
+        return self.files.get((path, "main" if ref == self.branch_sha("main") else ref))
 
     def collaborator_permission(self, login: str):
         self.permission_reads.append(login)
@@ -105,26 +110,36 @@ class FakeGitHub:
         self.writes.append(("update", comment_id, body))
 
     def approve_run(self, run_id: int):
+        if run_id in self.approve_errors:
+            raise self.approve_errors[run_id]
         self.writes.append(("approve", run_id))
+
+    def commit_file(self, parent_sha: str, path: str, text: str, message: str) -> str:
+        sha = "c%039d" % (len(self.commits) + 1)
+        self.commits[sha] = (parent_sha, path, text)
+        self.writes.append(("commit", parent_sha, path, text))
+        return sha
+
+    def _point(self, branch: str, sha: str) -> None:
+        # The branch then holds the default branch's files plus the commit's one file.
+        for key in [k for k in self.files if k[1] == branch]:
+            del self.files[key]
+        for (path, ref), value in list(self.files.items()):
+            if ref == "main":
+                self.files[(path, branch)] = value
+        parent, path, text = self.commits[sha]
+        assert parent == self.branch_sha("main"), "built on an old base"
+        self.files[(path, branch)] = (text, "blob-" + sha)
 
     def create_branch(self, branch: str, sha: str):
         if self.branch_error is not None:
             raise self.branch_error
-        # GitHub's new branch holds the default branch's files.
-        for (path, ref), value in list(self.files.items()):
-            if ref == "main":
-                self.files[(path, branch)] = value
+        self._point(branch, sha)
         self.writes.append(("branch", branch, sha))
 
     def update_branch(self, branch: str, sha: str):
-        for (path, ref), value in list(self.files.items()):
-            if ref == "main":
-                self.files[(path, branch)] = value
-        self.writes.append(("reset", branch, sha))
-
-    def put_file(self, path: str, branch: str, text: str, message: str, sha: str = ""):
-        self.files[(path, branch)] = (text, "new-sha")
-        self.writes.append(("put", path, branch, text, sha))
+        self._point(branch, sha)
+        self.writes.append(("point", branch, sha))
 
     def create_pull(self, head: str, base: str, title: str, body: str):
         pull = {"html_url": "https://github.com/%s/pull/77" % self.repo, "head": head, "body": body}
@@ -305,6 +320,27 @@ class ForkCiTest(GateTestCase):
         self.now += gate_mod.NO_PERMISSION_BACKOFF + 1
         self.assertEqual(1, self.keeper.approve_fork_runs(self.gh, self.config, REPO, make_pr(1, "alice", fork=True)))
 
+    def test_a_run_gone_before_its_approval_is_skipped_without_a_backoff(self) -> None:
+        self.gh.runs["a" * 40] = [(11, "someone/fork", "topic"), (12, "someone/fork", "topic")]
+        self.gh.approve_errors[11] = status_error(404)
+        self.assertEqual(1, self.keeper.approve_fork_runs(self.gh, self.config, REPO, make_pr(1, "alice", fork=True)))
+        self.assertIn(("approve", 12), self.gh.writes)
+        self.assertFalse(self.keeper.ci_blocked(REPO))
+
+    def test_a_refused_approval_backs_off(self) -> None:
+        self.gh.runs["a" * 40] = [(11, "someone/fork", "topic"), (12, "someone/fork", "topic")]
+        self.gh.approve_errors[11] = status_error(403)
+        self.assertEqual(0, self.keeper.approve_fork_runs(self.gh, self.config, REPO, make_pr(1, "alice", fork=True)))
+        self.assertTrue(self.keeper.ci_blocked(REPO))
+        self.assertNotIn(("approve", 12), self.gh.writes)
+
+    def test_a_transient_failure_propagates(self) -> None:
+        self.gh.runs["a" * 40] = [(11, "someone/fork", "topic")]
+        self.gh.approve_errors[11] = status_error(502)
+        with self.assertRaises(svc.ServiceError):
+            self.keeper.approve_fork_runs(self.gh, self.config, REPO, make_pr(1, "alice", fork=True))
+        self.assertFalse(self.keeper.ci_blocked(REPO))
+
     def test_switched_off(self) -> None:
         self.config = dict(GATE, contributor_gate={"enabled": True, "approve_fork_ci": False})
         self.gh.runs["a" * 40] = [(11, "someone/fork", "topic")]
@@ -345,24 +381,61 @@ class CommandTest(GateTestCase):
         reply = self.answer(3, "mallory", c.PLEDGE_SENTENCE)
         self.assertIn("https://github.com/%s/pull/77" % REPO, reply)
         branch = gate_mod.PLEDGE_BRANCH_PREFIX + "mallory"
-        self.assertEqual(("branch", branch, "f" * 40), self.gh.writes[0])
-        put = [w for w in self.gh.writes if w[0] == "put"][0]
-        self.assertEqual("alice\n*@example.com\nmallory  # pledge signed in %s#3\n" % REPO, put[3])
-        self.assertEqual("list-sha", put[4])
+        wanted = "alice\n*@example.com\nmallory  # pledge signed in %s#3\n" % REPO
+        self.assertEqual(("commit", "f" * 40, c.APPROVED_FILE, wanted), self.gh.writes[0])
+        self.assertEqual("branch", self.gh.writes[1][0])
+        self.assertEqual(wanted, self.gh.files[(c.APPROVED_FILE, branch)][0])
         pull = self.gh.pulls[branch]
         self.assertIn("pledge-sha", pull["body"])
         self.assertIn("5003", pull["body"])
 
     def test_a_branch_left_from_a_declined_pull_request_starts_again_from_main(self) -> None:
+        branch = gate_mod.PLEDGE_BRANCH_PREFIX + "mallory"
+        # The old branch still lists a login a maintainer has since removed from main.
+        self.gh.files[(c.APPROVED_FILE, branch)] = ("alice\nobsolete\nmallory\n", "old-sha")
+        self.gh.files[(c.APPROVED_FILE, "main")] = ("alice\nzed\n", "list-sha-2")
         self.gh.branch_error = status_error(422)
         self.answer(3, "mallory", c.PLEDGE_SENTENCE)
-        self.assertIn(("reset", gate_mod.PLEDGE_BRANCH_PREFIX + "mallory", "f" * 40), self.gh.writes)
-        self.assertIn(gate_mod.PLEDGE_BRANCH_PREFIX + "mallory", self.gh.pulls)
-        # Signing again (another comment) points at the same pull request, nothing new.
+        wanted = "alice\nzed\nmallory  # pledge signed in %s#3\n" % REPO
+        self.assertIn(("commit", "f" * 40, c.APPROVED_FILE, wanted), self.gh.writes)
+        self.assertEqual("point", [w for w in self.gh.writes if w[0] in ("branch", "point")][0][0])
+        self.assertEqual(wanted, self.gh.files[(c.APPROVED_FILE, branch)][0])
+        self.assertIn(branch, self.gh.pulls)
+        # Signing again (another comment) with nothing changed points at the same pull request, nothing new.
         writes = len(self.gh.writes)
         again = self.keeper.handle_command(self.gh, self.store, self.config, REPO, request(3, "mallory", c.PLEDGE_SENTENCE)._replace(comment_id=999))
         self.assertIn("pull/77", again)
         self.assertEqual(writes, len(self.gh.writes))
+
+    def test_signing_again_rebuilds_a_pull_request_a_merged_sibling_put_in_conflict(self) -> None:
+        branch = gate_mod.PLEDGE_BRANCH_PREFIX + "mallory"
+        self.answer(3, "mallory", c.PLEDGE_SENTENCE)
+        # Another contributor's pledge pull request is merged: main gained a line at the same place.
+        self.gh.files[(c.APPROVED_FILE, "main")] = ("alice\n*@example.com\nzed  # pledge signed\n", "list-sha-2")
+        writes = len(self.gh.writes)
+        again = self.keeper.handle_command(self.gh, self.store, self.config, REPO, request(3, "mallory", c.PLEDGE_SENTENCE)._replace(comment_id=999))
+        self.assertIn("pull/77", again)
+        new = self.gh.writes[writes:]
+        wanted = "alice\n*@example.com\nzed  # pledge signed\nmallory  # pledge signed in %s#3\n" % REPO
+        self.assertEqual([("commit", "f" * 40, c.APPROVED_FILE, wanted)], new[:1])
+        self.assertEqual(["commit", "point"], [w[0] for w in new])  # no second pull request
+        self.assertEqual(wanted, self.gh.files[(c.APPROVED_FILE, branch)][0])
+
+    def test_a_pledge_keeps_other_authors_cached_decisions(self) -> None:
+        self.gh.permissions["bob"] = "write"
+        self.assertTrue(self.keeper.decide(self.gh, self.config, REPO, make_pr(5, "bob"), self.store).trusted)
+        self.answer(3, "mallory", c.PLEDGE_SENTENCE)
+        self.assertTrue(self.keeper.decide(self.gh, self.config, REPO, make_pr(5, "bob"), self.store).trusted)
+        self.assertEqual(["bob"], self.gh.permission_reads)
+
+    def test_a_signer_listed_meanwhile_is_told_so(self) -> None:
+        # The cached list said no; main lists the signer by the time the pull request is built.
+        self.keeper.lists(self.gh, REPO, "main")
+        with mock.patch.object(self.keeper, "lists", return_value=(c.parse_list("alice\n"), "pledge-sha")):
+            self.gh.files[(c.APPROVED_FILE, "main")] = ("alice\nmallory\n", "list-sha-2")
+            reply = self.answer(3, "mallory", c.PLEDGE_SENTENCE)
+        self.assertIn("already an approved contributor", reply)
+        self.assertEqual([], [w for w in self.gh.writes if w[0] in ("branch", "point", "pull")])
 
     def test_only_the_author_signs(self) -> None:
         reply = self.answer(3, "eve", c.PLEDGE_SENTENCE)
@@ -515,6 +588,7 @@ class SchedulerGateTest(SchedulerTestCase):
         scheduler.control()
         self.listing.gate.runs["a" * 40] = [(31, "someone/fork", "topic")]
         twin = self.authored(9, "a" * 40, "mallory")  # same fork, branch and commit; another base branch
+        twin["base"]["ref"] = "release"
         self.listing.prs[REPO] = [self.authored(8, "a" * 40, "alice"), twin]
         scheduler.tick()
         self.assertNotIn(("approve", 31), self.listing.gate.writes)
@@ -522,6 +596,59 @@ class SchedulerGateTest(SchedulerTestCase):
         self.clock += gate_mod.UNTRUSTED_TTL + 1
         scheduler.tick()
         self.assertIn(("approve", 31), self.listing.gate.writes)
+
+    def test_an_unapproved_draft_on_the_same_branch_and_commit_keeps_the_runs_waiting(self) -> None:
+        scheduler = self.make(monotonic=lambda: self.clock, **GATE)
+        scheduler.control()
+        self.listing.gate.runs["a" * 40] = [(31, "someone/fork", "topic")]
+        draft = self.authored(9, "a" * 40, "mallory")
+        draft["draft"] = True
+        draft["base"]["ref"] = "release"
+        self.listing.prs[REPO] = [self.authored(8, "a" * 40, "alice"), draft]
+        scheduler.tick()
+        scheduler.tick()
+        self.assertNotIn(("approve", 31), self.listing.gate.writes)
+        # mallory approved: the ready PR's runs go, the draft itself still gets no CI approval of its own.
+        self.listing.gate.files[(c.APPROVED_FILE, "main")] = ("alice\nmallory\n", "s2")
+        self.clock += gate_mod.UNTRUSTED_TTL + 1
+        scheduler.tick()
+        self.assertEqual(1, self.listing.gate.writes.count(("approve", 31)))
+
+    def test_an_actions_outage_does_not_use_up_the_window(self) -> None:
+        scheduler = self.make(monotonic=lambda: self.clock, **GATE)
+        scheduler.control()
+        self.listing.prs[REPO] = [self.authored(8, "a" * 40, "alice")]
+        self.listing.gate.runs_error = status_error(502)
+        for _ in range(3):
+            scheduler.tick()
+            self.clock += gate_mod.CI_APPROVAL_WINDOW / 2
+        self.listing.gate.runs_error = None
+        self.listing.gate.runs["a" * 40] = [(31, "someone/fork", "topic")]
+        scheduler.tick()
+        self.assertIn(("approve", 31), self.listing.gate.writes)
+
+    def test_an_approved_note_left_by_the_write_budget_follows_after_the_review(self) -> None:
+        scheduler = self.make(monotonic=lambda: self.clock, **GATE)
+        scheduler.control()
+        numbers = [9, 10, 11, 12]
+        self.listing.prs[REPO] = [self.authored(n, ("%x" % n) * 40, "mallory") for n in numbers]
+        for _ in numbers:
+            scheduler.tick()  # three gate comments a tick
+        self.assertEqual(numbers, sorted(self.listing.gate.comments))
+        self.listing.gate.files[(c.APPROVED_FILE, "main")] = ("alice\nmallory\n", "s2")
+        self.clock += gate_mod.UNTRUSTED_TTL + 1
+        scheduler.tick()
+        self.assertEqual(numbers, sorted(number for _, number in scheduler._queue))
+        # The last one waits for budget; its head is reviewed (no longer a candidate) before the next tick.
+        scheduler._queue.clear()
+        with svc.STATE_LOCK:
+            reviewed = svc.repo_state(scheduler.state, REPO)["reviewed"]
+            for n in numbers:
+                reviewed[str(n)] = {"head_sha": ("%x" % n) * 40, "reviewed_at": "2026-11-12T00:00:00+00:00"}
+        scheduler.tick()
+        self.assertEqual({}, scheduler._queue)
+        for n in numbers:
+            self.assertIn("is an approved contributor", self.listing.gate.comments[n][0]["body"], n)
 
     def test_an_author_requested_review_is_refused_for_an_unapproved_author(self) -> None:
         scheduler = self.make(monotonic=lambda: self.clock, **GATE)
@@ -574,7 +701,7 @@ class SchedulerGateTest(SchedulerTestCase):
         self.clock += gate_mod.UNTRUSTED_TTL + 1
         scheduler.tick()
         self.assertEqual([9], sorted(number for _, number in scheduler._queue))
-        self.assertIn("approved contributor", self.listing.gate.comments[9][0]["body"])
+        self.assertIn("is an approved contributor", self.listing.gate.comments[9][0]["body"])
 
     def test_gate_off_queues_everyone_without_any_gate_call(self) -> None:
         scheduler = self.make()
@@ -584,6 +711,85 @@ class SchedulerGateTest(SchedulerTestCase):
         self.assertEqual([9], sorted(number for _, number in scheduler._queue))
         self.assertEqual([], self.listing.gate.writes)
         self.assertEqual([], self.listing.gate.permission_reads)
+
+
+class ClientContractTest(unittest.TestCase):
+    """The real GitHubClient calls behind the gate's fake (what the fakes take for granted)."""
+
+    def client(self) -> svc.GitHubClient:
+        with mock.patch.object(svc.GitHubClient, "_load_token", return_value="token"):
+            return svc.GitHubClient(REPO)
+
+    def test_waiting_runs_are_asked_for_this_commit_and_read_to_the_last_page(self) -> None:
+        client = self.client()
+        calls: List[str] = []
+        pages = {
+            "first": ({"workflow_runs": [{"id": 1}, "junk"]}, "https://api.github.com/next-page"),
+            "https://api.github.com/next-page": ({"workflow_runs": [{"id": 2}]}, None),
+        }
+
+        def request(method, endpoint, body=None, paginate=False, conditional=False, with_next=False):
+            calls.append(endpoint)
+            self.assertTrue(with_next)
+            return pages["first" if len(calls) == 1 else endpoint]
+
+        with mock.patch.object(client, "request", side_effect=request):
+            runs = client.list_waiting_runs("a" * 40)
+        self.assertEqual([1, 2], [run["id"] for run in runs])
+        query = dict(svc.urllib.parse.parse_qsl(svc.urllib.parse.urlparse(calls[0]).query))
+        self.assertEqual(
+            {"event": "pull_request", "status": "action_required", "head_sha": "a" * 40, "per_page": "100"}, query,
+        )
+        self.assertTrue(calls[0].startswith("repos/%s/actions/runs?" % REPO))
+
+    def test_waiting_runs_stop_at_the_page_limit(self) -> None:
+        client = self.client()
+        with mock.patch.object(client, "request", return_value=({"workflow_runs": [{"id": 1}]}, "https://api.github.com/more")) as request:
+            runs = client.list_waiting_runs("a" * 40)
+        self.assertEqual(svc.WAITING_RUN_PAGES, request.call_count)
+        self.assertEqual(svc.WAITING_RUN_PAGES, len(runs))
+
+    def test_commit_file_builds_on_the_parent_without_moving_a_branch(self) -> None:
+        client = self.client()
+        answers = iter([{"tree": {"sha": "tree-0"}}, {"sha": "tree-1"}, {"sha": "commit-1"}])
+        with mock.patch.object(client, "request", side_effect=lambda *a, **k: next(answers)) as request:
+            self.assertEqual("commit-1", client.commit_file("f" * 40, c.APPROVED_FILE, "alice\n", "msg"))
+        methods = [(call.args[0], call.args[1]) for call in request.call_args_list]
+        self.assertEqual([
+            ("GET", "repos/%s/git/commits/%s" % (REPO, "f" * 40)),
+            ("POST", "repos/%s/git/trees" % REPO),
+            ("POST", "repos/%s/git/commits" % REPO),
+        ], methods)
+        tree = request.call_args_list[1].args[2]
+        self.assertEqual({"base_tree": "tree-0", "tree": [{"path": c.APPROVED_FILE, "mode": "100644", "type": "blob", "content": "alice\n"}]}, tree)
+        self.assertEqual(["f" * 40], request.call_args_list[2].args[2]["parents"])
+
+
+class DoctorGateTest(unittest.TestCase):
+    def doctor(self, gate: Dict[str, Any]) -> List[str]:
+        config = load_shipped_config()
+        config["contributor_gate"] = gate
+        out = io.StringIO()
+        done = mock.Mock(returncode=1, stdout="", stderr="")
+        with mock.patch.object(svc, "load_config", return_value=config), \
+             mock.patch.object(svc.shutil, "which", return_value="/bin/gh"), \
+             mock.patch.object(svc, "run_command", return_value=done), contextlib.redirect_stdout(out):
+            svc.run_doctor(argparse.Namespace(config=str(ROOT / "config" / "reviewer.json")))
+        return [line for line in out.getvalue().splitlines() if line.startswith("contributor gate:")]
+
+    def test_scope_every_repository_listed_or_none(self) -> None:
+        self.assertIn("on for every review repository", self.doctor({"enabled": True})[0])
+        self.assertIn("on for acme-corp/public;", self.doctor({"enabled": True, "repositories": ["acme-corp/public"]})[0])
+        self.assertIn("on for no repository (repositories is empty)", self.doctor({"enabled": True, "repositories": []})[0])
+        self.assertEqual(["contributor gate: off"], self.doctor({"enabled": False}))
+
+
+class PledgeFileTest(unittest.TestCase):
+    def test_the_repositorys_pledge_shows_the_exact_command(self) -> None:
+        text = (ROOT / c.PLEDGE_FILE).read_text(encoding="utf-8")
+        self.assertIn("@review-of-legends " + c.PLEDGE_SENTENCE, text)
+        line = next(line for line in text.splitlines() if line.startswith("@review-of-legends "))
+        self.assertEqual(mentions.PLEDGE, mentions.parse_command(line[len("@review-of-legends "):]).kind)
 
 
 class OnceGateTest(unittest.TestCase):
@@ -606,26 +812,15 @@ class OnceGateTest(unittest.TestCase):
             "state_path": str(self.state_path),
             **GATE,
         }
-        files = {(c.APPROVED_FILE, "main"): ("alice\n", "s")}
-
-        class Client:
+        class Client(FakeGitHub):
             def __init__(self, repository, *args, **kwargs):
-                self.repo = repository
-
-            def bot_login(self):
-                return BOT
-
-            def get_pr(self, number):
-                return make_pr(number, "mallory", fork=True)
+                super().__init__(repository)
+                self.files[(c.APPROVED_FILE, "main")] = ("alice\n", "s")
+                self.prs[7] = make_pr(7, "mallory", fork=True)
+                self.permissions["mallory"] = "read"
 
             def list_open_prs(self):
-                return [make_pr(7, "mallory", fork=True)]
-
-            def get_file(self, path, ref):
-                return files.get((path, ref))
-
-            def collaborator_permission(self, login):
-                return "read"
+                return list(self.prs.values())
 
         def fake_review_pr(client, config, config_path, pr, state, **kwargs):
             reviewed.append(int(pr["number"]))

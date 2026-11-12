@@ -2279,13 +2279,24 @@ class GitHubClient:
         return str(permission) if isinstance(permission, str) and permission else None
 
     def list_waiting_runs(self, head_sha: str) -> list[dict[str, Any]]:
-        """Workflow runs of ``head_sha`` waiting for a maintainer's approval (fork pull requests)."""
+        """Workflow runs of ``head_sha`` waiting for a maintainer's approval (fork pull requests).
+
+        Every page, up to WAITING_RUN_PAGES: the caller filters by fork and
+        branch afterwards, and runs it leaves waiting (another PR's on the same
+        commit) must not hide this PR's on a later page.
+        """
         query = urllib.parse.urlencode(
             {"event": "pull_request", "status": "action_required", "head_sha": head_sha, "per_page": "100"}
         )
-        data = self.request("GET", f"repos/{self.repo}/actions/runs?{query}")
-        runs = data.get("workflow_runs") if isinstance(data, dict) else None
-        return [run for run in runs or [] if isinstance(run, dict)]
+        url: str | None = f"repos/{self.repo}/actions/runs?{query}"
+        runs: list[dict[str, Any]] = []
+        for _ in range(WAITING_RUN_PAGES):
+            if not url:
+                break
+            data, url = self.request("GET", url, with_next=True)
+            page = data.get("workflow_runs") if isinstance(data, dict) else None
+            runs.extend(run for run in page or [] if isinstance(run, dict))
+        return runs
 
     def approve_run(self, run_id: int) -> Any:
         return self.request("POST", f"repos/{self.repo}/actions/runs/{int(run_id)}/approve", {})
@@ -2306,15 +2317,24 @@ class GitHubClient:
             "PATCH", f"repos/{self.repo}/git/refs/heads/{urllib.parse.quote(branch)}", {"sha": sha, "force": True}
         )
 
-    def put_file(self, path: str, branch: str, text: str, message: str, sha: str = "") -> Any:
-        payload: dict[str, Any] = {
-            "message": message,
-            "content": base64.b64encode(text.encode("utf-8")).decode("ascii"),
-            "branch": branch,
-        }
-        if sha:
-            payload["sha"] = sha
-        return self.request("PUT", f"repos/{self.repo}/contents/{urllib.parse.quote(path)}", payload)
+    def commit_file(self, parent_sha: str, path: str, text: str, message: str) -> str:
+        """A new commit on ``parent_sha`` that sets one file; its sha. No branch moves."""
+        parent = self.request("GET", f"repos/{self.repo}/git/commits/{parent_sha}")
+        base_tree = ((parent or {}).get("tree") or {}).get("sha") if isinstance(parent, dict) else None
+        if not isinstance(base_tree, str) or not base_tree:
+            raise ServiceError(f"GitHub returned no tree for commit {parent_sha}")
+        tree = self.request(
+            "POST", f"repos/{self.repo}/git/trees",
+            {"base_tree": base_tree, "tree": [{"path": path, "mode": "100644", "type": "blob", "content": text}]},
+        )
+        commit = self.request(
+            "POST", f"repos/{self.repo}/git/commits",
+            {"message": message, "tree": (tree or {}).get("sha"), "parents": [parent_sha]},
+        )
+        sha = (commit or {}).get("sha") if isinstance(commit, dict) else None
+        if not isinstance(sha, str) or not sha:
+            raise ServiceError("GitHub returned no sha for the new commit")
+        return sha
 
     def open_pull_for_branch(self, branch: str) -> dict[str, Any] | None:
         owner = self.repo.split("/", 1)[0]
@@ -2330,6 +2350,9 @@ class GitHubClient:
 
 # Rows per page of a repository comment listing (?per_page=).
 COMMENT_PAGE_SIZE = 100
+
+# Pages of waiting workflow runs read for one commit (100 runs each).
+WAITING_RUN_PAGES = 10
 
 
 class CommentListing(list):
@@ -7560,10 +7583,11 @@ def run_doctor(args: argparse.Namespace) -> int:
     except ValueError:
         gate_settings = {"enabled": False}
     if gate_settings.get("enabled"):
-        scope = gate_settings["repositories"] or ["every review repository"]
+        only = gate_settings["repositories"]
+        scope = "every review repository" if only is None else (", ".join(only) or "no repository (repositories is empty)")
         print(
             "contributor gate: on for %s; trusted domains: %s"
-            % (", ".join(scope), ", ".join(gate_settings["trusted_email_domains"]) or "none configured")
+            % (scope, ", ".join(gate_settings["trusted_email_domains"]) or "none configured")
         )
         if app and app_ok:
             granted = _github_app_permissions.get((int(app["app_id"]), int(app["installation_id"]))) or {}
