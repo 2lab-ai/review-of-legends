@@ -1,10 +1,12 @@
 name: Sanitize
 
 # Two scans of everything that is published:
-# - forbidden patterns: scripts/sanitize-scan.sh over full history with the
-#   maintainers' secret pattern list (names of private systems that must never
-#   land here). The patterns are a secret, so a hit names commits, never text.
-#   Fork PRs get no secrets and are skipped here; push to main scans them.
+# - forbidden patterns: scripts/sanitize-scan.sh over full history with two
+#   secret pattern lists: SANITIZE_PATTERNS_SHARED (required; the list every
+#   2lab-ai public repository shares, with the same script) and this
+#   repository's own SANITIZE_PATTERNS. The patterns are secrets, so a hit names
+#   commits, never text. Fork PRs get no secrets and are skipped here; push to
+#   main scans them.
 # - credentials: gitleaks over full history.
 on:
   push:
@@ -34,8 +36,9 @@ jobs:
           persist-credentials: false
       - name: Full-history forbidden-pattern scan
         env:
+          SANITIZE_PATTERNS_SHARED: ${{ secrets.SANITIZE_PATTERNS_SHARED }}
           SANITIZE_PATTERNS: ${{ secrets.SANITIZE_PATTERNS }}
-        # Fails closed (exit 2) when the secret is not set.
+        # Fails closed (exit 2) when the shared secret is not set.
         run: bash scripts/sanitize-scan.sh
 
   gitleaks:

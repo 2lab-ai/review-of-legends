@@ -40,8 +40,11 @@ per head as a GitHub App. The optional dashboard (`code_review_service/dashboard
   [`rules/documents.md`](rules/documents.md). Otherwise write `docs: N/A — <why>` in the PR.
 - Tests never post to real PRs and never reach the real `launchd`: stub `launchctl` on
   `PATH` when a test runs `service.sh`.
-- Never commit names of private systems. The Sanitize workflow scans full history with the
-  maintainers' secret pattern list and gitleaks; a hit fails the PR.
+- Never commit names of private systems. The Sanitize workflow scans full history with two
+  secret pattern lists — `SANITIZE_PATTERNS_SHARED`, shared with the other 2lab-ai public
+  repositories (same `scripts/sanitize-scan.sh`: change it there too), and this repository's
+  own `SANITIZE_PATTERNS` — and with gitleaks; a hit fails the PR. A hit is fixed by rewriting
+  the commit, never by listing it as an exception.
 
 ## Release
 
