@@ -15,3 +15,4 @@ Document user-visible changes in their owning doc ([rules/documents.md](rules/do
 Describe the behavior changed, why, and the validation performed in pull requests. Avoid changing unrelated formatting. Report security issues through the private process in SECURITY.md.
 
 This project is MIT licensed; see LICENSE. Contributions are accepted under the same license.
+
