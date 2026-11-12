@@ -6501,7 +6501,6 @@ class ContributorCodeTest(AppTestCase):
         self.assertEqual(response.headers.get("cache-control"), "no-store")
         data = response.json()
         self.assertRegex(data["code"], r"^rol-[0-9a-f]{16}$")
-        self.assertEqual(data["command"], "@review-of-legends verify " + data["code"])
         (call,) = self.store.calls_named("create_contributor_code")
         email, code_hash, login, ttl = call[1]
         self.assertEqual(email, identity["email"].lower())

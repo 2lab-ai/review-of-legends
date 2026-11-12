@@ -919,33 +919,73 @@ class ReviewScheduler:
             skips.append((key, number, head, "%s is not an approved contributor (contributor gate)" % (login or "the author")))
         return kept
 
+    def _author_review(self, client: Any, repo: str, request: mentions.Request) -> Tuple[str, str]:
+        """``@review-of-legends review``: refused for an author the contributor gate does not approve."""
+        if self._gatekeeper.applies(self.config, repo):
+            pr = client.get_pr(request.number)
+            if not self._gatekeeper.decide(client, self.config, repo, pr, self.store).trusted:
+                return "gated", ""
+        return author_review.apply(self.store, repo, request, client, self._ledger_lookup)
+
     def _approve_fork_ci(self, repo: str, prs: List[Dict[str, Any]]) -> None:
         """Approve the waiting fork CI runs of approved authors' open PRs (contributor_gate).
 
         Apart from review eligibility: workflows start at different times and
         a reviewed head still needs its runs. Each head is tried every tick for
-        gate.CI_APPROVAL_WINDOW after the daemon first sees it; a failure is
-        logged and tried again next tick.
+        gate.CI_APPROVAL_WINDOW from when its author is first seen approved (a
+        pledge accepted hours later still gets its CI); while approval backs
+        off after a refusal the window does not run. A failure is logged and
+        tried again next tick.
         """
         if not self._gatekeeper.applies(self.config, repo):
             return
         client = self._watch_clients.get(repo) or self._client_factory(repo)
         now = self._monotonic()
         live: Set[Tuple[str, int, str]] = set()
+        forks = []
         for pr in prs:
             head = _head(pr)
             if not head or svc.is_draft(pr) or not gate.is_fork(repo, pr):
                 continue
             try:
-                key = (repo.lower(), int(pr["number"]), head)
+                forks.append(((repo.lower(), int(pr["number"]), head), pr))
             except (KeyError, TypeError, ValueError):
                 continue
+        # A run is told apart only by fork, branch and commit: PRs that share
+        # all three (even into other base branches) are approved together or
+        # not at all.
+        groups: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
+        for _, pr in forks:
+            head_info = pr.get("head") or {}
+            source = str(((head_info.get("repo") or {}).get("full_name")) or "").lower()
+            groups.setdefault((source, str(head_info.get("ref") or ""), _head(pr)), []).append(pr)
+        trusted: Dict[int, bool] = {}
+        for key, pr in forks:
             live.add(key)
-            if now - self._ci_seen.setdefault(key, now) > gate.CI_APPROVAL_WINDOW:
+            try:
+                trusted[key[1]] = self._gatekeeper.decide(client, self.config, repo, pr, self.store).trusted
+            except Exception as exc:  # noqa: BLE001 - tried again next tick
+                trusted[key[1]] = False
+                _log("%s pr #%d: WARNING fork CI approval skipped, contributor gate could not be read: %s" % (repo, key[1], exc))
+        for key, pr in forks:
+            if not trusted.get(key[1]):
+                # The window starts when the author is approved, not while the PR waits for that.
+                self._ci_seen.pop(key, None)
+                continue
+            head_info = pr.get("head") or {}
+            group = groups[(str(((head_info.get("repo") or {}).get("full_name")) or "").lower(), str(head_info.get("ref") or ""), key[2])]
+            if not all(trusted.get(int(other["number"])) for other in group):
+                continue
+            if self._gatekeeper.ci_blocked(repo):
+                continue
+            # Backing off is not trying: a window that a refusal interrupted
+            # starts again when the backoff ends.
+            start = max(self._ci_seen.setdefault(key, now), self._gatekeeper.ci_backoff_end(repo))
+            self._ci_seen[key] = start
+            if now - start > gate.CI_APPROVAL_WINDOW:
                 continue
             try:
-                if self._gatekeeper.decide(client, self.config, repo, pr, self.store).trusted:
-                    self._gatekeeper.approve_fork_runs(client, self.config, repo, pr)
+                self._gatekeeper.approve_fork_runs(client, self.config, repo, pr)
             except Exception as exc:  # noqa: BLE001 - tried again next tick
                 _log("%s pr #%d: WARNING fork CI approval failed: %s" % (repo, key[1], exc))
         for key in [k for k in self._ci_seen if k[0] == repo.lower() and k not in live]:
@@ -1399,9 +1439,7 @@ class ReviewScheduler:
                 try:
                     body = mentions.apply_command(
                         self.store, repo, request, self.config,
-                        review=lambda command: author_review.apply(
-                            self.store, repo, command, client, self._ledger_lookup,
-                        ),
+                        review=lambda command: self._author_review(client, repo, command),
                         contributor=lambda command: self._gatekeeper.handle_command(
                             client, self.store, self.config, repo, command,
                         ),

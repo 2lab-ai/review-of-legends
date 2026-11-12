@@ -658,6 +658,7 @@ _REVIEW_REPLIES = {
         "limit": "이 커밋의 댓글 재리뷰는 이미 한 번 요청했습니다. 새 커밋을 푸시하거나 메인테이너에게 요청해 주세요.",
         "queued": "%s 커밋의 새로운 리뷰를 대기열에 등록했습니다.",
         "answered": "%s 커밋의 리뷰가 이 댓글과 같은 시각이나 그 뒤에 끝나, 이 요청은 이미 처리되었습니다.",
+        "gated": "이 저장소는 승인된 기여자의 PR만 리뷰합니다. PR의 기여자 게이트 댓글에서 참여 방법을 확인해 주세요.",
     },
     "en": {
         "author": "Only the PR author can request a fresh review by comment. Maintainers can use the Retrigger badge on the review.",
@@ -669,6 +670,7 @@ _REVIEW_REPLIES = {
         "limit": "A comment-requested review has already been used for this head. Please push a commit or ask a maintainer.",
         "queued": "A fresh review of %s is queued.",
         "answered": "A review of %s that completed at or after your comment already answers this request.",
+        "gated": "This repository reviews pull requests of approved contributors only; the contributor gate comment on this PR lists the ways in.",
     },
 }
 

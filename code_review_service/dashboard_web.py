@@ -2557,10 +2557,7 @@ def create_app(
             active_store.create_contributor_code, email, contributors.code_hash(code), github_login,
             contributors.VERIFY_CODE_TTL_SECONDS,
         )
-        return _json({
-            "code": code, "expires_at": expires_at, "github_login": github_login,
-            "command": "@review-of-legends verify " + code,
-        })
+        return _json({"code": code, "expires_at": expires_at, "github_login": github_login})
 
     async def add_admin(request: Request) -> Response:
         session = await require_owner(request)

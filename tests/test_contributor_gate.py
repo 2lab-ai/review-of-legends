@@ -7,17 +7,21 @@ watch client that also answers the gate's calls.
 
 from __future__ import annotations
 
+import argparse
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from code_review_service import contributors as c
+from code_review_service import dashboard_execution as dx
 from code_review_service import gate as gate_mod
 from code_review_service import mentions
 from code_review_service import service as svc
@@ -199,6 +203,12 @@ class DecideTest(GateTestCase):
         self.assertTrue(self.decide("mallory").trusted)
         self.assertEqual(["mallory"], calls)
 
+    def test_a_reassigned_login_is_decided_afresh_within_the_ttl(self) -> None:
+        self.gh.permissions["dave"] = "write"
+        self.assertTrue(self.keeper.decide(self.gh, self.config, REPO, make_pr(1, "dave", user_id=1), self.store).trusted)
+        self.gh.permissions["dave"] = "read"
+        self.assertFalse(self.keeper.decide(self.gh, self.config, REPO, make_pr(1, "dave", user_id=2), self.store).trusted)
+
     def test_unknown_author_is_cached_for_the_untrusted_ttl(self) -> None:
         self.assertFalse(self.decide("mallory").trusted)
         self.assertFalse(self.decide("mallory").trusted)
@@ -268,6 +278,12 @@ class ForkCiTest(GateTestCase):
         self.gh.runs["a" * 40] = [(11, "someone/fork", "topic"), (12, "someone/fork", "topic")]
         self.assertEqual(2, self.keeper.approve_fork_runs(self.gh, self.config, REPO, make_pr(1, "alice", fork=True)))
         self.assertEqual([("approve", 11), ("approve", 12)], self.gh.writes)
+
+    def test_a_run_naming_other_pull_requests_is_not_approved(self) -> None:
+        self.gh.runs["a" * 40] = [(11, "someone/fork", "topic")]
+        listed = self.gh.list_waiting_runs
+        self.gh.list_waiting_runs = lambda head: [dict(run, pull_requests=[{"number": 99}]) for run in listed(head)]
+        self.assertEqual(0, self.keeper.approve_fork_runs(self.gh, self.config, REPO, make_pr(1, "alice", fork=True)))
 
     def test_another_prs_runs_on_the_same_commit_are_not_approved(self) -> None:
         # An unapproved author can open a pull request from another fork or branch at the very same commit.
@@ -364,6 +380,9 @@ class CommandTest(GateTestCase):
         self.assertIn("mallory", reply)
         self.assertNotIn("pull/", reply)
         self.assertIn("Contents: read and write", self.logged[-1])
+        source = mentions.source_key(REPO, request(3, "mallory", c.PLEDGE_SENTENCE))
+        signature = self.store.record_pledge(REPO, 3, "mallory", 0, "x", "x", source_key=source)
+        self.assertEqual(("mallory", "pledge-sha", None), (signature["login"], signature["pledge_sha"], signature["pull_url"]))
 
     def test_gate_off_answers_and_changes_nothing(self) -> None:
         self.config = {}
@@ -457,6 +476,63 @@ class SchedulerGateTest(SchedulerTestCase):
         self.assertEqual(1, len([w for w in self.listing.gate.writes if w[0] == "comment"]))
         self.assertEqual([8], sorted(number for _, number in scheduler._queue))
 
+    def test_an_unapproved_authors_runs_stay_waiting(self) -> None:
+        scheduler = self.make(monotonic=lambda: self.clock, **GATE)
+        scheduler.control()
+        self.listing.gate.runs["c" * 40] = [(41, "someone/fork", "topic")]
+        self.listing.prs[REPO] = [self.authored(9, "c" * 40, "mallory")]
+        scheduler.tick()
+        scheduler.tick()
+        self.assertNotIn(("approve", 41), self.listing.gate.writes)
+
+    def test_a_pledge_accepted_after_the_window_still_gets_its_ci(self) -> None:
+        scheduler = self.make(monotonic=lambda: self.clock, **GATE)
+        scheduler.control()
+        self.listing.gate.runs["c" * 40] = [(41, "someone/fork", "topic")]
+        self.listing.prs[REPO] = [self.authored(9, "c" * 40, "mallory")]
+        scheduler.tick()
+        # Hours later a maintainer merges the pledge pull request.
+        self.clock += gate_mod.CI_APPROVAL_WINDOW * 4
+        self.listing.gate.files[(c.APPROVED_FILE, "main")] = ("alice\nmallory\n", "s2")
+        scheduler.tick()
+        self.assertIn(("approve", 41), self.listing.gate.writes)
+
+    def test_a_permission_backoff_does_not_use_up_the_window(self) -> None:
+        scheduler = self.make(monotonic=lambda: self.clock, **GATE)
+        scheduler.control()
+        self.listing.prs[REPO] = [self.authored(8, "a" * 40, "alice")]
+        self.listing.gate.runs_error = status_error(403)
+        scheduler.tick()
+        self.listing.gate.runs_error = None
+        self.listing.gate.runs["a" * 40] = [(31, "someone/fork", "topic")]
+        # The App gets Actions write; the hour-long backoff ends after the 30-minute window would have.
+        self.clock += gate_mod.NO_PERMISSION_BACKOFF + 1
+        scheduler.tick()
+        self.assertIn(("approve", 31), self.listing.gate.writes)
+
+    def test_prs_sharing_a_branch_and_commit_are_approved_together_or_not_at_all(self) -> None:
+        scheduler = self.make(monotonic=lambda: self.clock, **GATE)
+        scheduler.control()
+        self.listing.gate.runs["a" * 40] = [(31, "someone/fork", "topic")]
+        twin = self.authored(9, "a" * 40, "mallory")  # same fork, branch and commit; another base branch
+        self.listing.prs[REPO] = [self.authored(8, "a" * 40, "alice"), twin]
+        scheduler.tick()
+        self.assertNotIn(("approve", 31), self.listing.gate.writes)
+        self.listing.gate.files[(c.APPROVED_FILE, "main")] = ("alice\nmallory\n", "s2")
+        self.clock += gate_mod.UNTRUSTED_TTL + 1
+        scheduler.tick()
+        self.assertIn(("approve", 31), self.listing.gate.writes)
+
+    def test_an_author_requested_review_is_refused_for_an_unapproved_author(self) -> None:
+        scheduler = self.make(monotonic=lambda: self.clock, **GATE)
+        scheduler.control()
+        client = self.listing.watch_client(REPO, {})
+        self.listing.live[(REPO, 9)] = self.authored(9, "c" * 40, "mallory")
+        outcome = scheduler._author_review(client, REPO, request(9, "mallory", "review"))
+        self.assertEqual(("gated", ""), outcome)
+        self.assertIn("gated", mentions._REVIEW_REPLIES["en"])
+        self.assertIn("gated", mentions._REVIEW_REPLIES["ko"])
+
     def test_fork_ci_is_approved_after_the_review_too(self) -> None:
         reviewed = {"8": {"head_sha": "a" * 40, "reviewed_at": "2026-10-13T10:00:00+00:00"}}
         scheduler = self.make(reviewed=reviewed, monotonic=lambda: self.clock, **GATE)
@@ -508,6 +584,67 @@ class SchedulerGateTest(SchedulerTestCase):
         self.assertEqual([9], sorted(number for _, number in scheduler._queue))
         self.assertEqual([], self.listing.gate.writes)
         self.assertEqual([], self.listing.gate.permission_reads)
+
+
+class OnceGateTest(unittest.TestCase):
+    """``rol once`` (svc._run_once_locked) applies the same gate; ``--force`` is the operator's override."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.state_path = self.tmp / "state.json"
+        self.state_path.write_text(json.dumps({"repositories": {REPO: {"reviewed": {}, "baseline_initialized": True}}}), encoding="utf-8")
+
+    def run_once(self, force: bool) -> List[int]:
+        reviewed: List[int] = []
+        config = {
+            "repositories": [REPO],
+            "agents": [{"id": i, "prompt_path": "x"} for i in ("a", "b", "c")],
+            "agent_runner": {"command": ["true"]},
+            "work_dir": str(self.tmp / "work"),
+            "state_path": str(self.state_path),
+            **GATE,
+        }
+        files = {(c.APPROVED_FILE, "main"): ("alice\n", "s")}
+
+        class Client:
+            def __init__(self, repository, *args, **kwargs):
+                self.repo = repository
+
+            def bot_login(self):
+                return BOT
+
+            def get_pr(self, number):
+                return make_pr(number, "mallory", fork=True)
+
+            def list_open_prs(self):
+                return [make_pr(7, "mallory", fork=True)]
+
+            def get_file(self, path, ref):
+                return files.get((path, ref))
+
+            def collaborator_permission(self, login):
+                return "read"
+
+        def fake_review_pr(client, config, config_path, pr, state, **kwargs):
+            reviewed.append(int(pr["number"]))
+            return False
+
+        with mock.patch.object(svc, "GitHubClient", Client), \
+             mock.patch.object(svc, "load_config", return_value=config), \
+             mock.patch.object(svc, "expand_path", side_effect=lambda v, base=None: Path(str(v))), \
+             mock.patch.object(dx, "open_store", return_value=None), \
+             mock.patch.object(svc, "review_pr", fake_review_pr), \
+             mock.patch.object(svc, "log"):
+            svc.run_once(argparse.Namespace(config=str(ROOT / "config" / "reviewer.json"), repo=REPO, pr=7, dry_run=False, force=force))
+        return reviewed
+
+    def test_an_explicit_pr_of_an_unapproved_author_is_skipped(self) -> None:
+        self.assertEqual([], self.run_once(force=False))
+
+    def test_force_overrides_the_gate(self) -> None:
+        self.assertEqual([7], self.run_once(force=True))
 
 
 if __name__ == "__main__":

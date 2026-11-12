@@ -889,6 +889,7 @@ Unlike herdr, there is no `.github/MAINTAINERS`: write access already approves.
 - It gets one comment (marker `review-of-legends-contributor-gate`) that lists the ways in.
 - The daemon checks the pull request again on every watch. Reading the list costs a conditional request (a `304` when nothing changed).
 - When the author becomes approved, the comment says so and the review starts.
+- `@review-of-legends review` from an unapproved author is refused with the same pointer.
 
 **Domain verification.** A commit email is never evidence: anyone can put any address in a commit.
 
@@ -909,7 +910,7 @@ From then on, any pull request by that login passes the gate when the email's do
 
 Opening the pull request needs Contents write. Without it, the reply asks a maintainer to add the line, and the signature is still recorded.
 
-**Fork CI.** Set the repository's Actions setting *Approval for running fork pull request workflows from contributors* to **Require approval for all external contributors**. For an approved author, the daemon then approves the pull request's waiting runs (`POST /repos/{repo}/actions/runs/{id}/approve`): only runs of its head commit from its own fork and branch. Another pull request at the same commit is not covered. It tries each head on every watch for 30 minutes after first seeing it, independently of the review, because workflows start at different times. This needs the App's **Actions: read and write** permission. Without it the runs wait for a person, and `doctor` says so.
+**Fork CI.** Set the repository's Actions setting *Approval for running fork pull request workflows from contributors* to **Require approval for all external contributors**. For an approved author, the daemon then approves the pull request's waiting runs (`POST /repos/{repo}/actions/runs/{id}/approve`): only runs of its head commit from its own fork and branch. Another pull request at the same commit is not covered. It tries each head on every watch for 30 minutes, counted from when it first sees the author approved, independently of the review: workflows start at different times, and a pledge accepted hours later still gets its CI approved. While approval backs off after a refusal, that time does not count. Pull requests that share a fork, branch and commit (into different base branches, say) are approved together, only when every one of their authors is approved: GitHub cannot tell their runs apart. This needs the App's **Actions: read and write** permission. Without it the runs wait for a person, and `doctor` says so.
 
 ## Commands
 

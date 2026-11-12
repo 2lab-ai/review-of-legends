@@ -61,7 +61,7 @@ class Gatekeeper:
         self._log = log
         self._lock = threading.Lock()
         # (repo, login) -> (decision, expires)
-        self._decisions: Dict[Tuple[str, str], Tuple[c.Decision, float]] = {}
+        self._decisions: Dict[Tuple[str, str, int], Tuple[c.Decision, float]] = {}
         # (repo, branch) -> (approved list, pledge blob sha or "", expires)
         self._lists: Dict[Tuple[str, str], Tuple[c.ContributorList, str, float]] = {}
         # (repo, number) -> hash of the gate comment body already on the PR
@@ -70,6 +70,8 @@ class Gatekeeper:
         self._approved_checked: Set[Tuple[str, int]] = set()
         # repo -> when fork CI approval may be tried again after a refusal
         self._ci_backoff: Dict[str, float] = {}
+        # (repo, list blob sha) whose ignored lines were already logged
+        self._warned_lists: Set[Tuple[str, str]] = set()
 
     # ------------------------------------------------------------- decisions
 
@@ -90,6 +92,10 @@ class Gatekeeper:
         approved = client.get_file(c.APPROVED_FILE, branch)
         pledge = client.get_file(c.PLEDGE_FILE, branch)
         parsed = c.parse_list(approved[0] if approved else None)
+        if parsed.invalid and approved and (repo.lower(), approved[1]) not in self._warned_lists:
+            self._warned_lists.add((repo.lower(), approved[1]))
+            self._log("%s: WARNING %s on %s: ignored lines that are neither a login nor *@domain: %s"
+                      % (repo, c.APPROVED_FILE, branch, ", ".join(repr(line) for line in parsed.invalid[:5])))
         pledge_sha = pledge[1] if pledge else ""
         with self._lock:
             self._lists[key] = (parsed, pledge_sha, now + LISTS_TTL)
@@ -99,7 +105,10 @@ class Gatekeeper:
         login, _ = mentions.pr_author(pr)
         if not login:
             return c.Decision(False, "no author")
-        key = (repo.lower(), login.lower())
+        user = pr.get("user") if isinstance(pr.get("user"), dict) else {}
+        user_id = user.get("id") if isinstance(user.get("id"), int) and not isinstance(user.get("id"), bool) else 0
+        # The account id too: a login reassigned within the TTL is decided afresh.
+        key = (repo.lower(), login.lower(), user_id)
         now = self._clock()
         with self._lock:
             cached = self._decisions.get(key)
@@ -230,15 +239,28 @@ class Gatekeeper:
 
     # ---------------------------------------------------------------- fork CI
 
+    def ci_blocked(self, repo: str) -> bool:
+        """Fork CI approval is backing off after a refusal (no Actions write)."""
+        return self.ci_backoff_end(repo) > self._clock()
+
+    def ci_backoff_end(self, repo: str) -> float:
+        """When the last refusal's backoff ends (or ended); 0.0 when there never was one."""
+        with self._lock:
+            return self._ci_backoff.get(repo.lower(), 0.0)
+
     def approve_fork_runs(self, client: Any, config: Dict[str, Any], repo: str, pr: Dict[str, Any]) -> int:
-        """Approve the head's workflow runs that wait for a maintainer; the number approved."""
+        """Approve this PR's waiting fork workflow runs; the number approved.
+
+        The caller has checked that every open PR sharing this fork, branch and
+        commit has an approved author (a run cannot be told apart between
+        them). A run that names its pull requests must name this one.
+        """
         settings = c.gate_settings(config)
         if not settings["approve_fork_ci"] or not is_fork(repo, pr):
             return 0
         now = self._clock()
-        with self._lock:
-            if self._ci_backoff.get(repo.lower(), 0.0) > now:
-                return 0
+        if self.ci_blocked(repo):
+            return 0
         head_info = pr.get("head") if isinstance(pr.get("head"), dict) else {}
         head = str(head_info.get("sha") or "")
         head_repo = head_info.get("repo") if isinstance(head_info.get("repo"), dict) else {}
@@ -253,6 +275,9 @@ class Gatekeeper:
                 # PR (an unapproved author's) can point at the very same commit.
                 run_repo = run.get("head_repository") if isinstance(run.get("head_repository"), dict) else {}
                 if str(run_repo.get("full_name") or "").lower() != source or str(run.get("head_branch") or "") != branch:
+                    continue
+                numbers = {item.get("number") for item in run.get("pull_requests") or [] if isinstance(item, dict)}
+                if numbers and int(pr["number"]) not in numbers:
                     continue
                 client.approve_run(int(run["id"]))
                 approved += 1
