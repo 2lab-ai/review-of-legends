@@ -268,6 +268,8 @@ class ReviewScheduler:
         # The contributor gate (gate.py): who may be reviewed, decided with caches.
         self._gatekeeper = gate.Gatekeeper(clock=self._monotonic, log=_log)
         self._gate_writes = GATE_WRITES_PER_TICK
+        # (repo, number) -> when its gate comment was last tried (the least recent goes first).
+        self._gate_tried: Dict[Key, float] = {}
         # (repo, number, head) -> when its fork CI approval window started.
         self._ci_seen: Dict[Tuple[str, int, str], float] = {}
         self._threads: List[threading.Thread] = []
@@ -895,6 +897,7 @@ class ReviewScheduler:
         """
         client = self._watch_clients.get(repo) or self._client_factory(repo)
         kept = []
+        gated = []
         for item in candidates:
             key, number, head, pr, _, _ = item
             login, _ = mentions.pr_author(pr)
@@ -909,15 +912,21 @@ class ReviewScheduler:
                 self._gatekeeper.defer_approved(repo, number)
                 kept.append(item)
                 continue
-            if self._gate_writes > 0:
-                try:
-                    if self._gatekeeper.post_gate_comment(client, self.config, repo, pr, self.store):
-                        self._gate_writes -= 1
-                except Exception as exc:  # noqa: BLE001 - commented again next tick
-                    # Charged too: a timeout may have written, and a failing GitHub must not take every candidate's turn.
-                    self._gate_writes -= 1
-                    _log("%s pr #%d: WARNING posting the contributor gate comment failed: %s" % (repo, number, exc))
+            gated.append(item)
             skips.append((key, number, head, "%s is not an approved contributor (contributor gate)" % (login or "the author")))
+        # The least recently tried first: a comment that keeps failing does not take every tick's turn.
+        gated.sort(key=lambda item: self._gate_tried.get(item[0], 0.0))
+        for key, number, _, pr, _, _ in gated:
+            if self._gate_writes <= 0:
+                break
+            self._gate_tried[key] = self._clock()
+            try:
+                if self._gatekeeper.post_gate_comment(client, self.config, repo, pr, self.store):
+                    self._gate_writes -= 1
+            except Exception as exc:  # noqa: BLE001 - commented again next tick
+                # Charged too: a timeout may have written, and a failing GitHub must not take every candidate's turn.
+                self._gate_writes -= 1
+                _log("%s pr #%d: WARNING posting the contributor gate comment failed: %s" % (repo, number, exc))
         return kept
 
     def _author_review(self, client: Any, repo: str, request: mentions.Request) -> Tuple[str, str]:
@@ -944,6 +953,8 @@ class ReviewScheduler:
                 by_number[int(pr["number"])] = pr
             except (KeyError, TypeError, ValueError):
                 continue
+        for key in [k for k in self._gate_tried if k[0] == repo.lower() and k[1] not in by_number]:
+            del self._gate_tried[key]
         pending = self._gatekeeper.unsettled(repo, set(by_number))
         if not pending:
             return
@@ -1028,6 +1039,11 @@ class ReviewScheduler:
             except Exception as exc:  # noqa: BLE001 - tried again next tick
                 self._ci_seen[key] = now
                 _log("%s pr #%d: WARNING fork CI approval failed: %s" % (repo, key[1], exc))
+                continue
+            if self._gatekeeper.waits_on_others(repo, key[1]):
+                # Held back for another PR's author (a closed one, say): the
+                # window starts again, so that author's acceptance still counts.
+                self._ci_seen[key] = now
         for key in [k for k in self._ci_seen if k[0] == repo.lower() and k not in live]:
             del self._ci_seen[key]
 

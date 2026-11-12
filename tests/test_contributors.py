@@ -90,8 +90,15 @@ class DecideTest(unittest.TestCase):
     def test_subdomain_is_not_the_domain(self) -> None:
         self.assertFalse(self.decide("gina", identity=c.Identity("gina", "gina@evil.example.com")).trusted)
 
-    def test_trusted_bot(self) -> None:
-        self.assertEqual(c.Decision(True, "trusted bot"), self.decide("dependabot[bot]"))
+    def test_a_bot_is_decided_like_anyone_else_here(self) -> None:
+        # Trusted bots are the gatekeeper's (contributor_gate.trusted_bots), checked before this.
+        self.assertFalse(self.decide("dependabot[bot]").trusted)
+
+    def test_login_note(self) -> None:
+        text = "# header\nalice\n@Bob  # pledge signed in o/r#7\n"
+        self.assertEqual("pledge signed in o/r#7", c.login_note(text, "bob"))
+        self.assertEqual("", c.login_note(text, "ALICE"))
+        self.assertIsNone(c.login_note(text, "carol"))
 
     def test_unknown_author(self) -> None:
         self.assertEqual(c.Decision(False, "not an approved contributor"), self.decide("mallory"))

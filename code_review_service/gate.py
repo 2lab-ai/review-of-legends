@@ -76,6 +76,8 @@ class Gatekeeper:
         self._ci_backoff: Dict[str, float] = {}
         # ids of the runs this process approved, oldest first (a dict keeps the order)
         self._approved_runs: Dict[int, None] = {}
+        # (repo, number) whose last approval held a run back for another PR's author
+        self._waiting_on_others: Set[Tuple[str, int]] = set()
         # (repo, list blob sha) whose ignored lines were already logged
         self._warned_lists: Set[Tuple[str, str]] = set()
 
@@ -149,14 +151,14 @@ class Gatekeeper:
         if identity is not None:
             decision = c.decide(
                 login, permission=None, approved=approved, trusted_domains=settings["trusted_email_domains"],
-                identity=identity, trusted_bots=(), user_id=user_id,
+                identity=identity, user_id=user_id,
             )
             if decision.trusted:
                 return decision
         permission = client.collaborator_permission(login)
         return c.decide(
             login, permission=permission, approved=approved, trusted_domains=settings["trusted_email_domains"],
-            identity=identity, trusted_bots=(), user_id=user_id,
+            identity=identity, user_id=user_id,
         )
 
     def forget(self, login: str) -> None:
@@ -278,13 +280,17 @@ class Gatekeeper:
     ) -> int:
         """Approve this PR's waiting fork workflow runs; the number approved.
 
-        Only runs of its commit from its fork and branch. A run that names its
-        pull requests must name this one. A run that names none (GitHub often
-        leaves fork runs unassociated) is approved only when every pull
-        request ever opened from that fork branch at this commit, open or
-        closed, has an approved author: the run may be any of theirs. The
-        caller checks the open ones without an API call; the closed ones are
-        read here.
+        Only runs of its commit from its fork and branch, and only when no
+        other pull request the run may belong to has an unapproved author:
+
+        - a run that names its pull requests must name this one, and every
+          other one it names (open or closed) must have an approved author;
+        - a run that names none (GitHub often leaves fork runs unassociated)
+          may be any PR's from that fork branch at this commit: every one of
+          them, closed ones too, must have an approved author.
+
+        A run held back for another PR's author is reported by waits_on_others,
+        so the caller does not use up its window on it.
         """
         settings = c.gate_settings(config)
         if not settings["approve_fork_ci"] or not is_fork(repo, pr):
@@ -300,6 +306,8 @@ class Gatekeeper:
         if not head or not source:
             return 0  # a deleted fork: nothing that is provably this PR's
         number = int(pr["number"])
+        with self._lock:
+            self._waiting_on_others.discard((repo.lower(), number))
         try:
             runs = client.list_waiting_runs(head)
         except Exception as exc:  # noqa: BLE001 - a missing permission must not stop reviews
@@ -307,7 +315,10 @@ class Gatekeeper:
                 self._refused(repo, now, exc)
                 return 0
             raise
+        trusted: Dict[int, bool] = {number: True}
+        siblings: Optional[bool] = None
         mine = []
+        held = False
         for run in runs:
             # Only this PR's runs: same commit, same fork and branch. Another
             # PR (an unapproved author's) can point at the very same commit.
@@ -315,16 +326,32 @@ class Gatekeeper:
             if str(run_repo.get("full_name") or "").lower() != source or str(run.get("head_branch") or "") != branch:
                 continue
             numbers = {item.get("number") for item in run.get("pull_requests") or [] if isinstance(item, dict)}
+            numbers = {n for n in numbers if isinstance(n, int) and not isinstance(n, bool)}
             if numbers and number not in numbers:
                 continue
             with self._lock:
                 if int(run["id"]) in self._approved_runs:
                     continue  # approved a moment ago for a PR sharing it; the listing lags
-            mine.append((run, bool(numbers)))
-        if any(not named for _, named in mine) and not self._siblings_trusted(client, config, repo, pr, store, source, branch, head):
-            mine = [(run, named) for run, named in mine if named]
+            if numbers:
+                for other in sorted(numbers - set(trusted)):
+                    trusted[other] = self.decide(client, config, repo, client.get_pr(other), store).trusted
+                    if not trusted[other]:
+                        self._log("%s pr #%d: fork CI run %s stays waiting: it also belongs to #%d, whose author is not approved"
+                                  % (repo, number, run.get("id"), other))
+                ok = all(trusted[n] for n in numbers)
+            else:
+                if siblings is None:
+                    siblings = self._siblings_trusted(client, config, repo, pr, store, source, branch, head)
+                ok = siblings
+            if ok:
+                mine.append(run)
+            else:
+                held = True
+        if held:
+            with self._lock:
+                self._waiting_on_others.add((repo.lower(), number))
         approved = 0
-        for run, _ in mine:
+        for run in mine:
             run_id = int(run["id"])
             try:
                 client.approve_run(run_id)
@@ -347,13 +374,26 @@ class Gatekeeper:
             self._log("%s pr #%d: approved %d waiting fork CI run(s) of %s" % (repo, number, approved, head[:12]))
         return approved
 
+    def waits_on_others(self, repo: str, number: int) -> bool:
+        """The last approve_fork_runs for this PR held a run back for another PR's unapproved author."""
+        with self._lock:
+            return (repo.lower(), int(number)) in self._waiting_on_others
+
     def _siblings_trusted(
         self, client: Any, config: Dict[str, Any], repo: str, pr: Dict[str, Any], store: Any,
         source: str, branch: str, head: str,
     ) -> bool:
-        """Every other PR from this fork branch at this commit, closed ones too, has an approved author."""
+        """Every other PR from this fork branch at this commit, closed ones too, has an approved author.
+
+        False as well when GitHub has more of them than are read (fail closed).
+        """
         owner = source.split("/", 1)[0]
-        for other in client.pulls_for_head(owner, branch):
+        others, complete = client.pulls_for_head(owner, branch)
+        if not complete:
+            self._log("%s pr #%d: fork CI runs not linked to a pull request stay waiting: too many pull requests from %s:%s to check"
+                      % (repo, int(pr["number"]), owner, branch))
+            return False
+        for other in others:
             other_head = other.get("head") if isinstance(other.get("head"), dict) else {}
             if str(other_head.get("sha") or "") != head or other.get("number") == pr.get("number"):
                 continue
@@ -473,6 +513,12 @@ class Gatekeeper:
         existing = client.open_pull_for_branch(branch)
         if existing is not None:
             on_branch = client.get_file(c.APPROVED_FILE, branch)
+            # Its line keeps the note it was opened with: signing again from
+            # another pull request changes nothing (no new head, no CI run);
+            # only a moved default branch rebuilds it.
+            note = c.login_note(on_branch[0], request.login) if on_branch else None
+            if note is not None:
+                wanted = c.add_login(current[0] if current else None, request.login, note)
             if on_branch is None or on_branch[0] != wanted:
                 client.update_branch(branch, client.commit_file(base_sha, c.APPROVED_FILE, wanted, message))
             return str(existing.get("html_url") or "")

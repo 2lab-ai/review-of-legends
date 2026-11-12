@@ -2301,11 +2301,20 @@ class GitHubClient:
     def get_run(self, run_id: int) -> dict[str, Any]:
         return self.request("GET", f"repos/{self.repo}/actions/runs/{int(run_id)}")
 
-    def pulls_for_head(self, owner: str, branch: str) -> list[dict[str, Any]]:
-        """Pull requests, open and closed, from ``owner:branch`` (the newest 100)."""
+    def pulls_for_head(self, owner: str, branch: str) -> tuple[list[dict[str, Any]], bool]:
+        """Pull requests, open and closed, from ``owner:branch``, and whether that is all of them.
+
+        Up to WAITING_RUN_PAGES pages of 100; False when GitHub has more.
+        """
         query = urllib.parse.urlencode({"head": f"{owner}:{branch}", "state": "all", "per_page": "100"})
-        data = self.request("GET", f"repos/{self.repo}/pulls?{query}")
-        return [item for item in data or [] if isinstance(item, dict)] if isinstance(data, list) else []
+        url: str | None = f"repos/{self.repo}/pulls?{query}"
+        pulls: list[dict[str, Any]] = []
+        for _ in range(WAITING_RUN_PAGES):
+            data, url = self.request("GET", url, with_next=True)
+            pulls.extend(item for item in data or [] if isinstance(item, dict))
+            if not url:
+                return pulls, True
+        return pulls, False
 
     def approve_run(self, run_id: int) -> Any:
         return self.request("POST", f"repos/{self.repo}/actions/runs/{int(run_id)}/approve", {})
@@ -7587,11 +7596,8 @@ def run_doctor(args: argparse.Namespace) -> int:
             print(f"github app token: FAILED ({exc})")
         else:
             print("github app token: ok")
-    try:
-        gate_settings = contributors.gate_settings(config)
-    except ValueError:
-        gate_settings = {"enabled": False}
-    if gate_settings.get("enabled"):
+    gate_settings = contributors.gate_settings(config)  # load_config has validated it
+    if gate_settings["enabled"]:
         only = gate_settings["repositories"]
         scope = "every review repository" if only is None else (", ".join(only) or "no repository (repositories is empty)")
         print(

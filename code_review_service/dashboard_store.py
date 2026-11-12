@@ -39,6 +39,9 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tupl
 from .mentions import LANGUAGE_CODE_PATTERN, MAX_FEEDBACK_CHARS
 
 TRUNCATION_MARKER = "...[truncated]"
+# A used contributor verification code is kept this long, so the comment that
+# used it can be handled again (a failed reply) and answered the same.
+USED_CODE_KEPT_SECONDS = 86400
 
 # ``skipped`` is import-only: a legacy baseline entry recorded to *suppress* a
 # first-run review. A live attempt never reaches it.
@@ -1565,7 +1568,9 @@ class DashboardStore:
     def create_contributor_code(self, email: str, code_hash: str, login: str, ttl_seconds: int = 3600) -> str:
         """Store one code for ``email`` and the GitHub ``login`` it is for; returns when it expires.
 
-        Expired and used codes are pruned.
+        Expired unused codes are pruned, and used ones a day after their use:
+        until then the comment that used one can be handled again (its reply
+        failed) and get the same answer.
         """
         email = _require_text(email, "email").lower()
         code_hash = _require_text(code_hash, "code_hash")
@@ -1574,7 +1579,11 @@ class DashboardStore:
         expires = (now + dt.timedelta(seconds=int(ttl_seconds))).isoformat(timespec="seconds")
         stamp = now.isoformat(timespec="seconds")
         with self._write() as conn:
-            conn.execute("DELETE FROM contributor_codes WHERE expires_at < ? OR used_at IS NOT NULL", (stamp,))
+            used_before = (now - dt.timedelta(seconds=USED_CODE_KEPT_SECONDS)).isoformat(timespec="seconds")
+            conn.execute(
+                "DELETE FROM contributor_codes WHERE (used_at IS NULL AND expires_at < ?) OR used_at < ?",
+                (stamp, used_before),
+            )
             conn.execute(
                 "INSERT OR REPLACE INTO contributor_codes (code_hash, email, login, created_at, expires_at)"
                 " VALUES (?, ?, ?, ?, ?)",

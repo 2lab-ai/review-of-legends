@@ -179,7 +179,6 @@ def decide(
     approved: ContributorList,
     trusted_domains: Iterable[str],
     identity: Optional[Identity],
-    trusted_bots: Iterable[str] = DEFAULT_TRUSTED_BOTS,
     user_id: int = 0,
 ) -> Decision:
     """Whether ``login`` is an approved contributor, and why.
@@ -192,8 +191,6 @@ def decide(
     lowered = (login or "").lower()
     if not lowered:
         return Decision(False, "no author")
-    if lowered in {b.lower() for b in trusted_bots}:
-        return Decision(True, "trusted bot")
     if permission in WRITE_PERMISSIONS:
         return Decision(True, "%s permission" % permission)
     if lowered in approved.logins:
@@ -260,6 +257,15 @@ def add_login(text: Optional[str], login: str, comment: str) -> str:
     if current and not current.endswith("\n"):
         current += "\n"
     return current + line + "\n"
+
+
+def login_note(text: Optional[str], login: str) -> Optional[str]:
+    """The ``# comment`` on ``login``'s line ("" when it has none); None when the login is not listed."""
+    for raw in (text or "").splitlines():
+        entry, _, comment = raw.partition("#")
+        if entry.strip().lstrip("@").lower() == login.lower():
+            return " ".join(comment.split())
+    return None
 
 
 # ------------------------------------------------------------------ comments
