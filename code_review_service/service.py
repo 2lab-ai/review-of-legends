@@ -4360,14 +4360,17 @@ def raised_finding_keys(
     keys: set[tuple[str, str]] = set()
     for result in results:
         for raw in result.get("findings", []) or []:
-            path = extract_finding_path(raw) if isinstance(raw, dict) else ""
-            if not path:
+            if not isinstance(raw, dict):
                 continue
             title = normalize_finding_title(finding_title(raw))
             if allowed is not None:
+                # Before the path check: a quote can place a finding that names no path.
                 placed = place_finding(raw, allowed, diff_anchors)
                 if placed is not None:
                     keys.add((placed.path, title))
+            path = extract_finding_path(raw)
+            if not path:
+                continue
             if path not in names:
                 path = posixpath.normpath(path)  # "src/../a.py" and "src//a.py" name a.py and src/a.py
             if path not in names:

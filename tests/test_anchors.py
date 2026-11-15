@@ -118,6 +118,42 @@ class NearestFirstTest(unittest.TestCase):
         self.assertEqual(self.anchors.place("c.py", 9, "def setup():"), anchors.Placement("b.py", 1, anchors.MOVED))
 
 
+class EdgeCaseTest(unittest.TestCase):
+    def test_an_ambiguous_own_path_is_neither_placed_nor_moved(self) -> None:
+        files = [
+            {"filename": "a.py", "patch": "@@ -0,0 +1,1 @@\n+x = 1\n"},
+            {"filename": "src/a.py", "patch": "@@ -0,0 +1,1 @@\n+y = 2\n"},
+            {"filename": "b.py", "patch": "@@ -0,0 +1,1 @@\n+z = 3\n"},
+        ]
+        diff = anchors.DiffAnchors(files)
+        # "/run/source/src/a.py" ends with both "src/a.py" and "a.py".
+        self.assertEqual(diff.own_files("/run/source/src/a.py"), ["a.py", "src/a.py"])
+        self.assertIsNone(diff.place("/run/source/src/a.py", 1, "z = 3"))
+        self.assertIsNone(diff.place("/run/source/src/a.py", 1, "y = 2"))
+        self.assertEqual(diff.place("/run/source/b.py", None, "z = 3"), anchors.Placement("b.py", 1, anchors.CODE))
+
+    def test_a_move_counts_files_and_then_picks_within_the_one_file(self) -> None:
+        files = [
+            {"filename": "a.py", "patch": "@@ -0,0 +1,1 @@\n+pass\n"},
+            {"filename": "c.py", "patch": "@@ -0,0 +1,3 @@\n+    retry()\n+x\n+    retry()\n"},
+        ]
+        diff = anchors.DiffAnchors(files)
+        self.assertEqual(diff.place("a.py", 3, "retry()"), anchors.Placement("c.py", 3, anchors.MOVED))
+        self.assertEqual(diff.place("a.py", 1, "retry()"), anchors.Placement("c.py", 1, anchors.MOVED))
+        self.assertIsNone(diff.place("a.py", None, "retry()"))
+
+    def test_a_no_newline_marker_does_not_shift_the_new_side(self) -> None:
+        patch = "@@ -1,2 +1,2 @@\n keep\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n"
+        diff = anchors.DiffAnchors([{"filename": "a.txt", "patch": patch}])
+        self.assertEqual(diff.place("a.txt", None, "new"), anchors.Placement("a.txt", 2, anchors.CODE))
+
+    def test_a_multi_line_quote_does_not_span_two_hunks(self) -> None:
+        diff = anchors.DiffAnchors(FILES)
+        # src/util.py: hunk 1 ends with "return {}" at 3, hunk 2 starts with "def b():" at 40.
+        self.assertIsNone(diff.place("src/util.py", 3, "return {}\ndef b():"))
+        self.assertEqual(diff.find("src/util.py", ["return {}", "def b():"]), [])
+
+
 class ServicePlacementTest(unittest.TestCase):
     def setUp(self) -> None:
         self.allowed = svc.commentable_added_lines(FILES)
@@ -188,6 +224,43 @@ class ServicePlacementTest(unittest.TestCase):
         self.assertIn(("src/app.py", title), keys)
         self.assertIn(("src/util.py", title), keys)
         self.assertNotIn(("src/util.py", title), svc.raised_finding_keys(self.result(raw), names))
+
+    def test_a_pathless_finding_placed_by_its_quote_is_raised_under_that_path(self) -> None:
+        raw = {"line": "?", "priority": 2, "title": "[P2] no path", "body": "b", "existing_code": "x = 1"}
+        findings = svc.normalize_findings(self.result(raw), self.allowed, self.anchors)
+        self.assertEqual([(f.path, f.line) for f in findings], [("src/util.py", 2)])
+        keys = svc.raised_finding_keys(self.result(raw), [item["filename"] for item in FILES],
+                                       allowed=self.allowed, diff_anchors=self.anchors)
+        self.assertEqual(keys, frozenset({("src/util.py", svc.normalize_finding_title("[P2] no path"))}))
+
+    def test_a_p1_with_a_line_that_is_not_a_number_is_placed_by_its_quote(self) -> None:
+        raw = {"path": "src/app.py", "line": "unknown", "priority": 1, "title": "[P1] none", "body": "b",
+               "existing_code": "if data is None:"}
+        findings = svc.normalize_findings(self.result(raw), self.allowed, self.anchors)
+        self.assertEqual([(f.path, f.line) for f in findings], [("src/app.py", 13)])
+        self.assertEqual(svc.unposted_blocking_findings(self.result(raw), self.allowed, self.anchors), [])
+
+    def test_a_crowded_body_stays_under_the_limit_with_its_footer_and_balanced_details(self) -> None:
+        pr = {"number": 7, "head": {"sha": "abc1234567"}}
+        unplaced = [svc.Finding("tests", f"src/m{i}.py", 1, "medium", "[P2] " + "x" * 400, "b", 0.0, 2)
+                    for i in range(60)]
+
+        def body(summary_chars: int, with_unplaced: bool) -> str:
+            results = [{"agent": "correctness", "summary": "y" * summary_chars}]
+            return svc.build_review_body({"marker": svc.MARKER}, pr, results, [], 0, "v",
+                                         unplaced=unplaced if with_unplaced else None)
+
+        fixed = len(body(0, False))
+        for spare in (50, 300, 3000, 30000):
+            # The rest of the body leaves ``spare`` characters under the limit.
+            text = body(svc.MAX_REVIEW_BODY_CHARS - spare - fixed, True)
+            self.assertLessEqual(len(text), svc.MAX_REVIEW_BODY_CHARS, spare)
+            self.assertTrue(text.endswith("_Generated by Review of Legends._"), spare)
+            self.assertEqual(text.count("<details>"), text.count("</details>"), spare)
+            # 50 left: no room for the heading, no section; from 300 on it shows, cut with "…and N more".
+            self.assertEqual("<details>" in text, spare >= 300, spare)
+            if spare >= 300:
+                self.assertIn("more", text.split("<details>")[1], spare)
 
 
 class _Client:

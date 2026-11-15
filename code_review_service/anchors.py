@@ -71,12 +71,20 @@ class DiffAnchors:
             if path and patch:
                 self.hunks[str(path)] = _new_side_hunks(str(patch))
 
-    def resolve_path(self, path: str) -> str | None:
-        """The diff's name for ``path``: itself, or the one file it ends with (an absolute path)."""
+    def own_files(self, path: str) -> list:
+        """The diff files ``path`` may name: itself, or every file it ends with (an absolute path).
+
+        More than one means the finding's own file is ambiguous (``/x/src/a.py``
+        ends with both ``src/a.py`` and ``a.py``); none means it is not in the diff.
+        """
         if path in self.hunks:
-            return path
-        matches = [name for name in self.hunks if path.endswith("/" + name)]
-        return matches[0] if len(matches) == 1 else None
+            return [path]
+        return [name for name in self.hunks if path and path.endswith("/" + name)]
+
+    def resolve_path(self, path: str) -> str | None:
+        """The diff's name for ``path`` when exactly one file fits, else None."""
+        owns = self.own_files(path)
+        return owns[0] if len(owns) == 1 else None
 
     def find(self, path: str, wanted: list) -> list:
         """Every run of consecutive new-side lines of ``path`` (one hunk) equal to ``wanted``."""
@@ -102,11 +110,19 @@ class DiffAnchors:
         In the finding's own file a quote that matches more than once takes the
         match nearest ``line``, changed or not: when that match has no added
         line the finding is about unchanged code and nothing is placed. A quote
-        found in its own file is not looked for elsewhere.
+        found in its own file is not looked for elsewhere, and neither is one
+        whose own file is ambiguous (own_files): moving it could pick the file
+        the agent did not mean.
+
+        Elsewhere, files count, not matches: the quote must sit on added lines
+        in exactly one other file, and within that file the usual choice applies.
         """
         if not quoted_lines(snippet):
             return None
-        own = self.resolve_path(path)
+        owns = self.own_files(path)
+        if len(owns) > 1:
+            return None
+        own = owns[0] if owns else None
         if own is not None:
             found = self._find_quote(own, snippet)
             if found:
@@ -114,17 +130,18 @@ class DiffAnchors:
                 if chosen is None or not any(item.added for item in chosen):
                     return None
                 return Placement(own, _anchor_line(chosen, line), CODE)
-        elsewhere = [
-            (name, run)
-            for name in self.hunks
-            if name != own
-            for run in self._find_quote(name, snippet)
-            if any(item.added for item in run)
-        ]
-        if len(elsewhere) == 1:
-            name, run = elsewhere[0]
-            return Placement(name, _anchor_line(run, None), MOVED)
-        return None
+        elsewhere: dict = {}
+        for name in self.hunks:
+            if name == own:
+                continue
+            runs = [run for run in self._find_quote(name, snippet) if any(item.added for item in run)]
+            if runs:
+                elsewhere[name] = runs
+        if len(elsewhere) != 1:
+            return None
+        name, runs = next(iter(elsewhere.items()))
+        chosen = _pick(runs, line)
+        return Placement(name, _anchor_line(chosen, line), MOVED) if chosen else None
 
 
 def _new_side_hunks(patch: str) -> list:
@@ -155,8 +172,7 @@ def _pick(runs: list, line: int | None) -> list | None:
         return None
 
     def distance(run: list) -> int:
-        lines = [item.line for item in run]
-        return 0 if lines[0] <= line <= lines[-1] else min(abs(line - lines[0]), abs(line - lines[-1]))
+        return max(0, run[0].line - line, line - run[-1].line)
 
     ranked = sorted(runs, key=distance)
     return ranked[0] if distance(ranked[0]) < distance(ranked[1]) else None
