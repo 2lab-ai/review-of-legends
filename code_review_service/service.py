@@ -29,6 +29,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from . import anchors
 from . import contributors
 from . import dashboard_execution
 from . import gate
@@ -178,6 +179,8 @@ MAX_REVIEW_BODY_CHARS = 60000
 # Blocking findings without a line comment (unposted_blockers_section): how many
 # the review body lists, and how much of each body it quotes.
 MAX_UNPOSTED_BLOCKERS_SHOWN = 10
+# P2/P3 findings with no place on the diff, listed in a collapsed section of the body.
+MAX_UNPLACED_SHOWN = 20
 UNPOSTED_BLOCKER_BODY_CHARS = 600
 MAX_FINDING_PATH_CHARS = 300
 MAX_FINDING_LINE = 10**7
@@ -3427,6 +3430,7 @@ Repository rules from ./rules/**/*.md:
     {{
       "path": "relative/file/path",
       "line": 123,
+      "existing_code": "the changed line(s) the finding is about, copied verbatim from the diff",
       "severity": "high|medium|low",
       "priority": 2,
       "title": "short finding title",
@@ -3445,6 +3449,9 @@ Review standard:
 - Do not flag pre-existing code, speculative downstream breakage, subjective style, or broad refactors.
 - Identify the exact scenario, input, environment, or invariant that makes the issue real.
 - Use the shortest useful line location on the new side of the diff, preferably an added line.
+- Set existing_code to the code the finding is about, copied character for character from the new
+  side of the diff (one to a few lines, without the leading "+"). The service places the comment by
+  finding this text in the diff; "line" is used only when the text is not found.
 - Priority mapping: P0=blocks release or operations; P1=the patch is wrong: a defect this diff
   introduces that must be fixed before merging; P2=worth fixing, but the patch is not wrong
   without it (an unlikely edge case, hardening, a missing test, a measurable inefficiency);
@@ -4231,8 +4238,56 @@ def parse_agent_json(raw: str) -> dict[str, Any]:
     return parsed
 
 
-def normalize_findings(results: list[dict[str, Any]], allowed: dict[str, set[int]]) -> list[Finding]:
+def place_finding(
+    raw: dict[str, Any], allowed: dict[str, set[int]], diff_anchors: anchors.DiffAnchors | None = None
+) -> anchors.Placement | None:
+    """Where a raw finding gets its inline comment: an added line of the diff, or None.
+
+    The code the agent quoted (``existing_code``) decides first (DiffAnchors.place):
+    found on an added line, it places the finding; found as unchanged code, the
+    finding gets no place. Without a quote, or when the quote decides nothing,
+    the agent's ``line`` counts if it is an added line (resolve_finding_path
+    takes an absolute path).
+    """
+    path = extract_finding_path(raw)
+    try:
+        line: int | None = int(extract_finding_line(raw))
+    except (TypeError, ValueError, OverflowError):
+        line = None
+    if diff_anchors is not None:
+        placed = diff_anchors.place(path, line, raw.get("existing_code"))
+        if placed is not None:
+            # A quote of unchanged code ends it: the agent's line could be an unrelated added line.
+            return None if placed.how == anchors.UNCHANGED else placed
+    if line is None:
+        return None
+    path = resolve_finding_path(path, line, allowed)
+    if line in allowed.get(path, set()):
+        return anchors.Placement(path, line, anchors.LINE)
+    return None
+
+
+def placement_counts(
+    results: list[dict[str, Any]], allowed: dict[str, set[int]], diff_anchors: anchors.DiffAnchors | None
+) -> dict[str, int]:
+    """How the run's raw findings were placed (code, moved, line) and how many found no place (none)."""
+    counts = {anchors.CODE: 0, anchors.MOVED: 0, anchors.LINE: 0, "none": 0}
+    for result in results:
+        for raw in result.get("findings") or []:
+            if isinstance(raw, dict):
+                placed = place_finding(raw, allowed, diff_anchors)
+                counts[placed.how if placed else "none"] += 1
+    return counts
+
+
+def normalize_findings(
+    results: list[dict[str, Any]], allowed: dict[str, set[int]], diff_anchors: anchors.DiffAnchors | None = None
+) -> list[Finding]:
     """The findings an inline comment can carry, ranked by finding_sort_key.
+
+    Each finding lands where place_finding puts it (the quoted code first, then
+    the agent's line); one with no place is left to unplaced_findings or
+    unposted_blocking_findings.
 
     Findings on one path:line with the same normalize_finding_title are one
     finding: the one that ranks first by finding_sort_key stays (a P0 is never
@@ -4247,14 +4302,10 @@ def normalize_findings(results: list[dict[str, Any]], allowed: dict[str, set[int
         for raw in result.get("findings", []):
             if not isinstance(raw, dict):
                 continue
-            path = extract_finding_path(raw)
-            try:
-                line = int(extract_finding_line(raw))
-            except (TypeError, ValueError, OverflowError):
+            placed = place_finding(raw, allowed, diff_anchors)
+            if placed is None:
                 continue
-            path = resolve_finding_path(path, line, allowed)
-            if line not in allowed.get(path, set()):
-                continue
+            path, line = placed.path, placed.line
             priority = extract_priority(raw)
             severity = severity_from_priority(priority) or str(raw.get("severity", "low")).lower()
             if severity not in {"high", "medium", "low"}:
@@ -4295,7 +4346,11 @@ def finding_title(raw: dict[str, Any]) -> str:
 
 
 def raised_finding_keys(
-    results: list[dict[str, Any]], filenames: Iterable[str] = (), roots: Iterable[str] = ()
+    results: list[dict[str, Any]],
+    filenames: Iterable[str] = (),
+    roots: Iterable[str] = (),
+    allowed: dict[str, set[int]] | None = None,
+    diff_anchors: anchors.DiffAnchors | None = None,
 ) -> frozenset:
     """(path, normalized title) of every finding the agents returned, on an added line or not.
 
@@ -4307,17 +4362,31 @@ def raised_finding_keys(
     (the checkout directory) it becomes the repository path; otherwise it
     counts for every PR file it ends in, since the checkout's own directories
     may look like repository ones and a wrong pick would resolve a thread the
-    finding keeps open.
+    finding keeps open. With ``allowed``, a finding also counts under the file
+    place_finding puts it in, and with ``diff_anchors`` under every file its
+    quoted code appears in: a thread a quote moved to another file stays open
+    while the agent reports the finding, even once the quote fits several files.
     """
     names = frozenset(str(name) for name in filenames if name)
     prefixes = [posixpath.normpath(str(root)).strip("/") + "/" for root in roots if str(root).strip("/")]
     keys: set[tuple[str, str]] = set()
     for result in results:
         for raw in result.get("findings", []) or []:
-            path = extract_finding_path(raw) if isinstance(raw, dict) else ""
-            if not path:
+            if not isinstance(raw, dict):
                 continue
             title = normalize_finding_title(finding_title(raw))
+            if allowed is not None:
+                # Before the path check: a quote can place a finding that names no path.
+                placed = place_finding(raw, allowed, diff_anchors)
+                if placed is not None:
+                    keys.add((placed.path, title))
+            if diff_anchors is not None:
+                # Every file the quote is in, placed or not: a thread an earlier review moved there
+                # stays raised while the agent reports it, even when the quote has turned ambiguous.
+                keys.update((name, title) for name in diff_anchors.quoted_in(raw.get("existing_code")))
+            path = extract_finding_path(raw)
+            if not path:
+                continue
             if path not in names:
                 path = posixpath.normpath(path)  # "src/../a.py" and "src//a.py" name a.py and src/a.py
             if path not in names:
@@ -4457,6 +4526,7 @@ def build_review_body(
     language_login: str = "",
     thread_plan: ThreadPlan | None = None,
     unposted_blockers: list[Finding] | None = None,
+    unplaced: list[Finding] | None = None,
     files_total: int | None = None,
     not_read: list[tuple[str, str]] | None = None,
 ) -> str:
@@ -4582,6 +4652,7 @@ def build_review_body(
             budget,
             limit=MAX_NOT_READ_ITEMS,
         ))
+    lines.extend(unplaced_findings_section(list(unplaced or []), budget))
     if still_open:
         lines.extend(bounded_section(
             ["### Not posted again: the line has an open earlier thread"],
@@ -5802,7 +5873,9 @@ def raw_results_have_p0_p1(results: list[dict[str, Any]]) -> bool:
     return False
 
 
-def unposted_blocking_findings(results: list[dict[str, Any]], allowed: dict[str, set[int]]) -> list[Finding]:
+def unposted_blocking_findings(
+    results: list[dict[str, Any]], allowed: dict[str, set[int]], diff_anchors: anchors.DiffAnchors | None = None
+) -> list[Finding]:
     """The raw P0/P1 findings that ``normalize_findings`` leaves out, in agent order.
 
     raw_results_have_p0_p1 and required_verdict_failures read the raw results,
@@ -5820,6 +5893,10 @@ def unposted_blocking_findings(results: list[dict[str, Any]], allowed: dict[str,
         for raw in result.get("findings", []) or []:
             if not isinstance(raw, dict) or not raw_finding_is_p0_p1(raw):
                 continue
+            body = str(raw.get("body") or "").strip()
+            placed = place_finding(raw, allowed, diff_anchors)
+            if placed is not None and body:
+                continue
             path = extract_finding_path(raw)
             try:
                 line = int(extract_finding_line(raw))
@@ -5827,9 +5904,6 @@ def unposted_blocking_findings(results: list[dict[str, Any]], allowed: dict[str,
                 line = 0
             if line > 0:
                 path = resolve_finding_path(path, line, allowed)
-            body = str(raw.get("body") or "").strip()
-            if path and body and line in allowed.get(path, set()):
-                continue
             priority = extract_priority(raw)
             try:
                 confidence = float(raw.get("confidence", raw.get("confidence_score", 0.0)))
@@ -5838,6 +5912,70 @@ def unposted_blocking_findings(results: list[dict[str, Any]], allowed: dict[str,
             severity = severity_from_priority(priority) or "high"
             unposted.append(Finding(agent_id, path, line, severity, finding_title(raw), body, confidence, priority))
     return unposted
+
+
+def unplaced_findings(
+    results: list[dict[str, Any]], allowed: dict[str, set[int]], diff_anchors: anchors.DiffAnchors | None = None
+) -> list[Finding]:
+    """The raw findings below P0/P1 that place_finding could not put on an added line, in agent order.
+
+    Before quoted code placed findings, these were dropped without a trace; the
+    body now lists them in a collapsed section (unplaced_findings_section). They
+    block nothing. A P0/P1 is unposted_blocking_findings' and is not repeated.
+    """
+    unplaced: list[Finding] = []
+    for result in results:
+        agent_id = str(result.get("agent", "unknown"))
+        for raw in result.get("findings", []) or []:
+            if not isinstance(raw, dict) or raw_finding_is_p0_p1(raw):
+                continue
+            body = str(raw.get("body") or "").strip()
+            if not body or place_finding(raw, allowed, diff_anchors) is not None:
+                continue
+            try:
+                line = int(extract_finding_line(raw))
+            except (TypeError, ValueError, OverflowError):
+                line = 0
+            priority = extract_priority(raw)
+            severity = severity_from_priority(priority) or str(raw.get("severity", "low")).lower()
+            if severity not in {"high", "medium", "low"}:
+                severity = "low"
+            unplaced.append(
+                Finding(agent_id, extract_finding_path(raw), line, severity, finding_title(raw), body, 0.0, priority)
+            )
+    return unplaced
+
+
+def unplaced_findings_section(unplaced: list[Finding], budget: list[int]) -> list[str]:
+    """A collapsed body section for unplaced_findings, within ``budget[0]`` characters; none when empty."""
+    if not unplaced:
+        return []
+    noun = "finding" if len(unplaced) == 1 else "findings"
+    closing = "</details>"
+    # The closing tag and the blank line after it, without which the next heading joins the HTML block.
+    tail = len(closing) + 2
+    budget[0] -= tail
+    section = bounded_section(
+        [
+            "<details>",
+            f"<summary>{len(unplaced)} {noun} with no place on an added line</summary>",
+            "",
+            "The quoted code was not found on an added line and the line given is not an added line "
+            "of this diff: often a remark on unchanged code. No inline comment was posted.",
+            "",
+        ],
+        [
+            f"- **{priority_label(finding)}** `{finding_location(finding)}` ({finding.agent}): "
+            f"{html.escape(display_title(finding.title), quote=False)}"
+            for finding in unplaced
+        ],
+        budget,
+        limit=MAX_UNPLACED_SHOWN,
+    )
+    if not section:
+        budget[0] += tail
+        return []
+    return section + [closing, ""]
 
 
 def finding_location(finding: Finding) -> str:
@@ -6595,6 +6733,8 @@ def review_pr(
             files = client.list_files(number)
             scope = review_scope.select_files(files, review_scope.settings_for(config, client.repo))
             allowed_lines = commentable_added_lines(list(scope.reviewed))
+            # Quotes are matched only in files the agents read.
+            diff_anchors = anchors.DiffAnchors(list(scope.reviewed))
             max_diff_chars = int(config.get("max_diff_chars", 180000))
             diff_text, shown_files = diff_and_shown_files(list(scope.reviewed), max_chars=max_diff_chars)
             not_read = review_scope.files_not_read(scope, shown_files)
@@ -6980,9 +7120,15 @@ def review_pr(
                 if verdict_failures else ""
             )
 
-            findings = normalize_findings(results, allowed_lines)
+            findings = normalize_findings(results, allowed_lines, diff_anchors)
             # The P0/P1 that block below but get no line comment: shown in the body and the summary.
-            unposted = unposted_blocking_findings(successful_agents, allowed_lines)
+            unposted = unposted_blocking_findings(successful_agents, allowed_lines, diff_anchors)
+            # The rest without a place: listed, collapsed, so none disappears.
+            unplaced = unplaced_findings(successful_agents, allowed_lines, diff_anchors)
+            placed_by = placement_counts(successful_agents, allowed_lines, diff_anchors)
+            log(f"{repo} pr #{number}: findings placed by quoted code {placed_by[anchors.CODE]}, "
+                f"moved to another file {placed_by[anchors.MOVED]}, by line {placed_by[anchors.LINE]}, "
+                f"no place {placed_by['none']}")
             max_comments = int(config.get("max_review_comments", 30))
             # The finding lifecycle (``lifecycle``, read before the agents ran): what
             # the bot's earlier threads already say stays off the diff (open threads
@@ -7007,6 +7153,9 @@ def review_pr(
                     [str(item.get("filename")) for item in files] + [old for old, _ in renamed],
                     # The agents ran in the clone; an absolute path names a file under it.
                     roots=(str(source_dir), os.path.realpath(source_dir)),
+                    # A finding moved to another file by its quote keeps that file's thread open too.
+                    allowed=allowed_lines,
+                    diff_anchors=diff_anchors,
                 ),
                 succeeded=frozenset(
                     str(result.get("agent")) for result in successful_agents if result.get("reused") is not True
@@ -7077,7 +7226,7 @@ def review_pr(
                 policy=policy, summary_meta=summary_meta or None, required_note=required_note,
                 repo=client.repo,
                 language=review_language, language_login=author_login, thread_plan=thread_plan,
-                unposted_blockers=unposted, files_total=len(files), not_read=not_read,
+                unposted_blockers=unposted, unplaced=unplaced, files_total=len(files), not_read=not_read,
             )
 
             if dry_run:

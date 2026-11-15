@@ -298,15 +298,18 @@ class _Client:
 
 
 class ReviewPrScopeTest(unittest.TestCase):
-    def run_review(self, files: list[dict], max_diff_chars: int = 180000) -> tuple[_Client, list[dict]]:
+    def run_review(self, files: list[dict], max_diff_chars: int = 180000,
+                   findings: list[dict] | None = None) -> tuple[_Client, list[dict]]:
         seen: list[dict] = []
+        if findings is None:
+            findings = [
+                {"path": "README.md", "line": 2, "priority": 2, "title": "[P2] docs", "body": "b"},
+                {"path": "app.py", "line": 2, "priority": 2, "title": "[P2] code", "body": "b"},
+            ]
 
         def fake_run_agent(agent, config, config_dir, run_dir, repo, pr, files, diff_text, *args, **kwargs):
             seen.append({"files": files, "diff": diff_text, "not_read": kwargs.get("not_read")})
-            return {"agent": agent["id"], "summary": "ok", "findings": [
-                {"path": "README.md", "line": 2, "priority": 2, "title": "[P2] docs", "body": "b"},
-                {"path": "app.py", "line": 2, "priority": 2, "title": "[P2] code", "body": "b"},
-            ]}
+            return {"agent": agent["id"], "summary": "ok", "findings": [dict(item) for item in findings]}
 
         client = _Client(files)
         with tempfile.TemporaryDirectory() as tmp:
@@ -457,6 +460,16 @@ class ReviewPrScopeTest(unittest.TestCase):
         ran, body = attempt(svc.review_diff_fingerprint(list(selected.reviewed)))
         self.assertEqual(ran, [])
         self.assertIn("- **correctness**: kept", body)
+
+
+    def test_a_quote_never_moves_a_finding_into_a_file_outside_the_scope(self) -> None:
+        readme = _file("README.md", patch="@@ -1,1 +1,2 @@\n intro\n+only in the docs\n")
+        quoting = {"path": "app.py", "line": 99, "priority": 2, "title": "[P2] quoted docs", "body": "b",
+                   "existing_code": "only in the docs"}
+        client, _ = self.run_review([_file("app.py"), readme], findings=[quoting])
+        body, comments = client.reviews[0]
+        self.assertEqual(comments, [])
+        self.assertIn("1 finding with no place on an added line", body)
 
 
 class ReviewFixesTest(unittest.TestCase):

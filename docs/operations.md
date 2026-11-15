@@ -21,6 +21,8 @@ configurable review agents, and posts one GitHub PR review containing a summary 
   `side: RIGHT` on added lines. Findings on one line share a comment, a finding the bot already has
   an open thread for is not posted again, and outdated bot threads are resolved (see *Finding
   lifecycle*).
+- A finding's line comes from the code it quotes, not from the line number the agent counted (see
+  *Placing findings*).
 - Reviews are submitted as `APPROVE` only when **all** of the following hold; otherwise the service
   posts a non-approving `COMMENT` review:
   - `approval.enabled` is `true` in `config/reviewer.json` (default: `false`; opt-in because the
@@ -246,6 +248,34 @@ resolves nothing. Inline comment titles also lose the priority an agent wrote in
 (`[P2] …`, `P2 - …`, `P2: …`; a separator followed by a space, so `P1 -> P2 …` stays a title), so
 the header names the priority once; a finding with no numeric priority keeps its title as written,
 since its header shows the severity (`**LOW - P0: …**`).
+
+### Placing findings
+
+Agents miscount lines: a P1 once landed on an unchanged blank line, where it got no comment. So each
+finding carries `existing_code`, the changed code it is about, copied from the diff, and the service
+places it (`code_review_service/anchors.py`):
+
+1. **Quoted code, own file.** The quote is matched against the new side of each hunk of the
+   finding's file: consecutive lines, blank lines and runs of whitespace ignored, a leading `+`/`-`
+   tolerated. The comment goes on the agent's `line` when that is an added line of the match, else
+   on the match's last added line. A quote that matches more than once takes the match nearest the
+   agent's `line`, changed or not (no `line`, or a tie: no pick); a chosen match with no added line,
+   like a quote found only on unchanged lines, places nothing.
+2. **Quoted code, another file.** When the quote is nowhere in the finding's file, the one other
+   file where it sits on added lines takes the comment, at the match nearest the agent's `line`
+   when it repeats there (changed or not: a nearest match on unchanged lines places nothing). Two
+   or more such files: no guess. A finding whose path fits more than one
+   file of the diff (an absolute path ending in both `src/a.py` and `a.py`) is not moved either. A
+   finding counts as raised under its own path, the path it is placed in, and every file its
+   quote appears in, so a later review keeps a moved thread open while the agent still reports it.
+3. **The agent's line**, when it is an added line of the file (as before) — but not after the quote
+   was found as unchanged code: then the finding is about code this PR did not change, and the
+   agent's line, which could be an unrelated added line, is not used.
+
+A finding that gets no place this way is not dropped: a P0/P1 is listed under *Blocking findings
+not on an added line* (and still blocks approval and a required status), and any other finding in a
+collapsed *N findings with no place on an added line* section (up to 20). The daemon log counts the
+findings placed by quoted code, moved to another file, placed by line, and left without a place.
 
 ### Review scope
 
