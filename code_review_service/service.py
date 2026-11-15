@@ -3378,13 +3378,21 @@ def render_prompt(
     def listed(item: dict[str, Any]) -> str:
         line = f"- {item.get('filename')} ({item.get('status')}, +{item.get('additions')}, -{item.get('deletions')})"
         reason = not_read.get(str(item.get("filename")))
+        if reason == review_scope.CUT_PATCH:
+            # Its visible hunks are in the diff and reviewable; only the rest is missing.
+            return f"{line} [only part of this change is in the diff below: GitHub cut its patch]"
         return f"{line} [not in the diff below: {review_scope.REASON_TEXT.get(reason, reason)}]" if reason else line
 
     file_list = "\n".join(listed(item) for item in files)
-    if not_read:
+    if any(reason != review_scope.CUT_PATCH for reason in not_read.values()):
         file_list += (
             "\n\nFiles marked [not in the diff below] are outside this review: do not report on them, "
             "and do not report that they are missing or unchanged."
+        )
+    if review_scope.CUT_PATCH in not_read.values():
+        file_list += (
+            "\n\nFiles marked [only part of this change is in the diff below] are reviewed as shown: report on "
+            "their visible hunks, and do not guess at the part GitHub left out."
         )
     title = pr.get("title", "")
     body = pr.get("body") or ""

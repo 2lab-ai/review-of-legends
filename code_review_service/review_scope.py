@@ -131,16 +131,8 @@ GENERATED_PATTERNS = (
     "**/.svelte-kit/**",
 )
 DOCUMENTATION_PATTERNS = (
-    "*.md",
-    "*.mdx",
-    "*.markdown",
-    "*.rst",
-    "*.adoc",
-    "*.asciidoc",
-    "*.rdoc",
-    "*.textile",
-    "**/docs/**/*.txt",
-    "**/doc/**/*.txt",
+    "*.{md,mdx,markdown,rst,adoc,asciidoc,rdoc,textile}",
+    "**/{docs,doc}/**/*.txt",
     # Project notices, with no extension or .txt (a bare HISTORY* would take history.py).
     "{LICENSE,LICENCE,COPYING,NOTICE,AUTHORS,CONTRIBUTORS,CHANGELOG,CHANGES,HISTORY}",
     "{LICENSE,LICENCE,COPYING,NOTICE,AUTHORS,CONTRIBUTORS,CHANGELOG,CHANGES,HISTORY}.txt",
