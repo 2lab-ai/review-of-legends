@@ -70,7 +70,8 @@ class DiffAnchorsTest(unittest.TestCase):
         self.assertEqual(self.anchors.place("src/app.py", None, "+    data = read(path)\n+    if data is None:").line, 13)
 
     def test_a_quote_of_unchanged_code_places_nothing(self) -> None:
-        self.assertIsNone(self.anchors.place("src/app.py", 15, "return parse(data)"))
+        self.assertEqual(self.anchors.place("src/app.py", 15, "return parse(data)"),
+                         anchors.Placement("src/app.py", 15, anchors.UNCHANGED))
         self.assertIsNone(self.anchors.place("src/app.py", 12, "    data = open(path)"))  # the deleted line
 
     def test_a_repeated_quote_takes_the_match_nearest_the_agents_line(self) -> None:
@@ -109,12 +110,12 @@ class NearestFirstTest(unittest.TestCase):
 
     def test_the_nearest_match_is_chosen_before_unchanged_ones_are_set_aside(self) -> None:
         # The agent points at the unchanged call at 10: the finding is about unchanged code.
-        self.assertIsNone(self.anchors.place("a.py", 10, "check()"))
+        self.assertEqual(self.anchors.place("a.py", 10, "check()"), anchors.Placement("a.py", 10, anchors.UNCHANGED))
         self.assertEqual(self.anchors.place("a.py", 29, "check()").line, 30)
         self.assertIsNone(self.anchors.place("a.py", None, "check()"))
 
     def test_an_unchanged_match_in_the_own_file_is_not_moved_to_an_added_copy_elsewhere(self) -> None:
-        self.assertIsNone(self.anchors.place("a.py", 9, "def setup():"))
+        self.assertEqual(self.anchors.place("a.py", 9, "def setup():"), anchors.Placement("a.py", 9, anchors.UNCHANGED))
         self.assertEqual(self.anchors.place("c.py", 9, "def setup():"), anchors.Placement("b.py", 1, anchors.MOVED))
 
 
@@ -160,7 +161,7 @@ class EdgeCaseTest(unittest.TestCase):
         ]
         diff = anchors.DiffAnchors(files)
         # Nearest to line 4 is c.py's unchanged call: the finding is about unchanged code.
-        self.assertIsNone(diff.place("a.py", 4, "retry()"))
+        self.assertEqual(diff.place("a.py", 4, "retry()"), anchors.Placement("c.py", 4, anchors.UNCHANGED))
         self.assertEqual(diff.place("a.py", 30, "retry()"), anchors.Placement("c.py", 30, anchors.MOVED))
 
     def test_the_quote_beats_another_added_line_the_agent_named(self) -> None:
@@ -268,6 +269,24 @@ class ServicePlacementTest(unittest.TestCase):
         keys = svc.raised_finding_keys(self.result(raw), [item["filename"] for item in FILES],
                                        allowed=self.allowed, diff_anchors=self.anchors)
         self.assertEqual(keys, frozenset({("src/util.py", svc.normalize_finding_title("[P2] no path"))}))
+
+    def test_a_quote_of_unchanged_code_never_falls_back_to_the_agents_added_line(self) -> None:
+        # Line 14 is an added line, but the quote names the unchanged "return parse(data)" at 15.
+        minor = {"path": "src/app.py", "line": 14, "priority": 2, "title": "[P2] old", "body": "b",
+                 "existing_code": "return parse(data)"}
+        blocker = dict(minor, priority=1, title="[P1] old")
+        results = self.result(minor, blocker)
+        self.assertEqual(svc.normalize_findings(results, self.allowed, self.anchors), [])
+        self.assertEqual([f.title for f in svc.unplaced_findings(results, self.allowed, self.anchors)], ["[P2] old"])
+        self.assertEqual([f.title for f in svc.unposted_blocking_findings(results, self.allowed, self.anchors)],
+                         ["[P1] old"])
+        self.assertEqual(svc.placement_counts(results, self.allowed, self.anchors)["none"], 2)
+
+    def test_the_quote_wins_over_another_added_line_through_the_service(self) -> None:
+        raw = {"path": "src/app.py", "line": 14, "priority": 2, "title": "[P2] read", "body": "b",
+               "existing_code": "data = read(path)"}
+        findings = svc.normalize_findings(self.result(raw), self.allowed, self.anchors)
+        self.assertEqual([(f.path, f.line) for f in findings], [("src/app.py", 12)])
 
     def test_a_p1_with_a_line_that_is_not_a_number_is_placed_by_its_quote(self) -> None:
         raw = {"path": "src/app.py", "line": "unknown", "priority": 1, "title": "[P1] none", "body": "b",

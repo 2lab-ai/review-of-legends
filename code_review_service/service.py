@@ -4235,9 +4235,11 @@ def place_finding(
 ) -> anchors.Placement | None:
     """Where a raw finding gets its inline comment: an added line of the diff, or None.
 
-    The code the agent quoted (``existing_code``) decides first (DiffAnchors.place);
-    without one, or when it is not found on an added line, the agent's ``line``
-    counts if it is an added line (resolve_finding_path takes an absolute path).
+    The code the agent quoted (``existing_code``) decides first (DiffAnchors.place):
+    found on an added line, it places the finding; found as unchanged code, the
+    finding gets no place. Without a quote, or when the quote decides nothing,
+    the agent's ``line`` counts if it is an added line (resolve_finding_path
+    takes an absolute path).
     """
     path = extract_finding_path(raw)
     try:
@@ -4247,7 +4249,8 @@ def place_finding(
     if diff_anchors is not None:
         placed = diff_anchors.place(path, line, raw.get("existing_code"))
         if placed is not None:
-            return placed
+            # A quote of unchanged code ends it: the agent's line could be an unrelated added line.
+            return None if placed.how == anchors.UNCHANGED else placed
     if line is None:
         return None
     path = resolve_finding_path(path, line, allowed)

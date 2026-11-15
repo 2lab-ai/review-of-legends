@@ -22,6 +22,9 @@ from typing import Any, Iterable
 CODE = "code"  # the quoted code, in the finding's own file
 MOVED = "moved"  # the quoted code, found in exactly one other file of the diff
 LINE = "line"  # the line number the agent wrote
+# The quote names unchanged code: no comment, and no falling back to the agent's line,
+# which could be an unrelated added line. Its line is the match's first line, for the record.
+UNCHANGED = "unchanged"
 
 # A quote longer than this is not a pointer to code any more; it is matched on its first lines.
 MAX_QUOTED_LINES = 40
@@ -100,7 +103,8 @@ class DiffAnchors:
         return found
 
     def place(self, path: str, line: int | None, snippet: Any) -> Placement | None:
-        """Where the quoted code sits on an added line, or None (the caller falls back to ``line``).
+        """Where the quoted code sits on an added line; UNCHANGED when it names unchanged code;
+        None when the quote decides nothing (the caller falls back to ``line``).
 
         In the finding's own file a quote that matches more than once takes the
         match nearest ``line``, changed or not: when that match has no added
@@ -123,8 +127,10 @@ class DiffAnchors:
             found = self._find_quote(own, snippet)
             if found:
                 chosen = _pick(found, line)
-                if chosen is None or not any(item.added for item in chosen):
+                if chosen is None:
                     return None
+                if not any(item.added for item in chosen):
+                    return Placement(own, chosen[0].line, UNCHANGED)
                 return Placement(own, _anchor_line(chosen, line), CODE)
         elsewhere: dict = {}
         for name in self.hunks:
@@ -137,8 +143,10 @@ class DiffAnchors:
             return None
         name, runs = next(iter(elsewhere.items()))
         chosen = _pick(runs, line)
-        if chosen is None or not any(item.added for item in chosen):
+        if chosen is None:
             return None
+        if not any(item.added for item in chosen):
+            return Placement(name, chosen[0].line, UNCHANGED)
         return Placement(name, _anchor_line(chosen, line), MOVED)
 
     def quoted_in(self, snippet: Any) -> frozenset:

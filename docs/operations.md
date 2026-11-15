@@ -268,7 +268,9 @@ places it (`code_review_service/anchors.py`):
    file of the diff (an absolute path ending in both `src/a.py` and `a.py`) is not moved either. A
    finding counts as raised under its own path, the path it is placed in, and every file its
    quote appears in, so a later review keeps a moved thread open while the agent still reports it.
-3. **The agent's line**, when it is an added line of the file (as before).
+3. **The agent's line**, when it is an added line of the file (as before) — but not after the quote
+   was found as unchanged code: then the finding is about code this PR did not change, and the
+   agent's line, which could be an unrelated added line, is not used.
 
 A finding that gets no place this way is not dropped: a P0/P1 is listed under *Blocking findings
 not on an added line* (and still blocks approval and a required status), and any other finding in a
