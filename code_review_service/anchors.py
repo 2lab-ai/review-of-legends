@@ -16,6 +16,7 @@ Standard library only: the daemon runs on macOS's stock Python 3.9.
 from __future__ import annotations
 
 import dataclasses
+import posixpath
 import re
 from typing import Any, Iterable
 
@@ -82,7 +83,13 @@ class DiffAnchors:
         """
         if path in self.hunks:
             return [path]
-        return [name for name in self.hunks if path and path.endswith("/" + name)]
+        if not path:
+            return []
+        # "./src/a.py" and "src//a.py" name src/a.py.
+        path = posixpath.normpath(path)
+        if path in self.hunks:
+            return [path]
+        return [name for name in self.hunks if path.endswith("/" + name)]
 
     def find(self, path: str, wanted: list) -> list:
         """Every run of consecutive new-side lines of ``path`` (one hunk) equal to ``wanted``."""

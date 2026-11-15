@@ -190,6 +190,26 @@ class EdgeCaseTest(unittest.TestCase):
         title = svc.normalize_finding_title("[P2] retry")
         self.assertTrue({("a.py", title), ("b.py", title), ("c.py", title)} <= keys)
 
+    def test_a_quote_on_unchanged_lines_still_counts_as_raised_there(self) -> None:
+        files = [
+            {"filename": "a.py", "patch": "@@ -0,0 +1,1 @@\n+pass\n"},
+            {"filename": "d.py", "patch": "@@ -7,2 +7,2 @@\n     retry()\n-x\n+y\n"},
+        ]
+        diff = anchors.DiffAnchors(files)
+        raw = {"path": "a.py", "line": 1, "priority": 2, "title": "[P2] retry", "body": "b", "existing_code": "retry()"}
+        # d.py has the quote only on an unchanged line: no move there, but its thread stays raised.
+        self.assertIsNone(diff.place("a.py", 7, "retry()"))
+        keys = svc.raised_finding_keys([{"agent": "c", "findings": [raw]}], ["a.py", "d.py"],
+                                       allowed=svc.commentable_added_lines(files), diff_anchors=diff)
+        self.assertIn(("d.py", svc.normalize_finding_title("[P2] retry")), keys)
+
+    def test_a_relative_path_with_dot_segments_names_its_file(self) -> None:
+        diff = anchors.DiffAnchors(FILES)
+        for path in ("./src/app.py", "src//app.py", "src/x/../app.py"):
+            self.assertEqual(diff.own_files(path), ["src/app.py"], path)
+        self.assertEqual(diff.place("./src/app.py", None, "data = read(path)"),
+                         anchors.Placement("src/app.py", 12, anchors.CODE))
+
 
 class ServicePlacementTest(unittest.TestCase):
     def setUp(self) -> None:
