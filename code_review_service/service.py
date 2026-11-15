@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
 import concurrent.futures
 import dataclasses
 import datetime as dt
@@ -33,6 +34,7 @@ from . import contributors
 from . import dashboard_execution
 from . import gate
 from . import mentions
+from . import review_scope
 
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config" / "reviewer.json"
@@ -170,6 +172,8 @@ query($id: ID!) {
 # the rest of the body leaves of MAX_REVIEW_BODY_CHARS, and count the rest; a
 # longer inline comment has its finding bodies cut (render_line_comment).
 MAX_THREAD_SECTION_ITEMS = 20
+# Files listed under "Files this review did not read"; the header line counts them all.
+MAX_NOT_READ_ITEMS = 50
 MAX_COMMENT_CHARS = 60000
 MAX_REVIEW_BODY_CHARS = 60000
 # Blocking findings without a line comment (unposted_blockers_section): how many
@@ -347,6 +351,7 @@ def load_config(path: Path) -> dict[str, Any]:
         )
     try:
         contributors.gate_settings(config)
+        review_scope.validate(config)
     except ValueError as exc:
         raise ServiceError(str(exc)) from None
     dashboard = config.get("dashboard")
@@ -2833,6 +2838,8 @@ def load_repository_rules(source_dir: Path, trusted_ref: str = "") -> str:
         if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > MAX_RULE_BYTES:
             continue
         relative = path.relative_to(source_dir).as_posix()
+        if review_scope.is_secret_path(relative):
+            continue  # a credential file is left out of every prompt, rules included
         remaining = MAX_RULE_BYTES - used_bytes
         content = read_regular_text_file(path, remaining)
         if content is None:
@@ -2868,6 +2875,8 @@ def load_repository_rules_from_git(source_dir: Path, trusted_ref: str) -> str:
         mode, object_type, blob_size = parts[0], parts[1], parts[3]
         if object_type != "blob" or mode == "120000" or not relative.endswith(".md"):
             continue
+        if review_scope.is_secret_path(relative):
+            continue  # a credential file is left out of every prompt, rules included
         if len(chunks) >= MAX_RULE_FILES or used_bytes >= MAX_RULE_BYTES:
             break
         # Reject blobs we cannot size up front; running ``git show`` first and
@@ -3353,17 +3362,30 @@ def render_prompt(
     repository_rules: str = "",
     language: str = "",
     answered: str = "",
+    not_read: dict[str, str] | None = None,
 ) -> str:
     """The prompt one reviewer agent reads.
 
     ``answered`` is the block of earlier findings people answered on this pull
     request (answered_findings_section); it goes in after the repository rules,
     before the output contract, and an empty one leaves the prompt as it was.
+    ``not_read`` maps each changed file the diff does not carry in full to its
+    reason (review_scope.files_not_read); those files are marked in the list,
+    and none leaves the prompt as it was.
     """
-    file_list = "\n".join(
-        f"- {item.get('filename')} ({item.get('status')}, +{item.get('additions')}, -{item.get('deletions')})"
-        for item in files
-    )
+    not_read = not_read or {}
+
+    def listed(item: dict[str, Any]) -> str:
+        line = f"- {item.get('filename')} ({item.get('status')}, +{item.get('additions')}, -{item.get('deletions')})"
+        reason = not_read.get(str(item.get("filename")))
+        return f"{line} [not in the diff below: {review_scope.REASON_TEXT.get(reason, reason)}]" if reason else line
+
+    file_list = "\n".join(listed(item) for item in files)
+    if not_read:
+        file_list += (
+            "\n\nFiles marked [not in the diff below] are outside this review: do not report on them, "
+            "and do not report that they are missing or unchanged."
+        )
     title = pr.get("title", "")
     body = pr.get("body") or ""
     number = pr.get("number")
@@ -3864,6 +3886,7 @@ def run_agent(
     prompt_text: str | None = None,
     language: str = "",
     answered: str = "",
+    not_read: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     agent_id = agent["id"]
     # ``prompt_text`` is the prompt review_pr read at attempt start (agent_prompt_texts:
@@ -3874,7 +3897,8 @@ def run_agent(
         prompt_text = expand_path(agent["prompt_path"], config_dir).read_text(encoding="utf-8")
     agent_prompt = prompt_text
     prompt = render_prompt(
-        repo, pr, files, diff_text, agent_prompt, repository_rules, language=language, answered=answered
+        repo, pr, files, diff_text, agent_prompt, repository_rules, language=language, answered=answered,
+        **({"not_read": not_read} if not_read else {}),
     )
 
     artifact_dir = prepare_review_artifact_dir(run_dir, artifact_root)
@@ -4484,12 +4508,18 @@ def build_review_body(
     thread_plan: ThreadPlan | None = None,
     unposted_blockers: list[Finding] | None = None,
     unplaced: list[Finding] | None = None,
+    files_total: int | None = None,
+    not_read: list[tuple[str, str]] | None = None,
 ) -> str:
     """The review body. ``thread_plan`` gives the lifecycle sections (findings not
     posted again because of an open or an answered earlier thread, threads
     resolved after posting, the reactions on earlier findings); each gets its
     section only when non-empty. ``unposted_blockers``
-    (unposted_blocking_findings) are listed under the required note."""
+    (unposted_blocking_findings) are listed under the required note.
+    ``files_total`` (the PR's changed files) and ``not_read``
+    (review_scope.files_not_read) give the "Files read in full" header line and
+    the section naming every file the agents did not read; a review that
+    skipped a file it meant to read says it is partial."""
     plan = thread_plan or ThreadPlan()
     still_open, resolving, feedback = plan.held_back, plan.resolve, plan.feedback
     head_sha = pr.get("head", {}).get("sha", "")
@@ -4508,6 +4538,8 @@ def build_review_body(
         f"Agents: {len(results)}  ",
         f"Line comments: {included_comments}/{len(findings)}",
     ]
+    not_read = list(not_read or [])
+    partial = review_scope.is_partial(not_read)
     # A result reused from a failed attempt (review_pr marks it) names its model
     # but spent its tokens there, and it is no runner invocation of this attempt.
     llm_rows = [
@@ -4534,6 +4566,12 @@ def build_review_body(
         lines.append(
             f"Tokens ({scope}): {format_token_pair(totals)} "
             f"({totals['agents_with_usage']}/{invocations} runner invocations reported usage)"
+        )
+    if files_total is not None:
+        lines[-1] += "  "
+        lines.append(
+            f"Files read in full: {files_total - len(not_read)}/{files_total}"
+            + (" (partial review)" if partial else "")
         )
     if required_note:
         lines.extend(["", f"**{required_note}**"])
@@ -4581,6 +4619,20 @@ def build_review_body(
     # The lifecycle sections take only what the rest of the body leaves under
     # GitHub's limit, so they never turn a body that fit into a refused review.
     budget = [MAX_REVIEW_BODY_CHARS - len("\n".join(lines)) - len(footer) - 1]
+    if not_read:
+        # First in the budget: a reader must be able to tell what no agent saw.
+        head = ["### Files this review did not read"]
+        if partial:
+            head.append(
+                "**Partial review:** the agents did not read every file this review covers "
+                "(past the diff budget, or GitHub sent no patch). Problems in those files went unseen."
+            )
+        lines.extend(bounded_section(
+            head,
+            [f"- `{path}` — {review_scope.REASON_TEXT.get(reason, reason)}" for path, reason in not_read],
+            budget,
+            limit=MAX_NOT_READ_ITEMS,
+        ))
     lines.extend(unplaced_findings_section(list(unplaced or []), budget))
     if still_open:
         lines.extend(bounded_section(
@@ -6643,11 +6695,16 @@ def review_pr(
 
         log(f"{client.repo} pr #{number}: fetching changed files")
         try:
+            # ``files`` stays every file of the PR (lists, renames, thread
+            # evidence); the agents read the patches of ``scope.reviewed`` only.
             files = client.list_files(number)
-            allowed_lines = commentable_added_lines(files)
-            diff_anchors = anchors.DiffAnchors(files)
+            scope = review_scope.select_files(files, review_scope.settings_for(config, client.repo))
+            allowed_lines = commentable_added_lines(list(scope.reviewed))
+            # Quotes are matched only in files the agents read.
+            diff_anchors = anchors.DiffAnchors(list(scope.reviewed))
             max_diff_chars = int(config.get("max_diff_chars", 180000))
-            diff_text, shown_files = diff_and_shown_files(files, max_chars=max_diff_chars)
+            diff_text, shown_files = diff_and_shown_files(list(scope.reviewed), max_chars=max_diff_chars)
+            not_read = review_scope.files_not_read(scope, shown_files)
         except Exception as exc:
             # Same rule as the clone below: an attempt that began must reach a
             # terminal state here, or it sits in the dashboard's Active queue
@@ -6658,7 +6715,19 @@ def review_pr(
         # A dashboard retry of a failed attempt: the agents that succeeded there keep
         # their results (and the models they ran on) when the diff they read is this
         # one; only the others run below.
-        diff_sha = review_diff_fingerprint(files)
+        diff_sha = review_diff_fingerprint(list(scope.reviewed))
+        partial_review = review_scope.is_partial(not_read)
+        # The reviewed status stays a success (it records review history), and says when the review was partial.
+        unread = sum(1 for _, reason in not_read if reason in review_scope.PARTIAL_REASONS)
+        scope_note = f"; partial: {unread} of {len(files)} files not read" if partial_review else ""
+        if not_read:
+            counts = collections.Counter(reason for _, reason in not_read)
+            log(f"{client.repo} pr #{number}: {len(not_read)} of {len(files)} changed files not read in full "
+                f"({', '.join(f'{reason} {count}' for reason, count in sorted(counts.items()))})"
+                + ("; partial review" if partial_review else ""))
+        # Every agent prompt names the files left out, so no agent reports on them
+        # or on their absence ("the docs were not updated").
+        scope_kwargs: dict[str, Any] = {"not_read": dict(not_read)} if not_read else {}
         reused: dict[str, dict[str, Any]] = {}
         if reuse_results is not None:
             reused_base = str((pr.get("base") or {}).get("sha") or "")
@@ -6897,6 +6966,7 @@ def review_pr(
                         **prompt_kwargs.get(agent["id"], {}),
                         **language_kwargs,
                         **answered_kwargs,
+                        **scope_kwargs,
                     ): agent["id"]
                     for agent in to_run
                 }
@@ -7123,7 +7193,7 @@ def review_pr(
                 policy=policy, summary_meta=summary_meta or None, required_note=required_note,
                 repo=client.repo,
                 language=review_language, language_login=author_login, thread_plan=thread_plan,
-                unposted_blockers=unposted, unplaced=unplaced,
+                unposted_blockers=unposted, unplaced=unplaced, files_total=len(files), not_read=not_read,
             )
 
             if dry_run:
@@ -7206,7 +7276,7 @@ def review_pr(
                                 log(f"{repo} pr #{number}: WARNING state save after unverified post failed: {save_exc}")
                     # Every agent ran and the POST most likely landed; the ledger now
                     # counts this head as reviewed and no retry may post it again.
-                    reviewed_success(f"reviewed ({str(head_sha)[:12]}); the posted review could not be confirmed")
+                    reviewed_success(f"reviewed ({str(head_sha)[:12]}){scope_note}; the posted review could not be confirmed")
                     recorder.failed(
                         f"review POST outcome unknown, needs GitHub reconciliation: {exc}",
                         stage=dashboard_execution.POSTING_UNVERIFIED_STAGE,
@@ -7252,7 +7322,7 @@ def review_pr(
                 required_status("failure", "; ".join(f"{item['agent']}: {item['status']}" for item in verdict_failures))
             else:
                 required_status("success", f"required reviewers passed: {', '.join(required_ids)}")
-            reviewed_success(f"reviewed ({str(head_sha)[:12]})")
+            reviewed_success(f"reviewed ({str(head_sha)[:12]}){scope_note}")
             # G3 runs only here, after a confirmed POST: the review body that names these
             # threads is on the PR. A failed or unknown POST raised above and resolves nothing.
             if thread_plan.resolve:

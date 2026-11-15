@@ -4,6 +4,13 @@
   ],
   "_repository_agents_comment": "opt_in agents run only where a repository switches them on here; a default agent can be switched off per repository the same way",
   "repository_agents": {},
+  "_review_scope_comment": "Which changed files the agents read. exclude_categories: generated (lock files, minified bundles, generator output, snapshots, dist/), documentation (*.md, *.rst, *.adoc, LICENSE, CHANGELOG, ...) and vendored (vendor/, node_modules/, ...) are left out of the diff unless removed from this list. include: globs reviewed anyway (e.g. skills/**/*.md where Markdown is code). exclude: globs left out on top; it beats include. repositories: per owner/name, each key set there replaces the global one. Secret paths (.env, id_rsa, *.pem, ...) are left out of every prompt (diff and repository rules), whatever is set. Every file the agents did not read in full is named on the review; a file cut by max_diff_chars or sent without a patch makes the review partial. See docs/operations.md 'Review scope'.",
+  "review_scope": {
+    "exclude_categories": ["generated", "documentation", "vendored"],
+    "include": [],
+    "exclude": [],
+    "repositories": {}
+  },
   "_scheduler_comment": "The daemon re-reads this file and lists every repository's open PRs every watch_interval_seconds (conditional requests: an unchanged list costs no rate limit; below 300 calls left it lists every poll_interval_seconds instead). A PR's first review starts as soon as it is seen unless max_concurrent_reviews reviews (operator retries included) already run, the hard safety cap; updates of reviewed PRs run at most max_concurrent_update_reviews at a time. Each review runs up to max_parallel_agents agents, so up to max_concurrent_reviews x max_parallel_agents llmux calls can run at once. Drafts are reviewed once marked ready, unless review_drafts is true.",
   "watch_interval_seconds": 20,
   "max_concurrent_reviews": 8,
