@@ -14,6 +14,9 @@ configurable review agents, and posts one GitHub PR review containing a summary 
   into it, checks out the PR head, and runs the review agents from that clone.
 - All Markdown files under the cloned repository's `./rules/**/*.md` path are read and injected
   into every review agent prompt.
+- Generated files, documentation and vendored dependencies are left out of the diff the agents
+  read, and secret paths are left out of every prompt; every changed file the agents did not read in full is
+  named on the review with its reason (see *Review scope*).
 - Review comments are posted through the pull request review endpoint with `path`, `line`, and
   `side: RIGHT` on added lines. Findings on one line share a comment, a finding the bot already has
   an open thread for is not posted again, and outdated bot threads are resolved (see *Finding
@@ -244,6 +247,83 @@ resolves nothing. Inline comment titles also lose the priority an agent wrote in
 the header names the priority once; a finding with no numeric priority keeps its title as written,
 since its header shows the severity (`**LOW - P0: …**`).
 
+### Review scope
+
+The agents read the patches of the files in the review scope (`code_review_service/review_scope.py`).
+The other changed files appear in their prompt by name only, marked `[not in the diff below: <reason>]`,
+with an instruction not to report on them or on their absence. Line comments land only on files in
+the scope.
+
+**Left out by default** — the three `exclude_categories`:
+
+| Category | Matches |
+|---|---|
+| `generated` | dependency lock files (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`, `go.sum`, `poetry.lock`, `uv.lock`, `Gemfile.lock`, `composer.lock`, …), minified bundles and source maps (`*.min.js`, `*.min.css`, `*.js.map`), generator output (`*.pb.go`, `*_pb2.py`, `*.gen.go`, `*_generated.go`, `*.generated.*`, `*.g.dart`, …), test snapshots (`__snapshots__/`, `*.snap`), committed build output (`dist/`, `.next/`, `.nuxt/`, `.svelte-kit/`); and any file whose patch shows a comment line `Code generated … DO NOT EDIT` or `@generated` (`//`, `#`, `/*`, `--`, … comments) in its first 5 lines |
+| `documentation` | `*.md`, `*.mdx`, `*.markdown`, `*.rst`, `*.adoc`, `*.asciidoc`, `*.rdoc`, `*.textile`, `*.txt` under a `docs/` or `doc/` directory, and `LICENSE`, `COPYING`, `NOTICE`, `AUTHORS`, `CONTRIBUTORS`, `CHANGELOG`, `CHANGES`, `HISTORY` with no extension or `.txt` |
+| `vendored` | `vendor/`, `node_modules/`, `bower_components/`, Yarn's cache and releases, `.pnp.cjs`, `Pods/`, `Carthage/` |
+
+Test files, `requirements.txt`, `CMakeLists.txt` and other code stay in. The full lists are in
+`review_scope.py`; matching ignores case.
+
+**Never sent: secret paths.** `.env` and `.env.*` (but not `.env.example`, `.env.sample`,
+`.env.template`, `.env.dist`), anything under a `.ssh` directory, `id_rsa`, `id_dsa`, `id_ecdsa`,
+`id_ed25519`, `.netrc`, `.npmrc`, `.pypirc`, `.dockercfg`, `.docker/config.json`, `*.pem`, `*.key`,
+`*.p12`, `*.pfx`, `*.jks`, `*.keystore` — by the file's name, or the name it was renamed from. No
+setting brings them back; the review names them. They are left out of every prompt the service
+builds: the diff and the repository rules (a `rules/**/*.md` file with such a name is skipped too).
+The default llmux runner reads nothing but that prompt. A runner that opens the checkout itself —
+the Codex rollback runner — can still read them; it is outside this guarantee.
+
+**Bringing files back** — `review_scope` in `config/reviewer.json`:
+
+```json
+"review_scope": {
+  "exclude_categories": ["generated", "documentation", "vendored"],
+  "include": [],
+  "exclude": [],
+  "repositories": {
+    "acme-corp/docs-site": {"exclude_categories": ["generated", "vendored"]},
+    "acme-corp/agent-skills": {"include": ["skills/**/*.md", "AGENTS.md", "CLAUDE.md"]}
+  }
+}
+```
+
+- `exclude_categories` — the categories left out; `[]` reviews every file but secret paths.
+- `include` — globs reviewed even when a category leaves them out. Use it where Markdown is code,
+  such as agent prompts and skills.
+- `exclude` — globs left out on top of the categories ("excluded by review_scope.exclude"); it
+  beats `include`.
+- `repositories` — per `owner/name` (any case): each key a repository sets replaces the global one.
+- Globs: `**` spans directories, `*` and `?` stay in one, `{a,b}` is a choice of globs
+  (`skills/**/{*.md,*.mdx}`), `[...]` a class. A
+  glob without a `/` matches the file name at any depth (`*.md`); one with a `/` starts at the
+  repository root (`docs/**`), and so does one with a leading `/` (`/setup.cfg`).
+- The setting lives in this service's config, never in the reviewed repository: a pull request
+  cannot change its own scope. A bad shape fails at startup.
+
+**What the review says.** The header carries `Files read in full: <read>/<changed>`, and the section
+*Files this review did not read* lists each file with its reason (up to 50; the count covers all):
+
+- a scope reason above: a secret path, a category, or `review_scope.exclude`;
+- `past the diff budget (max_diff_chars)` — the patch did not fit in `max_diff_chars` (default
+  180,000 characters, filled in GitHub's file order);
+- `GitHub sent no patch (the diff is too large)` — lines changed, but GitHub's file list carries no patch;
+- `GitHub's patch is shorter than the change (cut by GitHub)` — the patch carries fewer added and
+  deleted lines than GitHub counts for the file;
+- `no text diff (binary file)`. A rename with no change has nothing to read and is not listed.
+
+The files that make a review partial are listed first. When the diff budget, or a missing or cut
+patch, kept the agents from a file in the scope, the review is
+**partial**: the header says `(partial review)`, the section opens with a warning, and the
+`reviewed/<base>` status description ends in `; partial: N of M files in scope not read` (M counts the
+files in the review scope, not the files left out by it). The status stays
+`success`: it records that a review was posted. Files left out by the scope alone do not make a
+review partial.
+
+A name that looks generated or like documentation is not proof: the patterns also leave out code
+named `*.min.js` or `*.md`. Such a file is still named on the review, so the people reading it see
+what no agent read.
+
 ### Scheduling
 
 The daemon (`code_review_service/scheduler.py`) does not walk the repositories one PR at a time:
@@ -331,7 +411,8 @@ the context keeps that PR from merging (unless its head commit and base are thos
 PR; see below).
 
 - `reviewed_status` (default `true`) turns it on; `false` turns it off. A dry run sets nothing.
-- A review sets it when the review is posted ("reviewed (<head>)"). A review POST whose outcome is
+- A review sets it when the review is posted ("reviewed (<head>)", with "; partial: N of M files
+  in scope not read" after the head when the agents skipped a file in the review scope; see *Review scope*). A review POST whose outcome is
   unknown (a timeout or 5xx after sending) sets it too ("reviewed (<head>); the posted review
   could not be confirmed"): every agent ran and the POST most likely landed, and the ledger
   already counts that head as reviewed, so no retry may post it again (a Retrigger re-run is
