@@ -3,8 +3,10 @@
 Generated files, documentation and vendored dependencies are left out of the
 diff by default; an operator brings a category back per repository
 (``exclude_categories``) or one path at a time (``include``). Secret paths —
-credential files such as ``.env`` or ``id_rsa`` — are never sent to a model,
-and no setting brings them back. ``files_not_read`` then names every file the
+credential files such as ``.env`` or ``id_rsa`` — are left out of every prompt
+the service builds (the diff, and the repository rules), and no setting brings
+them back. A runner that reads the checkout itself (the Codex rollback runner)
+is outside that guarantee. ``files_not_read`` then names every file the
 agents did not read in full and why, so a review never looks complete when it
 was not.
 
@@ -40,7 +42,7 @@ DEFAULT_EXCLUDE_CATEGORIES = CATEGORIES
 PARTIAL_REASONS = frozenset({BUDGET, NO_PATCH})
 
 REASON_TEXT = {
-    SECRET: "secret path, never sent to a model",
+    SECRET: "secret path, left out of every prompt",
     CONFIGURED: "excluded by review_scope.exclude",
     GENERATED: "generated file",
     DOCUMENTATION: "documentation",
@@ -156,7 +158,7 @@ VENDORED_PATTERNS = (
 # "Code generated ... DO NOT EDIT." and "@generated" (Meta, Buck, others).
 GENERATED_HEADER = re.compile(r"\bCode generated\b.*\bDO NOT EDIT\b|@generated\b")
 GENERATED_HEADER_LINES = 5
-_HUNK = re.compile(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+_HUNK = re.compile(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
 
@@ -214,7 +216,8 @@ def glob_regex(pattern: str) -> "re.Pattern[str]":
             out.append(re.escape(char))
             i += 1
     prefix = "" if anchored or "/" in text else "(?:.*/)?"
-    return re.compile(prefix + "".join(out), re.IGNORECASE)
+    # DOTALL: a Git path may hold a line feed, and a secret pattern must still match it.
+    return re.compile(prefix + "".join(out), re.IGNORECASE | re.DOTALL)
 
 
 def _compile(patterns: Iterable[str]) -> tuple:
@@ -243,27 +246,29 @@ def is_secret_path(path: str) -> bool:
     return _matches(path, _SECRET)
 
 
-def has_generated_header(patch: str, first_lines: int = GENERATED_HEADER_LINES) -> bool:
+def has_generated_header(patch: str, removed: bool = False, first_lines: int = GENERATED_HEADER_LINES) -> bool:
     """Whether the patch shows a generator's header in the file's first ``first_lines`` lines.
 
-    Only lines the patch carries count (added or context, on the new side), so
-    a header outside every hunk is not seen; the path patterns cover the rest.
+    Only lines the patch carries count, so a header outside every hunk is not
+    seen; the path patterns cover the rest. The new side is read (added and
+    context lines); for a ``removed`` file, whose every line is deleted, the
+    old side is.
     """
-    new_line = None
+    line = None
     # split, not splitlines: a U+2028 inside a diff line must not shift the count.
     for raw in patch.split("\n"):
         hunk = _HUNK.match(raw)
         if hunk:
-            new_line = int(hunk.group(1))
+            line = int(hunk.group(1 if removed else 2))
             continue
-        if new_line is None or raw.startswith("-") or raw.startswith("\\"):
+        if line is None or raw.startswith("\\") or raw.startswith("+" if removed else "-"):
             continue
-        if new_line > first_lines:
-            new_line = None  # past the top of the file: wait for the next hunk
+        if line > first_lines:
+            line = None  # past the top of the file: wait for the next hunk
             continue
         if GENERATED_HEADER.search(raw[1:]):
             return True
-        new_line += 1
+        line += 1
     return False
 
 
@@ -274,8 +279,6 @@ class ScopeSettings:
     exclude_categories: frozenset = frozenset(DEFAULT_EXCLUDE_CATEGORIES)
     include: tuple = ()  # compiled globs reviewed even when a category leaves them out
     exclude: tuple = ()  # compiled globs left out on top of the categories
-    include_patterns: tuple = ()  # the same globs as written, for the review body
-    exclude_patterns: tuple = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -306,7 +309,8 @@ def file_reason(file_info: dict[str, Any], settings: ScopeSettings) -> str | Non
             continue
         if _matches(path, _CATEGORY_PATTERNS[category]):
             return category
-        if category == GENERATED and has_generated_header(str(file_info.get("patch") or "")):
+        removed = file_info.get("status") == "removed"
+        if category == GENERATED and has_generated_header(str(file_info.get("patch") or ""), removed=removed):
             return GENERATED
     return None
 
@@ -360,6 +364,17 @@ def _string_list(value: Any, where: str) -> list:
     return [item.strip() for item in value]
 
 
+def _glob_list(value: Any, where: str) -> list:
+    """A list of globs that compile: a bad one fails at startup, not in every review."""
+    patterns = _string_list(value, where)
+    for pattern in patterns:
+        try:
+            glob_regex(pattern)
+        except re.error as exc:
+            raise ValueError(f"{where}: {pattern!r} is not a valid glob ({exc})") from None
+    return patterns
+
+
 def _categories(value: Any, where: str) -> list:
     names = _string_list(value, where)
     unknown = sorted(set(names) - set(CATEGORIES))
@@ -376,7 +391,7 @@ def _block(raw: Any, where: str) -> dict[str, Any]:
         block["exclude_categories"] = _categories(raw["exclude_categories"], f"{where}.exclude_categories")
     for key in ("include", "exclude"):
         if key in raw:
-            block[key] = _string_list(raw[key], f"{where}.{key}")
+            block[key] = _glob_list(raw[key], f"{where}.{key}")
     return block
 
 
@@ -406,12 +421,8 @@ def settings_for(config: dict[str, Any], repo: str) -> ScopeSettings:
     for name, block in (raw.get("repositories") or {}).items():
         if name.lower() == str(repo).lower():
             merged.update(_block(block, f"config.review_scope.repositories[{name}]"))
-    include = tuple(merged.get("include", ()))
-    exclude = tuple(merged.get("exclude", ()))
     return ScopeSettings(
         exclude_categories=frozenset(merged.get("exclude_categories", DEFAULT_EXCLUDE_CATEGORIES)),
-        include=_compile(include),
-        exclude=_compile(exclude),
-        include_patterns=include,
-        exclude_patterns=exclude,
+        include=_compile(merged.get("include", ())),
+        exclude=_compile(merged.get("exclude", ())),
     )

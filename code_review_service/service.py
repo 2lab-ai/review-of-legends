@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
 import concurrent.futures
 import dataclasses
 import datetime as dt
@@ -2834,6 +2835,8 @@ def load_repository_rules(source_dir: Path, trusted_ref: str = "") -> str:
         if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > MAX_RULE_BYTES:
             continue
         relative = path.relative_to(source_dir).as_posix()
+        if review_scope.is_secret_path(relative):
+            continue  # a credential file is left out of every prompt, rules included
         remaining = MAX_RULE_BYTES - used_bytes
         content = read_regular_text_file(path, remaining)
         if content is None:
@@ -2869,6 +2872,8 @@ def load_repository_rules_from_git(source_dir: Path, trusted_ref: str) -> str:
         mode, object_type, blob_size = parts[0], parts[1], parts[3]
         if object_type != "blob" or mode == "120000" or not relative.endswith(".md"):
             continue
+        if review_scope.is_secret_path(relative):
+            continue  # a credential file is left out of every prompt, rules included
         if len(chunks) >= MAX_RULE_FILES or used_bytes >= MAX_RULE_BYTES:
             break
         # Reject blobs we cannot size up front; running ``git show`` first and
@@ -6587,9 +6592,7 @@ def review_pr(
         unread = sum(1 for _, reason in not_read if reason in review_scope.PARTIAL_REASONS)
         scope_note = f"; partial: {unread} of {len(files)} files not read" if partial_review else ""
         if not_read:
-            counts: dict[str, int] = {}
-            for _, reason in not_read:
-                counts[reason] = counts.get(reason, 0) + 1
+            counts = collections.Counter(reason for _, reason in not_read)
             log(f"{client.repo} pr #{number}: {len(not_read)} of {len(files)} changed files not read in full "
                 f"({', '.join(f'{reason} {count}' for reason, count in sorted(counts.items()))})"
                 + ("; partial review" if partial_review else ""))

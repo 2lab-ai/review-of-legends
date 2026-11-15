@@ -15,7 +15,7 @@ configurable review agents, and posts one GitHub PR review containing a summary 
 - All Markdown files under the cloned repository's `./rules/**/*.md` path are read and injected
   into every review agent prompt.
 - Generated files, documentation and vendored dependencies are left out of the diff the agents
-  read, and secret paths are never sent; every changed file the agents did not read in full is
+  read, and secret paths are left out of every prompt; every changed file the agents did not read in full is
   named on the review with its reason (see *Review scope*).
 - Review comments are posted through the pull request review endpoint with `path`, `line`, and
   `side: RIGHT` on added lines. Findings on one line share a comment, a finding the bot already has
@@ -269,7 +269,10 @@ Test files, `requirements.txt`, `CMakeLists.txt` and other code stay in. The ful
 `.env.template`, `.env.dist`), anything under a `.ssh` directory, `id_rsa`, `id_dsa`, `id_ecdsa`,
 `id_ed25519`, `.netrc`, `.npmrc`, `.pypirc`, `.dockercfg`, `.docker/config.json`, `*.pem`, `*.key`,
 `*.p12`, `*.pfx`, `*.jks`, `*.keystore` — by the file's name, or the name it was renamed from. No
-setting brings them back; the review names them.
+setting brings them back; the review names them. They are left out of every prompt the service
+builds: the diff and the repository rules (a `rules/**/*.md` file with such a name is skipped too).
+The default llmux runner reads nothing but that prompt. A runner that opens the checkout itself —
+the Codex rollback runner — can still read them; it is outside this guarantee.
 
 **Bringing files back** — `review_scope` in `config/reviewer.json`:
 
