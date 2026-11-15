@@ -4311,7 +4311,11 @@ def finding_title(raw: dict[str, Any]) -> str:
 
 
 def raised_finding_keys(
-    results: list[dict[str, Any]], filenames: Iterable[str] = (), roots: Iterable[str] = ()
+    results: list[dict[str, Any]],
+    filenames: Iterable[str] = (),
+    roots: Iterable[str] = (),
+    allowed: dict[str, set[int]] | None = None,
+    diff_anchors: anchors.DiffAnchors | None = None,
 ) -> frozenset:
     """(path, normalized title) of every finding the agents returned, on an added line or not.
 
@@ -4323,7 +4327,9 @@ def raised_finding_keys(
     (the checkout directory) it becomes the repository path; otherwise it
     counts for every PR file it ends in, since the checkout's own directories
     may look like repository ones and a wrong pick would resolve a thread the
-    finding keeps open.
+    finding keeps open. With ``allowed``, a finding also counts under the file
+    place_finding puts it in: a finding its quoted code moved to another file
+    keeps that file's thread open as well.
     """
     names = frozenset(str(name) for name in filenames if name)
     prefixes = [posixpath.normpath(str(root)).strip("/") + "/" for root in roots if str(root).strip("/")]
@@ -4334,6 +4340,10 @@ def raised_finding_keys(
             if not path:
                 continue
             title = normalize_finding_title(finding_title(raw))
+            if allowed is not None:
+                placed = place_finding(raw, allowed, diff_anchors)
+                if placed is not None:
+                    keys.add((placed.path, title))
             if path not in names:
                 path = posixpath.normpath(path)  # "src/../a.py" and "src//a.py" name a.py and src/a.py
             if path not in names:
@@ -5857,7 +5867,9 @@ def unplaced_findings_section(unplaced: list[Finding], budget: list[int]) -> lis
         return []
     noun = "finding" if len(unplaced) == 1 else "findings"
     closing = "</details>"
-    budget[0] -= len(closing) + 1
+    # The closing tag and the blank line after it, without which the next heading joins the HTML block.
+    tail = len(closing) + 2
+    budget[0] -= tail
     section = bounded_section(
         [
             "<details>",
@@ -5876,7 +5888,7 @@ def unplaced_findings_section(unplaced: list[Finding], budget: list[int]) -> lis
         limit=MAX_UNPLACED_SHOWN,
     )
     if not section:
-        budget[0] += len(closing) + 1
+        budget[0] += tail
         return []
     return section + [closing, ""]
 
@@ -7038,6 +7050,9 @@ def review_pr(
                     [str(item.get("filename")) for item in files] + [old for old, _ in renamed],
                     # The agents ran in the clone; an absolute path names a file under it.
                     roots=(str(source_dir), os.path.realpath(source_dir)),
+                    # A finding moved to another file by its quote keeps that file's thread open too.
+                    allowed=allowed_lines,
+                    diff_anchors=diff_anchors,
                 ),
                 succeeded=frozenset(
                     str(result.get("agent")) for result in successful_agents if result.get("reused") is not True

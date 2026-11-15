@@ -90,6 +90,33 @@ class DiffAnchorsTest(unittest.TestCase):
         for quote in (None, "", "   \n ", 42, ["data = read(path)"]):
             self.assertIsNone(self.anchors.place("src/app.py", 12, quote), repr(quote))
 
+    def test_a_quote_ending_in_unchanged_context_lands_on_its_last_added_line(self) -> None:
+        self.assertEqual(self.anchors.place("src/app.py", None, "return {}\nreturn parse(data)").line, 14)
+        self.assertEqual(self.anchors.place("src/app.py", 15, "return {}\nreturn parse(data)").line, 14)
+
+
+class NearestFirstTest(unittest.TestCase):
+    # "check()" is unchanged at 10 and added at 30 of a.py; "def setup():" is unchanged in a.py and
+    # added in b.py.
+    FILES = [
+        {"filename": "a.py", "patch": "@@ -9,2 +9,2 @@\n def setup():\n     check()\n"
+                                      "@@ -28,1 +28,3 @@\n x = 1\n+y = 2\n+    check()\n"},
+        {"filename": "b.py", "patch": "@@ -0,0 +1,2 @@\n+def setup():\n+    pass\n"},
+    ]
+
+    def setUp(self) -> None:
+        self.anchors = anchors.DiffAnchors(self.FILES)
+
+    def test_the_nearest_match_is_chosen_before_unchanged_ones_are_set_aside(self) -> None:
+        # The agent points at the unchanged call at 10: the finding is about unchanged code.
+        self.assertIsNone(self.anchors.place("a.py", 10, "check()"))
+        self.assertEqual(self.anchors.place("a.py", 29, "check()").line, 30)
+        self.assertIsNone(self.anchors.place("a.py", None, "check()"))
+
+    def test_an_unchanged_match_in_the_own_file_is_not_moved_to_an_added_copy_elsewhere(self) -> None:
+        self.assertIsNone(self.anchors.place("a.py", 9, "def setup():"))
+        self.assertEqual(self.anchors.place("c.py", 9, "def setup():"), anchors.Placement("b.py", 1, anchors.MOVED))
+
 
 class ServicePlacementTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -141,6 +168,27 @@ class ServicePlacementTest(unittest.TestCase):
         self.assertIn('"existing_code": "the changed line(s) the finding is about', prompt)
         self.assertIn("Set existing_code to the code the finding is about", prompt)
 
+    def test_the_unplaced_section_fits_the_budget_or_is_left_out(self) -> None:
+        unplaced = [svc.Finding("tests", f"src/m{i}.py", 1, "low", f"[P3] t{i}", "b", 0.0, 3) for i in range(30)]
+        tight = [120]
+        self.assertEqual(svc.unplaced_findings_section(unplaced, tight), [])
+        self.assertEqual(tight, [120])  # nothing taken when nothing is shown
+        roomy = [5000]
+        section = svc.unplaced_findings_section(unplaced, roomy)
+        self.assertEqual(section[-2:], ["</details>", ""])
+        self.assertIn("- …and 10 more", section)
+        self.assertEqual(roomy[0], 5000 - sum(len(line) + 1 for line in section))
+
+    def test_a_moved_finding_counts_as_raised_under_both_paths(self) -> None:
+        raw = {"path": "src/app.py", "line": 3, "priority": 3, "title": "[P3] elsewhere", "body": "b",
+               "existing_code": "x = 1"}
+        names = [item["filename"] for item in FILES]
+        keys = svc.raised_finding_keys(self.result(raw), names, allowed=self.allowed, diff_anchors=self.anchors)
+        title = svc.normalize_finding_title("[P3] elsewhere")
+        self.assertIn(("src/app.py", title), keys)
+        self.assertIn(("src/util.py", title), keys)
+        self.assertNotIn(("src/util.py", title), svc.raised_finding_keys(self.result(raw), names))
+
 
 class _Client:
     repo = "acme-corp/app"
@@ -191,13 +239,23 @@ class ReviewPrPlacementTest(unittest.TestCase):
             }
             pr = {"number": 5, "head": {"sha": "abcdef1234567890"}, "base": {"ref": "main"},
                   "title": "t", "body": "", "user": {"login": "someone"}}
+            evidence: list = []
+            real_plan = svc.plan_review_threads
+
+            def capture_plan(*args, **kwargs):
+                evidence.append(kwargs.get("evidence"))
+                return real_plan(*args, **kwargs)
+
             with mock.patch.object(svc, "clone_pr_source", lambda *a, **k: None), \
-                    mock.patch.object(svc, "run_agent", fake_run_agent):
+                    mock.patch.object(svc, "run_agent", fake_run_agent), \
+                    mock.patch.object(svc, "plan_review_threads", capture_plan):
                 svc.review_pr(client, config, ROOT / "config" / "reviewer.json", pr, {"reviewed": {}})
         body, comments = client.reviews[0]
         self.assertEqual(sorted((c["path"], c["line"]) for c in comments), [("src/app.py", 13), ("src/util.py", 2)])
         self.assertIn("1 finding with no place on an added line", body)
         self.assertIn("- **P2** `src/app.py:15` (correctness): old code", body)
+        # The finding moved to src/util.py keeps a thread there open on the next review.
+        self.assertIn(("src/util.py", svc.normalize_finding_title("[P3] elsewhere")), evidence[0].raised)
 
 
 if __name__ == "__main__":

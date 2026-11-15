@@ -26,7 +26,6 @@ LINE = "line"  # the line number the agent wrote
 # A quote longer than this is not a pointer to code any more; it is matched on its first lines.
 MAX_QUOTED_LINES = 40
 _HUNK = re.compile(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
-_SPACE = re.compile(r"\s+")
 _MARKER = re.compile(r"^[+-] ?")
 
 
@@ -45,7 +44,7 @@ class Placement:
 
 
 def _norm(text: str) -> str:
-    return _SPACE.sub(" ", text).strip()
+    return " ".join(text.split())
 
 
 def quoted_lines(snippet: Any) -> list:
@@ -101,8 +100,9 @@ class DiffAnchors:
         """Where the quoted code sits on an added line, or None (the caller falls back to ``line``).
 
         In the finding's own file a quote that matches more than once takes the
-        match nearest ``line``; a quote that matches only unchanged lines places
-        nothing there, and is not looked for elsewhere.
+        match nearest ``line``, changed or not: when that match has no added
+        line the finding is about unchanged code and nothing is placed. A quote
+        found in its own file is not looked for elsewhere.
         """
         if not quoted_lines(snippet):
             return None
@@ -110,8 +110,10 @@ class DiffAnchors:
         if own is not None:
             found = self._find_quote(own, snippet)
             if found:
-                chosen = _pick([run for run in found if any(item.added for item in run)], line)
-                return Placement(own, _anchor_line(chosen, line), CODE) if chosen else None
+                chosen = _pick(found, line)
+                if chosen is None or not any(item.added for item in chosen):
+                    return None
+                return Placement(own, _anchor_line(chosen, line), CODE)
         elsewhere = [
             (name, run)
             for name in self.hunks

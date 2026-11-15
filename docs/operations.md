@@ -256,9 +256,12 @@ places it (`code_review_service/anchors.py`):
    finding's file: consecutive lines, blank lines and runs of whitespace ignored, a leading `+`/`-`
    tolerated. The comment goes on the agent's `line` when that is an added line of the match, else
    on the match's last added line. A quote that matches more than once takes the match nearest the
-   agent's `line` (none, or a tie: no pick). A quote found only on unchanged lines places nothing.
+   agent's `line`, changed or not (no `line`, or a tie: no pick); a chosen match with no added line,
+   like a quote found only on unchanged lines, places nothing.
 2. **Quoted code, another file.** When the quote is nowhere in the finding's file, the one other
-   file where it sits on added lines takes the comment. Two or more such files: no guess.
+   file where it sits on added lines takes the comment. Two or more such files: no guess. A
+   finding moved this way counts as raised under both paths, so a later review keeps the moved
+   thread open while the agent still reports it.
 3. **The agent's line**, when it is an added line of the file (as before).
 
 A finding that gets no place this way is not dropped: a P0/P1 is listed under *Blocking findings

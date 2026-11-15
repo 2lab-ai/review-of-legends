@@ -1531,9 +1531,9 @@ class ResolveOnlyOnCompleteEvidenceTest(unittest.TestCase):
         captured = {}
         original = svc.raised_finding_keys
 
-        def spy(results, filenames=(), roots=()):
+        def spy(results, filenames=(), roots=(), **kwargs):
             captured["roots"] = tuple(roots)
-            return original(results, filenames, roots)
+            return original(results, filenames, roots, **kwargs)
 
         with mock.patch.object(svc, "raised_finding_keys", spy):
             self.assertTrue(_review(client, {}))
