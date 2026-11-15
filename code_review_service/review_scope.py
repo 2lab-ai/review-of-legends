@@ -154,10 +154,16 @@ VENDORED_PATTERNS = (
     "**/Carthage/**",
 )
 
-# The two header conventions generators write at the top of a file: Go's
-# "Code generated ... DO NOT EDIT." and "@generated" (Meta, Buck, others).
-GENERATED_HEADER = re.compile(r"\bCode generated\b.*\bDO NOT EDIT\b|@generated\b")
+# The two notices generators write in a comment at the top of a file: Go's
+# "Code generated ... DO NOT EDIT." and "@generated" (Meta, Buck, others). Only a
+# comment line counts, not code that mentions the words, and only its first
+# GENERATED_HEADER_CHARS characters are read: a PR-supplied line can be megabytes
+# long, and the bounded gap keeps the match linear.
+GENERATED_HEADER = re.compile(
+    r"\s*(?://|#|/\*|\*|--|<!--|;|%)\s*(?:Code generated\b[^\n]{0,200}?\bDO NOT EDIT\b|@generated\b)"
+)
 GENERATED_HEADER_LINES = 5
+GENERATED_HEADER_CHARS = 300
 _HUNK = re.compile(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
@@ -269,7 +275,7 @@ def has_generated_header(patch: str, removed: bool = False, first_lines: int = G
         # Past the top of the file, the rest of the hunk is too: wait for the next one.
         if line is None or line > first_lines or raw.startswith("\\") or raw.startswith("+" if removed else "-"):
             continue
-        if GENERATED_HEADER.search(raw[1:]):
+        if GENERATED_HEADER.match(raw[1:1 + GENERATED_HEADER_CHARS]):
             return True
         line += 1
     return False

@@ -258,7 +258,7 @@ the scope.
 
 | Category | Matches |
 |---|---|
-| `generated` | dependency lock files (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`, `go.sum`, `poetry.lock`, `uv.lock`, `Gemfile.lock`, `composer.lock`, …), minified bundles and source maps (`*.min.js`, `*.min.css`, `*.js.map`), generator output (`*.pb.go`, `*_pb2.py`, `*.gen.go`, `*_generated.go`, `*.generated.*`, `*.g.dart`, …), test snapshots (`__snapshots__/`, `*.snap`), committed build output (`dist/`, `.next/`, `.nuxt/`, `.svelte-kit/`); and any file whose patch shows `Code generated … DO NOT EDIT` or `@generated` in its first 5 lines |
+| `generated` | dependency lock files (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`, `go.sum`, `poetry.lock`, `uv.lock`, `Gemfile.lock`, `composer.lock`, …), minified bundles and source maps (`*.min.js`, `*.min.css`, `*.js.map`), generator output (`*.pb.go`, `*_pb2.py`, `*.gen.go`, `*_generated.go`, `*.generated.*`, `*.g.dart`, …), test snapshots (`__snapshots__/`, `*.snap`), committed build output (`dist/`, `.next/`, `.nuxt/`, `.svelte-kit/`); and any file whose patch shows a comment line `Code generated … DO NOT EDIT` or `@generated` (`//`, `#`, `/*`, `--`, … comments) in its first 5 lines |
 | `documentation` | `*.md`, `*.mdx`, `*.markdown`, `*.rst`, `*.adoc`, `*.asciidoc`, `*.rdoc`, `*.textile`, `*.txt` under a `docs/` or `doc/` directory, and `LICENSE`, `COPYING`, `NOTICE`, `AUTHORS`, `CONTRIBUTORS`, `CHANGELOG`, `CHANGES`, `HISTORY` with no extension or `.txt` |
 | `vendored` | `vendor/`, `node_modules/`, `bower_components/`, Yarn's cache and releases, `.pnp.cjs`, `Pods/`, `Carthage/` |
 
