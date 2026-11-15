@@ -153,6 +153,42 @@ class EdgeCaseTest(unittest.TestCase):
         self.assertIsNone(diff.place("src/util.py", 3, "return {}\ndef b():"))
         self.assertEqual(diff.find("src/util.py", ["return {}", "def b():"]), [])
 
+    def test_a_move_also_chooses_nearest_first_including_unchanged_matches(self) -> None:
+        files = [
+            {"filename": "a.py", "patch": "@@ -0,0 +1,1 @@\n+pass\n"},
+            {"filename": "c.py", "patch": "@@ -4,1 +4,1 @@\n     retry()\n@@ -29,1 +29,2 @@\n x\n+    retry()\n"},
+        ]
+        diff = anchors.DiffAnchors(files)
+        # Nearest to line 4 is c.py's unchanged call: the finding is about unchanged code.
+        self.assertIsNone(diff.place("a.py", 4, "retry()"))
+        self.assertEqual(diff.place("a.py", 30, "retry()"), anchors.Placement("c.py", 30, anchors.MOVED))
+
+    def test_the_quote_beats_another_added_line_the_agent_named(self) -> None:
+        diff = anchors.DiffAnchors(FILES)
+        # Line 14 is an added line too, but the quote names line 12.
+        self.assertEqual(diff.place("src/app.py", 14, "data = read(path)"),
+                         anchors.Placement("src/app.py", 12, anchors.CODE))
+
+    def test_a_unicode_line_separator_inside_a_line_does_not_shift_lines(self) -> None:
+        patch = "@@ -0,0 +1,2 @@\n+label = 'a b'\n+value = 2\n"
+        diff = anchors.DiffAnchors([{"filename": "u.py", "patch": patch}])
+        self.assertEqual(diff.place("u.py", None, "value = 2"), anchors.Placement("u.py", 2, anchors.CODE))
+
+    def test_every_file_a_quote_is_in_counts_as_raised(self) -> None:
+        files = [
+            {"filename": "a.py", "patch": "@@ -0,0 +1,1 @@\n+pass\n"},
+            {"filename": "b.py", "patch": "@@ -0,0 +1,1 @@\n+    retry()\n"},
+            {"filename": "c.py", "patch": "@@ -0,0 +1,1 @@\n+    retry()\n"},
+        ]
+        diff = anchors.DiffAnchors(files)
+        raw = {"path": "a.py", "line": 1, "priority": 2, "title": "[P2] retry", "body": "b", "existing_code": "retry()"}
+        # Ambiguous now (b.py and c.py): no placement, yet a thread moved to b.py earlier stays raised.
+        self.assertIsNone(diff.place("a.py", 1, "retry()"))
+        keys = svc.raised_finding_keys([{"agent": "c", "findings": [raw]}], ["a.py", "b.py", "c.py"],
+                                       allowed=svc.commentable_added_lines(files), diff_anchors=diff)
+        title = svc.normalize_finding_title("[P2] retry")
+        self.assertTrue({("a.py", title), ("b.py", title), ("c.py", title)} <= keys)
+
 
 class ServicePlacementTest(unittest.TestCase):
     def setUp(self) -> None:

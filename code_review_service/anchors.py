@@ -81,11 +81,6 @@ class DiffAnchors:
             return [path]
         return [name for name in self.hunks if path and path.endswith("/" + name)]
 
-    def resolve_path(self, path: str) -> str | None:
-        """The diff's name for ``path`` when exactly one file fits, else None."""
-        owns = self.own_files(path)
-        return owns[0] if len(owns) == 1 else None
-
     def find(self, path: str, wanted: list) -> list:
         """Every run of consecutive new-side lines of ``path`` (one hunk) equal to ``wanted``."""
         found = []
@@ -115,7 +110,8 @@ class DiffAnchors:
         the agent did not mean.
 
         Elsewhere, files count, not matches: the quote must sit on added lines
-        in exactly one other file, and within that file the usual choice applies.
+        in exactly one other file, and within that file the same choice applies
+        (the nearest match, changed or not; none with added lines, no place).
         """
         if not quoted_lines(snippet):
             return None
@@ -134,14 +130,22 @@ class DiffAnchors:
         for name in self.hunks:
             if name == own:
                 continue
-            runs = [run for run in self._find_quote(name, snippet) if any(item.added for item in run)]
-            if runs:
+            runs = self._find_quote(name, snippet)
+            if any(item.added for run in runs for item in run):
                 elsewhere[name] = runs
         if len(elsewhere) != 1:
             return None
         name, runs = next(iter(elsewhere.items()))
         chosen = _pick(runs, line)
-        return Placement(name, _anchor_line(chosen, line), MOVED) if chosen else None
+        if chosen is None or not any(item.added for item in chosen):
+            return None
+        return Placement(name, _anchor_line(chosen, line), MOVED)
+
+    def quoted_in(self, snippet: Any) -> frozenset:
+        """Every diff file where the quote appears at all, on added lines or not."""
+        if not quoted_lines(snippet):
+            return frozenset()
+        return frozenset(name for name in self.hunks if self._find_quote(name, snippet))
 
 
 def _new_side_hunks(patch: str) -> list:

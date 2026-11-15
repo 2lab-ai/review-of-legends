@@ -263,10 +263,11 @@ places it (`code_review_service/anchors.py`):
    like a quote found only on unchanged lines, places nothing.
 2. **Quoted code, another file.** When the quote is nowhere in the finding's file, the one other
    file where it sits on added lines takes the comment, at the match nearest the agent's `line`
-   when it repeats there. Two or more such files: no guess. A finding whose path fits more than one
+   when it repeats there (changed or not: a nearest match on unchanged lines places nothing). Two
+   or more such files: no guess. A finding whose path fits more than one
    file of the diff (an absolute path ending in both `src/a.py` and `a.py`) is not moved either. A
-   finding moved this way counts as raised under both paths, so a later review keeps the moved
-   thread open while the agent still reports it.
+   finding counts as raised under its own path, the path it is placed in, and every file its
+   quote appears in, so a later review keeps a moved thread open while the agent still reports it.
 3. **The agent's line**, when it is an added line of the file (as before).
 
 A finding that gets no place this way is not dropped: a P0/P1 is listed under *Blocking findings

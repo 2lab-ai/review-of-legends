@@ -4352,8 +4352,9 @@ def raised_finding_keys(
     counts for every PR file it ends in, since the checkout's own directories
     may look like repository ones and a wrong pick would resolve a thread the
     finding keeps open. With ``allowed``, a finding also counts under the file
-    place_finding puts it in: a finding its quoted code moved to another file
-    keeps that file's thread open as well.
+    place_finding puts it in, and with ``diff_anchors`` under every file its
+    quoted code appears in: a thread a quote moved to another file stays open
+    while the agent reports the finding, even once the quote fits several files.
     """
     names = frozenset(str(name) for name in filenames if name)
     prefixes = [posixpath.normpath(str(root)).strip("/") + "/" for root in roots if str(root).strip("/")]
@@ -4368,6 +4369,10 @@ def raised_finding_keys(
                 placed = place_finding(raw, allowed, diff_anchors)
                 if placed is not None:
                     keys.add((placed.path, title))
+            if diff_anchors is not None:
+                # Every file the quote is in, placed or not: a thread an earlier review moved there
+                # stays raised while the agent reports it, even when the quote has turned ambiguous.
+                keys.update((name, title) for name in diff_anchors.quoted_in(raw.get("existing_code")))
             path = extract_finding_path(raw)
             if not path:
                 continue
