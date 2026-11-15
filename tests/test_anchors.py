@@ -69,6 +69,22 @@ class DiffAnchorsTest(unittest.TestCase):
         self.assertEqual(self.anchors.place("src/app.py", None, "data   =  read(path)\n\n").line, 12)
         self.assertEqual(self.anchors.place("src/app.py", None, "+    data = read(path)\n+    if data is None:").line, 13)
 
+    def test_code_that_starts_with_an_operator_matches_itself_first(self) -> None:
+        # "- item" (a YAML list entry) is added at 2; a bare "item" is added at 4.
+        patch = "@@ -0,0 +1,4 @@\n+steps:\n+  - item\n+other:\n+  item\n"
+        diff = anchors.DiffAnchors([{"filename": "ci.yml", "patch": patch}])
+        self.assertEqual(diff.place("ci.yml", None, "- item"), anchors.Placement("ci.yml", 2, anchors.CODE))
+        self.assertEqual(diff.place("ci.yml", None, "+  - item"), anchors.Placement("ci.yml", 2, anchors.CODE))
+
+    def test_repeated_searches_reuse_the_first_result(self) -> None:
+        diff = anchors.DiffAnchors(FILES)
+        with mock.patch.object(diff, "find", wraps=diff.find) as find:
+            for _ in range(5):
+                diff.place("src/app.py", None, "data = read(path)")
+                diff.quoted_in("data = read(path)")
+        searched = [call.args[0] for call in find.call_args_list]
+        self.assertEqual(sorted(searched), ["src/app.py", "src/util.py"])
+
     def test_a_quote_of_unchanged_code_places_nothing(self) -> None:
         self.assertEqual(self.anchors.place("src/app.py", 15, "return parse(data)"),
                          anchors.Placement("src/app.py", 15, anchors.UNCHANGED))

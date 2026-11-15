@@ -69,6 +69,9 @@ class DiffAnchors:
 
     def __init__(self, files: Iterable[dict[str, Any]]) -> None:
         self.hunks: dict[str, list] = {}
+        # (path, quote) -> matching runs: a review places each finding in several passes
+        # (inline, blockers, unplaced, counts, raised keys), and each would search the diff again.
+        self._found: dict[tuple, list] = {}
         for file_info in files:
             path = file_info.get("filename")
             patch = file_info.get("patch")
@@ -102,12 +105,21 @@ class DiffAnchors:
         return found
 
     def _find_quote(self, path: str, snippet: str) -> list:
-        found = self.find(path, quoted_lines(snippet))
-        if not found:
-            bare = _without_markers(snippet)
-            if bare and bare != quoted_lines(snippet):
-                found = self.find(path, bare)
-        return found
+        """The quote's runs in ``path``: as written first, then with leading diff markers taken off.
+
+        As written first, so code that starts with an operator (a YAML ``- item``,
+        a ``-1``) matches itself before a marker-stripped reading can match
+        something else.
+        """
+        key = (path, snippet)
+        if key not in self._found:
+            found = self.find(path, quoted_lines(snippet))
+            if not found:
+                bare = _without_markers(snippet)
+                if bare and bare != quoted_lines(snippet):
+                    found = self.find(path, bare)
+            self._found[key] = found
+        return self._found[key]
 
     def place(self, path: str, line: int | None, snippet: Any) -> Placement | None:
         """Where the quoted code sits on an added line; UNCHANGED when it names unchanged code;
