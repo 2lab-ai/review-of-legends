@@ -476,9 +476,14 @@ class ReviewFixesTest(unittest.TestCase):
             self.assertNotIn("sk-live-789", rules)
             self.assertNotIn("Host secret", rules)
             subprocess.run(["git", "init", "-q", str(source)], check=True)
-            subprocess.run(["git", "-C", str(source), "add", "-A"], check=True)
+            # -f: a developer's global ignore list may skip .env files, and the test must still see them.
+            subprocess.run(["git", "-C", str(source), "add", "-f", "-A"], check=True)
             subprocess.run(["git", "-C", str(source), "-c", "user.name=t", "-c", "user.email=t@example.com",
                             "commit", "-q", "-m", "rules"], check=True)
+            tracked = subprocess.run(["git", "-C", str(source), "ls-files"], check=True,
+                                     capture_output=True, text=True).stdout.split("\n")
+            self.assertTrue({"rules/.env.md", "rules/style.md"} <= set(tracked), tracked)
+            self.assertEqual(len([name for name in tracked if name.endswith("config.md")]), 1, tracked)
             from_git = svc.load_repository_rules(source, trusted_ref="HEAD")
         self.assertIn("use tabs", from_git)
         self.assertNotIn("sk-live-789", from_git)
