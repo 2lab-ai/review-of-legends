@@ -204,6 +204,43 @@ class PromptAndBodyTest(unittest.TestCase):
         plain = svc.render_prompt("acme-corp/app", self.PR, files, "diff", "agent")
         self.assertNotIn("not in the diff below", plain)
 
+    def test_a_patch_github_cut_is_marked_as_partly_shown_not_as_absent(self) -> None:
+        files = [_file("app.py"), _file("big.sql")]
+        prompt = svc.render_prompt("acme-corp/app", self.PR, files, "diff", "agent",
+                                   not_read={"big.sql": scope.CUT_PATCH})
+        self.assertIn("- big.sql (modified, +1, -0) [only part of this change is in the diff below", prompt)
+        self.assertIn("report on their visible hunks", prompt)
+        self.assertNotIn("[not in the diff below", prompt)
+        self.assertNotIn("do not report on them", prompt)
+
+    def test_the_visual_outline_gets_the_scoped_diff(self) -> None:
+        seen: dict = {}
+
+        def fake_outline(config, config_dir, source_dir, repo, pr, files, diff_text, **kwargs):
+            seen["diff"] = diff_text
+            return None
+
+        files = [_file("app.py"), _file(".env", patch="@@ -0,0 +1,1 @@\n+API_KEY=sk-live-123\n"), _file("README.md")]
+        client = _Client(files)
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "agents": [{"id": "correctness", "enabled": True, "prompt_path": "../agents/correctness.md"}],
+                "agent_runner": {"command": ["true"]}, "min_successful_agents": 0, "max_review_comments": 30,
+                "work_dir": str(Path(tmp) / "work"), "progress_comment": {"enabled": False},
+                "executive_summary": {"enabled": False}, "visual_outline": {"enabled": True},
+            }
+            pr = {"number": 4, "head": {"sha": "abcdef1234567890"}, "base": {"ref": "main"},
+                  "title": "t", "body": "", "user": {"login": "someone"}}
+            with mock.patch.object(svc, "clone_pr_source", lambda *a, **k: None), \
+                    mock.patch.object(svc, "visual_outline_exists", lambda *a, **k: False), \
+                    mock.patch.object(svc, "run_visual_outline_agent", fake_outline), \
+                    mock.patch.object(svc, "run_agent", lambda agent, *a, **k: {"agent": agent["id"], "summary": "ok",
+                                                                             "findings": []}):
+                svc.review_pr(client, config, ROOT / "config" / "reviewer.json", pr, {"reviewed": {}})
+        self.assertIn("diff --git a/app.py", seen["diff"])
+        self.assertNotIn("sk-live-123", seen["diff"])
+        self.assertNotIn("README.md", seen["diff"])
+
     def body(self, not_read, total=4) -> str:
         return svc.build_review_body(
             {"marker": svc.MARKER}, self.PR, [{"agent": "correctness", "summary": "ok"}], [], 0, "v",
