@@ -338,9 +338,12 @@ the Codex rollback runner — can still read them; it is outside this guarantee.
 - `past the diff budget (max_diff_chars)` — the patch did not fit in `max_diff_chars` (default
   180,000 characters, filled in GitHub's file order);
 - `GitHub sent no patch (the diff is too large)` — lines changed, but GitHub's file list carries no patch;
+- `GitHub's patch is shorter than the change (cut by GitHub)` — the patch carries fewer added and
+  deleted lines than GitHub counts for the file;
 - `no text diff (binary file)`. A rename with no change has nothing to read and is not listed.
 
-When the diff budget or a missing patch kept the agents from a file in the scope, the review is
+The files that make a review partial are listed first. When the diff budget, or a missing or cut
+patch, kept the agents from a file in the scope, the review is
 **partial**: the header says `(partial review)`, the section opens with a warning, and the
 `reviewed/<base>` status description ends in `; partial: N of M files in scope not read` (M counts the
 files in the review scope, not the files left out by it). The status stays
