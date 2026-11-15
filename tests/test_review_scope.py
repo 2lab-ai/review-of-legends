@@ -300,7 +300,7 @@ class ReviewPrScopeTest(unittest.TestCase):
         body, _ = client.reviews[0]
         self.assertIn("Files read in full: 1/2 (partial review)", body)
         reviewed = [s for s in client.statuses if s[0].startswith(svc.REVIEWED_STATUS_CONTEXT)]
-        self.assertEqual(reviewed[0][2], "reviewed (abcdef123456); partial: 1 of 2 files not read")
+        self.assertEqual(reviewed[0][2], "reviewed (abcdef123456); partial: 1 of 2 files in scope not read")
 
     def test_a_secret_file_never_reaches_an_agent(self) -> None:
         secret = _file(".env", patch="@@ -0,0 +1,1 @@\n+API_KEY=sk-live-123\n")
@@ -316,7 +316,7 @@ class ReviewPrScopeTest(unittest.TestCase):
         self.assertIn("Files read in full: 1/2 (partial review)", body)
         self.assertIn("**Partial review:**", body)
         reviewed = [s for s in client.statuses if s[0].startswith(svc.REVIEWED_STATUS_CONTEXT)]
-        self.assertEqual(reviewed[0][2], "reviewed (abcdef123456); partial: 1 of 2 files not read")
+        self.assertEqual(reviewed[0][2], "reviewed (abcdef123456); partial: 1 of 2 files in scope not read")
 
     def test_the_prompt_written_for_the_runner_carries_no_secret_patch(self) -> None:
         # The real run_agent: the prompt file the runner reads is what the model gets.
@@ -349,8 +349,73 @@ class ReviewPrScopeTest(unittest.TestCase):
         self.assertIn("- .env (modified, +1, -0) [not in the diff below: secret path, left out of every prompt]", prompt)
         self.assertEqual(len(client.reviews), 1)
 
+    def test_the_status_counts_files_in_scope_and_the_body_counts_every_file(self) -> None:
+        files = [_file("app.py"), _file("README.md"),
+                 _file("big.py", patch="@@ -1,1 +1,2 @@\n a\n+" + "x" * 900 + "\n")]
+        client, _ = self.run_review(files, max_diff_chars=400)
+        self.assertIn("Files read in full: 1/3 (partial review)", client.reviews[0][0])
+        reviewed = [s for s in client.statuses if s[0].startswith(svc.REVIEWED_STATUS_CONTEXT)]
+        self.assertEqual(reviewed[0][2], "reviewed (abcdef123456); partial: 1 of 2 files in scope not read")
+
+    def test_a_retry_reuses_a_result_only_when_it_read_the_scoped_diff(self) -> None:
+        files = [_file("app.py"), _file(".env", patch="@@ -0,0 +1,1 @@\n+API_KEY=sk-live-123\n")]
+        base = "b" * 40
+        selected = scope.select_files(files, scope.settings_for({}, "acme-corp/app"))
+
+        def attempt(diff_sha: str) -> list:
+            ran: list = []
+
+            def fake_run_agent(agent, *args, **kwargs):
+                ran.append(agent["id"])
+                return {"agent": agent["id"], "summary": "fresh", "findings": []}
+
+            kept = {"agent": "correctness", "summary": "kept", "findings": [],
+                    svc.REVIEWED_BASE_KEY: base, svc.REVIEWED_DIFF_KEY: diff_sha}
+            reuse = {"head_sha": "abcdef1234567890", "run_id": "r1", "results": {"correctness": kept}}
+            with tempfile.TemporaryDirectory() as tmp:
+                config = {
+                    "agents": [{"id": "correctness", "enabled": True, "prompt_path": "../agents/correctness.md"}],
+                    "agent_runner": {"command": ["true"]}, "min_successful_agents": 0,
+                    "max_review_comments": 30, "work_dir": str(Path(tmp) / "work"),
+                    "progress_comment": {"enabled": False}, "executive_summary": {"enabled": False},
+                    "visual_outline": {"enabled": False},
+                }
+                pr = {"number": 9, "head": {"sha": "abcdef1234567890"}, "base": {"ref": "main", "sha": base},
+                      "title": "t", "body": "", "user": {"login": "someone"}}
+                with mock.patch.object(svc, "clone_pr_source", lambda *a, **k: None), \
+                        mock.patch.object(svc, "load_repository_rules", lambda *a, **k: ""), \
+                        mock.patch.object(svc, "run_agent", fake_run_agent):
+                    svc.review_pr(_Client(files), config, ROOT / "config" / "reviewer.json", pr, {"reviewed": {}},
+                                  force=True, reuse_results=reuse)
+            return ran
+
+        # Saved before the scope existed: it read the .env patch, so the agent runs again.
+        self.assertEqual(attempt(svc.review_diff_fingerprint(files)), ["correctness"])
+        # Saved on the scoped diff: reused.
+        self.assertEqual(attempt(svc.review_diff_fingerprint(list(selected.reviewed))), [])
+
 
 class ReviewFixesTest(unittest.TestCase):
+    def test_brace_choices_are_globs_too(self) -> None:
+        pattern = scope.glob_regex("skills/**/{*.md,*.mdx}")
+        self.assertTrue(pattern.fullmatch("skills/a/SKILL.md"))
+        self.assertTrue(pattern.fullmatch("skills/b.mdx"))
+        self.assertFalse(pattern.fullmatch("skills/a/run.py"))
+        settings = scope.settings_for({"review_scope": {"include": ["skills/**/{*.md,*.mdx}"]}}, "a/b")
+        self.assertIsNone(scope.file_reason(_file("skills/a/SKILL.md"), settings))
+
+    def test_a_file_name_cannot_break_out_of_its_code_span(self) -> None:
+        self.assertEqual(svc.code_span("docs/a.md"), "`docs/a.md`")
+        self.assertEqual(svc.code_span("a`b.md"), "``a`b.md``")
+        self.assertEqual(svc.code_span("`x.md"), "`` `x.md ``")
+        self.assertEqual(svc.code_span("a.md\n### @owner"), "`a.md\\n### @owner`")
+        body = svc.build_review_body(
+            {"marker": svc.MARKER}, {"number": 7, "head": {"sha": "abc1234567"}}, [], [], 0, "v",
+            files_total=2, not_read=[("x`\n## Injected @owner.md", scope.DOCUMENTATION)],
+        )
+        self.assertIn("- ``x`\\n## Injected @owner.md`` — documentation", body)
+        self.assertNotIn("\n## Injected", body)
+
     def test_a_path_with_a_line_feed_still_matches_a_secret_pattern(self) -> None:
         for name in ("dir\nname/.npmrc", "home/.ssh/private\nbackup", "a\nb/id_rsa", "x\ny/.env"):
             self.assertTrue(scope.is_secret_path(name), repr(name))

@@ -294,7 +294,8 @@ the Codex rollback runner — can still read them; it is outside this guarantee.
 - `exclude` — globs left out on top of the categories ("excluded by review_scope.exclude"); it
   beats `include`.
 - `repositories` — per `owner/name` (any case): each key a repository sets replaces the global one.
-- Globs: `**` spans directories, `*` and `?` stay in one, `{a,b}` is a choice, `[...]` a class. A
+- Globs: `**` spans directories, `*` and `?` stay in one, `{a,b}` is a choice of globs
+  (`skills/**/{*.md,*.mdx}`), `[...]` a class. A
   glob without a `/` matches the file name at any depth (`*.md`); one with a `/` starts at the
   repository root (`docs/**`), and so does one with a leading `/` (`/setup.cfg`).
 - The setting lives in this service's config, never in the reviewed repository: a pull request
@@ -311,7 +312,8 @@ the Codex rollback runner — can still read them; it is outside this guarantee.
 
 When the diff budget or a missing patch kept the agents from a file in the scope, the review is
 **partial**: the header says `(partial review)`, the section opens with a warning, and the
-`reviewed/<base>` status description ends in `; partial: N of M files not read`. The status stays
+`reviewed/<base>` status description ends in `; partial: N of M files in scope not read` (M counts the
+files in the review scope, not the files left out by it). The status stays
 `success`: it records that a review was posted. Files left out by the scope alone do not make a
 review partial.
 
@@ -407,7 +409,7 @@ PR; see below).
 
 - `reviewed_status` (default `true`) turns it on; `false` turns it off. A dry run sets nothing.
 - A review sets it when the review is posted ("reviewed (<head>)", with "; partial: N of M files
-  not read" after the head when the agents skipped a file in the review scope; see *Review scope*). A review POST whose outcome is
+  in scope not read" after the head when the agents skipped a file in the review scope; see *Review scope*). A review POST whose outcome is
   unknown (a timeout or 5xx after sending) sets it too ("reviewed (<head>); the posted review
   could not be confirmed"): every agent ran and the POST most likely landed, and the ledger
   already counts that head as reviewed, so no retry may post it again (a Retrigger re-run is

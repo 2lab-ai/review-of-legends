@@ -173,6 +173,13 @@ def glob_regex(pattern: str) -> "re.Pattern[str]":
     text = pattern.strip()
     anchored = text.startswith("/")
     text = text.lstrip("/")
+    prefix = "" if anchored or "/" in text else "(?:.*/)?"
+    # DOTALL: a Git path may hold a line feed, and a secret pattern must still match it.
+    return re.compile(prefix + _translate(text), re.IGNORECASE | re.DOTALL)
+
+
+def _translate(text: str) -> str:
+    """The regex for a glob body; each ``{a,b}`` choice is a glob in its own right."""
     out = []
     i = 0
     while i < len(text):
@@ -199,7 +206,7 @@ def glob_regex(pattern: str) -> "re.Pattern[str]":
                 i += 1
                 continue
             choices = text[i + 1:end].split(",")
-            out.append("(?:" + "|".join(re.escape(choice) for choice in choices) + ")")
+            out.append("(?:" + "|".join(_translate(choice) for choice in choices) + ")")
             i = end + 1
         elif char == "[":
             end = text.find("]", i + 1)
@@ -215,9 +222,7 @@ def glob_regex(pattern: str) -> "re.Pattern[str]":
         else:
             out.append(re.escape(char))
             i += 1
-    prefix = "" if anchored or "/" in text else "(?:.*/)?"
-    # DOTALL: a Git path may hold a line feed, and a secret pattern must still match it.
-    return re.compile(prefix + "".join(out), re.IGNORECASE | re.DOTALL)
+    return "".join(out)
 
 
 def _compile(patterns: Iterable[str]) -> tuple:
@@ -261,10 +266,8 @@ def has_generated_header(patch: str, removed: bool = False, first_lines: int = G
         if hunk:
             line = int(hunk.group(1 if removed else 2))
             continue
-        if line is None or raw.startswith("\\") or raw.startswith("+" if removed else "-"):
-            continue
-        if line > first_lines:
-            line = None  # past the top of the file: wait for the next hunk
+        # Past the top of the file, the rest of the hunk is too: wait for the next one.
+        if line is None or line > first_lines or raw.startswith("\\") or raw.startswith("+" if removed else "-"):
             continue
         if GENERATED_HEADER.search(raw[1:]):
             return True
