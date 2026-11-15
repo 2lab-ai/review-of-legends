@@ -4629,7 +4629,7 @@ def build_review_body(
             )
         lines.extend(bounded_section(
             head,
-            [f"- `{path}` — {review_scope.REASON_TEXT.get(reason, reason)}" for path, reason in not_read],
+            [f"- {code_span(path)} — {review_scope.REASON_TEXT.get(reason, reason)}" for path, reason in not_read],
             budget,
             limit=MAX_NOT_READ_ITEMS,
         ))
@@ -4689,6 +4689,20 @@ def build_review_body(
         ))
     lines.append(footer)
     return "\n".join(lines)
+
+
+def code_span(text: str) -> str:
+    """``text`` as one inline code span that nothing in it can end: a file name is PR-supplied.
+
+    The fence is one backtick longer than the longest run inside, padded when the
+    text starts or ends with one; control characters, line feeds included, show as
+    their escape (\\n), so a name cannot open a new line, heading or mention.
+    """
+    shown = "".join(char if char.isprintable() else char.encode("unicode_escape").decode("ascii") for char in text)
+    longest = max((len(run) for run in re.findall("`+", shown)), default=0)
+    fence = "`" * (longest + 1)
+    pad = " " if shown.startswith("`") or shown.endswith("`") else ""
+    return f"{fence}{pad}{shown}{pad}{fence}"
 
 
 def bounded_section(head: list[str], entries: list[str], budget: list[int],
@@ -6716,15 +6730,15 @@ def review_pr(
         # their results (and the models they ran on) when the diff they read is this
         # one; only the others run below.
         diff_sha = review_diff_fingerprint(list(scope.reviewed))
-        partial_review = review_scope.is_partial(not_read)
-        # The reviewed status stays a success (it records review history), and says when the review was partial.
+        # The reviewed status stays a success (it records review history), and says when the review was
+        # partial: how many files in the scope the agents did not read, of the files in the scope.
         unread = sum(1 for _, reason in not_read if reason in review_scope.PARTIAL_REASONS)
-        scope_note = f"; partial: {unread} of {len(files)} files not read" if partial_review else ""
+        scope_note = f"; partial: {unread} of {len(scope.reviewed)} files in scope not read" if unread else ""
         if not_read:
             counts = collections.Counter(reason for _, reason in not_read)
             log(f"{client.repo} pr #{number}: {len(not_read)} of {len(files)} changed files not read in full "
                 f"({', '.join(f'{reason} {count}' for reason, count in sorted(counts.items()))})"
-                + ("; partial review" if partial_review else ""))
+                + ("; partial review" if unread else ""))
         # Every agent prompt names the files left out, so no agent reports on them
         # or on their absence ("the docs were not updated").
         scope_kwargs: dict[str, Any] = {"not_read": dict(not_read)} if not_read else {}
