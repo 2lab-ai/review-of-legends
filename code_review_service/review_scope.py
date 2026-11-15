@@ -35,11 +35,12 @@ VENDORED = "vendored"
 BUDGET = "budget"
 NO_PATCH = "no-patch"
 BINARY = "binary"
+CUT_PATCH = "cut-patch"
 
 CATEGORIES = (GENERATED, DOCUMENTATION, VENDORED)
 DEFAULT_EXCLUDE_CATEGORIES = CATEGORIES
 # Reasons that make a review partial: a file it chose to review, it did not read.
-PARTIAL_REASONS = frozenset({BUDGET, NO_PATCH})
+PARTIAL_REASONS = frozenset({BUDGET, NO_PATCH, CUT_PATCH})
 
 REASON_TEXT = {
     SECRET: "secret path, left out of every prompt",
@@ -50,6 +51,7 @@ REASON_TEXT = {
     BUDGET: "past the diff budget (max_diff_chars)",
     NO_PATCH: "GitHub sent no patch (the diff is too large)",
     BINARY: "no text diff (binary file)",
+    CUT_PATCH: "GitHub's patch is shorter than the change (cut by GitHub)",
 }
 
 SECRET_PATTERNS = (
@@ -342,24 +344,50 @@ def files_not_read(scope: Scope, shown: Iterable[str]) -> list:
     ``shown`` is the set of files whose whole patch was in the agents' diff
     (diff_and_shown_files). A reviewed file outside it was cut by the diff
     budget, or GitHub sent no patch: for a binary file (nothing added or
-    deleted) that is ``binary``, otherwise the diff was too large. A rename
-    with no change has nothing to read and is not listed.
+    deleted) that is ``binary``, otherwise the diff was too large. A file in
+    ``shown`` whose patch has fewer added and deleted lines than GitHub counts
+    for it was cut by GitHub (``cut-patch``). A rename with no change has
+    nothing to read and is not listed.
+
+    The files that make the review partial come first, so a list cut for
+    length still names them.
     """
     seen = frozenset(shown)
     missing = list(scope.excluded)
     for file_info in scope.reviewed:
         path = str(file_info.get("filename") or "<unknown>")
         if path in seen:
+            if _patch_lines(str(file_info.get("patch") or "")) < _changed(file_info):
+                missing.append((path, CUT_PATCH))
             continue
         if file_info.get("patch"):
             missing.append((path, BUDGET))
             continue
-        changed = int(file_info.get("additions") or 0) + int(file_info.get("deletions") or 0)
-        if changed:
+        if _changed(file_info):
             missing.append((path, NO_PATCH))
         elif file_info.get("status") != "renamed":
             missing.append((path, BINARY))
-    return missing
+    return sorted(missing, key=lambda item: item[1] not in PARTIAL_REASONS)
+
+
+def _changed(file_info: dict[str, Any]) -> int:
+    """The added plus deleted lines GitHub counts for a file."""
+    try:
+        return int(file_info.get("additions") or 0) + int(file_info.get("deletions") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _patch_lines(patch: str) -> int:
+    """The added and deleted lines a patch carries (inside hunks; ``+++x`` there is an added line)."""
+    count = 0
+    in_hunk = False
+    for raw in patch.split("\n"):
+        if raw.startswith("@@"):
+            in_hunk = True
+        elif in_hunk and raw[:1] in ("+", "-"):
+            count += 1
+    return count
 
 
 def is_partial(not_read: Iterable[tuple]) -> bool:

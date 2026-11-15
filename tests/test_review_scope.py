@@ -170,12 +170,22 @@ class FilesNotReadTest(unittest.TestCase):
         selected = scope.select_files(files, DEFAULTS)
         _, shown = svc.diff_and_shown_files(list(selected.reviewed), max_chars=300)
         not_read = scope.files_not_read(selected, shown)
+        # The ones that make the review partial first, then the rest, each in GitHub's order.
         self.assertEqual(not_read, [
-            ("README.md", scope.DOCUMENTATION),
             ("big.py", scope.BUDGET),
             ("huge.sql", scope.NO_PATCH),
+            ("README.md", scope.DOCUMENTATION),
             ("logo.png", scope.BINARY),
         ])
+        self.assertTrue(scope.is_partial(not_read))
+
+    def test_a_patch_github_cut_short_makes_the_review_partial(self) -> None:
+        cut = _file("big.sql", patch="@@ -1,1 +1,3 @@\n a\n+b\n+c\n", additions=900, deletions=12)
+        whole = _file("ok.py", patch="@@ -1,2 +1,2 @@\n-x\n++++y\n", additions=1, deletions=1)
+        selected = scope.select_files([cut, whole], DEFAULTS)
+        _, shown = svc.diff_and_shown_files(list(selected.reviewed), max_chars=180000)
+        not_read = scope.files_not_read(selected, shown)
+        self.assertEqual(not_read, [("big.sql", scope.CUT_PATCH)])
         self.assertTrue(scope.is_partial(not_read))
 
     def test_left_out_by_scope_alone_is_not_partial(self) -> None:
@@ -350,6 +360,17 @@ class ReviewPrScopeTest(unittest.TestCase):
         self.assertIn("- .env (modified, +1, -0) [not in the diff below: secret path, left out of every prompt]", prompt)
         self.assertEqual(len(client.reviews), 1)
 
+    def test_a_pr_whose_every_file_is_out_of_scope_still_gets_a_review_naming_them(self) -> None:
+        client, seen = self.run_review([_file("README.md"), _file("package-lock.json")])
+        self.assertEqual(seen[0]["diff"], "")
+        self.assertEqual(seen[0]["not_read"], {"README.md": scope.DOCUMENTATION, "package-lock.json": scope.GENERATED})
+        body, comments = client.reviews[0]
+        self.assertEqual(comments, [])
+        self.assertIn("Files read in full: 0/2\n", body)
+        self.assertNotIn("Partial review", body)
+        reviewed = [s for s in client.statuses if s[0].startswith(svc.REVIEWED_STATUS_CONTEXT)]
+        self.assertEqual(reviewed[0][2], "reviewed (abcdef123456)")
+
     def test_the_status_counts_files_in_scope_and_the_body_counts_every_file(self) -> None:
         files = [_file("app.py"), _file("README.md"),
                  _file("big.py", patch="@@ -1,1 +1,2 @@\n a\n+" + "x" * 900 + "\n")]
@@ -479,7 +500,7 @@ class ReviewFixesTest(unittest.TestCase):
             # -f: a developer's global ignore list may skip .env files, and the test must still see them.
             subprocess.run(["git", "-C", str(source), "add", "-f", "-A"], check=True)
             subprocess.run(["git", "-C", str(source), "-c", "user.name=t", "-c", "user.email=t@example.com",
-                            "commit", "-q", "-m", "rules"], check=True)
+                            "-c", "commit.gpgsign=false", "commit", "-q", "-m", "rules"], check=True)
             tracked = subprocess.run(["git", "-C", str(source), "ls-files"], check=True,
                                      capture_output=True, text=True).stdout.split("\n")
             self.assertTrue({"rules/.env.md", "rules/style.md"} <= set(tracked), tracked)
