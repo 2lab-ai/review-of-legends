@@ -744,15 +744,20 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   directory on the run's `PATH`, the real install
   of every program publish starts afterwards outside the sandbox (the command's interpreter and
   script, `git`, `gh`; a program inside a Homebrew `Cellar` protects the whole Homebrew prefix),
-  the directory of each symlink that leads to one, and the `deny_write` paths. Last, this review's
-  own run directory (its clone and ui-diff's worktrees) and this repository's own caches are
-  readable and writable again. Both are checked with `lstat` first and granted as checked, never
-  re-resolved: a cache directory a PR's code swapped for a symlink is replaced by a fresh
-  directory, a run directory that is not a plain directory fails the stage. The publish copy is
-  made under `cache_dir/publish`, which the run step can neither read nor write. Every ancestor of
-  a protected or denied directory, every symlink on the way to one (or to a program publish
-  runs), the two granted roots and the clone directory are pinned (no rename, no replacement by
-  a symlink). Beyond files, the profile refuses launchd job creation, LaunchServices opens,
+  the directory of each symlink that leads to one, and the `deny_write` paths (`~` is expanded
+  in all of them, and in the App key path, before anything is resolved). Last, this review's
+  clone, this run's own temp directory (ui-diff's worktrees) and this repository's own caches are
+  readable and writable again; the rest of the review's run directory (the service's artifacts,
+  the reviewers' prompts and answers) stays out of reach. They are checked with `lstat` first and
+  granted as checked, never re-resolved: a cache directory a PR's code swapped for a symlink is
+  replaced by a fresh directory, a run directory or clone that is not a plain directory fails the
+  stage. The publish copy is made under `cache_dir/publish`, which the run step can neither read
+  nor write. Every entry the kernel looks up on the way to a protected or denied path, to a
+  program publish runs, to a `PATH` entry or to the App key is pinned (no rename, no replacement
+  by a symlink): each unresolved directory, each symlink followed one hop at a time, each link
+  inside a link's target, and each directory of the final path; so are the granted roots. Such
+  an entry inside a granted place fails the stage. Without a sandbox the cache directories are
+  used as configured (a cache symlinked to preinstalled browsers stays). Beyond files, the profile refuses launchd job creation, LaunchServices opens,
   AppleEvents, the keychain service, looking into other processes, and `osascript`/`automator`/
   `shortcuts`/`open`; a program the PR's own code builds to send AppleEvents still needs macOS
   Automation consent, which a headless review daemon does not hold. Publish also runs sandboxed,

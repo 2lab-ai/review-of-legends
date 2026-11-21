@@ -67,6 +67,22 @@ FAKE_UI_DIFF = textwrap.dedent(
                 outcome = type(exc).__name__
             with record.open("a") as handle:
                 handle.write(json.dumps({"args": ["write"], "write": outcome, "env": {}, "cwd": "", "config": None}) + "\\n")
+        if behaviour.get("probe"):
+            # Read and write each path; record what the sandbox let through.
+            seen = {}
+            for path in behaviour["probe"]:
+                try:
+                    Path(path).read_text()
+                    seen[path + " read"] = "ok"
+                except OSError as exc:
+                    seen[path + " read"] = type(exc).__name__
+                try:
+                    Path(path).write_text("probe")
+                    seen[path + " write"] = "ok"
+                except OSError as exc:
+                    seen[path + " write"] = type(exc).__name__
+            with record.open("a") as handle:
+                handle.write(json.dumps({"args": ["probe"], "seen": seen, "env": {}, "cwd": "", "config": None}) + "\\n")
         if behaviour.get("relink"):
             # Swap a symlink on the way to the ui-diff install for one to a forged tool.
             link, forged = behaviour["relink"]
@@ -311,31 +327,34 @@ class SandboxTest(unittest.TestCase):
         # Ancestors of protected directories are pinned against rename/replace.
         self.assertIn(f'(deny file-write* (literal "{os.path.realpath("/srv")}"))', lines)
 
-    def test_this_run_and_this_repositorys_caches_are_allowed_last(self) -> None:
-        profile = ui_diff.sandbox_profile(self.config(), Path("/srv/rol/config"),
-                                          run_dir=Path("/srv/rol/data/work/acme-corp__web/pr-7"), repo="Acme-Corp/Web")
-        lines = profile.splitlines()
+    def test_this_clone_this_runs_temp_and_this_repositorys_caches_are_allowed_last(self) -> None:
         run = os.path.realpath("/srv/rol/data/work/acme-corp__web/pr-7")
+        profile = ui_diff.sandbox_profile(self.config(), Path("/srv/rol/config"), source=Path(run) / "source",
+                                          scratch=Path(run) / "rol-ui-diff-run-x", repo="Acme-Corp/Web")
+        lines = profile.splitlines()
         repo_cache = os.path.realpath("/srv/rol/data/ui-diff/repositories/acme-corp/web")
         grants = [line for line in lines if line.startswith("(allow file-read* file-write*")]
         self.assertEqual(grants, [
-            f'(allow file-read* file-write* (subpath "{run}"))',
+            f'(allow file-read* file-write* (subpath "{run}/source"))',
+            f'(allow file-read* file-write* (subpath "{run}/rol-ui-diff-run-x"))',
             f'(allow file-read* file-write* (subpath "{repo_cache}"))',
         ])
         after = lines[lines.index(grants[-1]) + 1:]
-        # The granted roots and the clone cannot be swapped out from under the daemon.
-        for path in (run, repo_cache, run + "/source"):
+        # The granted roots cannot be swapped out from under the daemon.
+        for path in (run + "/source", run + "/rol-ui-diff-run-x", repo_cache):
             self.assertIn(f'(deny file-write* (literal "{path}"))', after)
-        # Ancestors may be stat()ed (realpath, mkdir -p), not listed.
+        # The run directory itself (the service's artifacts) is not granted: its
+        # entry may be stat()ed on the way to the clone, nothing more.
+        self.assertIn(f'(allow file-read-metadata (literal "{run}"))', profile)
+        self.assertNotIn(f'(subpath "{run}"))', "\n".join(grants))
         self.assertIn(f'(allow file-read-metadata (literal "{os.path.realpath("/srv/rol/data/work")}"))', profile)
-        self.assertNotIn(f'(allow file-read* file-write* (subpath "{os.path.realpath("/srv/rol/data/work")}"))', profile)
 
     def test_a_protected_program_inside_a_writable_place_is_refused(self) -> None:
         config = self.config()
         config["visual_outline"]["ui_diff"]["command"] = ["/usr/bin/env", "/srv/rol/data/work/x/pr-7/ui-diff.mjs"]
         with mock.patch.object(ui_diff, "_protected_tool_dirs", lambda settings, path: [Path("/srv/rol/data/work/x/pr-7")]):
             with self.assertRaises(ValueError):
-                ui_diff.sandbox_profile(config, Path("/srv/rol/config"), run_dir=Path("/srv/rol/data/work/x/pr-7"))
+                ui_diff.sandbox_profile(config, Path("/srv/rol/config"), scratch=Path("/srv/rol/data/work/x/pr-7"))
 
     def test_every_program_publish_runs_is_write_protected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -414,7 +433,7 @@ class SandboxTest(unittest.TestCase):
         # Whatever lies on the way to a protected path must stay out of the run's reach.
         config = self.config(deny=["/srv/rol/data/work/x/pr-7/link/secret"])
         with self.assertRaises(ValueError):
-            ui_diff.sandbox_profile(config, Path("/srv/rol/config"), run_dir=Path("/srv/rol/data/work/x/pr-7"))
+            ui_diff.sandbox_profile(config, Path("/srv/rol/config"), source=Path("/srv/rol/data/work/x/pr-7"))
 
     def test_without_a_sandbox_a_symlinked_cache_is_kept(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -834,7 +853,7 @@ class RunStageTest(unittest.TestCase):
         cache = ui_diff.prepare_cache(config, service, REPO)
         self.assertFalse(os.path.islink(str(repo_cache)), "the planted link was removed")
         self.assertTrue((cache / "home").is_dir())
-        profile = ui_diff.sandbox_profile(config, service, run_dir=ui_diff.checked_run_dir(self.source.parent),
+        profile = ui_diff.sandbox_profile(config, service, source=ui_diff.checked_run_dir(self.source),
                                           repo=REPO, cache=cache)
         self.assertNotIn(str(os.path.realpath(key_dir)), profile)
         self.assertEqual(sorted(os.listdir(key_dir)), [], "nothing was created through the link")
@@ -917,7 +936,7 @@ class RunStageTest(unittest.TestCase):
         os.symlink(str(self.tmp / "tool"), str(link))
         settings = config["visual_outline"]["ui_diff"]
         settings["command"][1] = str(link / Path(settings["command"][1]).name)
-        forged = self.source.parent / "forged"
+        forged = self.source / "forged"
         forged.mkdir()
         (forged / Path(settings["command"][1]).name).write_text(
             "import json, os\n"
@@ -931,6 +950,34 @@ class RunStageTest(unittest.TestCase):
         self.assertEqual(relink["relink"], "PermissionError")
         self.assertEqual(os.readlink(str(link)), str(self.tmp / "tool"))
         self.assertNotIn(["forged"], [record["args"] for record in self.records()], "publish ran the original install")
+
+    @unittest.skipUnless(sys.platform == "darwin" and os.access(ui_diff.SANDBOX_EXEC, os.X_OK), "macOS sandbox-exec")
+    def test_the_run_reaches_only_its_clone_its_temp_and_its_repositorys_cache(self) -> None:
+        config, service = self.sandboxed_config(self.tmp / "secret")
+        work = self.tmp / "work"
+        config["work_dir"] = str(work)
+        self.source = work / "pr-7-run" / "source"
+        self.source.mkdir(parents=True)
+        own = self.source / "own.txt"
+        artifact = work / "pr-7-run" / "artifacts" / "agent-answer.txt"
+        sibling = work / "pr-8-run" / "source" / "theirs.txt"
+        other_cache = Path(os.path.realpath(ui_diff.repository_cache_root(config, service, "acme-corp/other"))) / "home" / "x"
+        for path in (own, artifact, sibling, other_cache):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("original")
+        own_cache = ui_diff.prepare_cache(config, service, REPO) / "home" / "mine.txt"
+        (self.tmp / "tool" / "behaviour.json").write_text(json.dumps(
+            {"probe": [str(own), str(own_cache), str(artifact), str(sibling), str(other_cache)]}
+        ))
+        outcome = ui_diff.run_stage(config, service, self.source, work / "pr-7-run" / "artifacts", REPO, _pr(),
+                                    lambda env: env, self.logs.append, lambda p, t: p.write_text(t))
+        self.assertEqual(outcome.status, "ok", outcome.detail)
+        seen = next(record for record in self.records() if record["args"] == ["probe"])["seen"]
+        self.assertEqual(seen[f"{own} write"], "ok")
+        self.assertEqual(seen[f"{own_cache} write"], "ok")
+        for path in (artifact, sibling, other_cache):
+            self.assertEqual((seen[f"{path} read"], seen[f"{path} write"]), ("PermissionError", "PermissionError"), path)
+            self.assertEqual(path.read_text(), "original")
 
     def test_a_dry_run_never_hands_out_the_credential(self) -> None:
         self.behaviour()

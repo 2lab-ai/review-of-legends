@@ -643,7 +643,8 @@ def publish_profile(config: Dict[str, Any], config_dir: Path, workspace_root: Op
 def sandbox_profile(
     config: Dict[str, Any],
     config_dir: Path,
-    run_dir: Optional[Path] = None,
+    source: Optional[Path] = None,
+    scratch: Optional[Path] = None,
     repo: str = "",
     cache: Optional[Path] = None,
 ) -> Optional[str]:
@@ -655,7 +656,10 @@ def sandbox_profile(
     repositories); writing the service tree, every directory on PATH, the
     install of every program publish starts afterwards outside the sandbox and
     the ``deny_write`` paths. Then, last (later rules win), reading and writing
-    this review's own run directory and this repository's caches.
+    this review's clone (``source``), this run's own temp directory
+    (``scratch``) and this repository's caches. The rest of the review's run
+    directory (the service's artifacts, the reviewers' prompts and answers)
+    stays out of reach.
 
     Every entry the kernel looks up on the way to each denied or protected
     path, each program publish runs, each PATH entry and the App key is pinned
@@ -686,9 +690,9 @@ def sandbox_profile(
         # The key as the daemon names it, symlinks and all.
         reached.append(str(app["private_key_path"]))
     # Granted as checked (checked_run_dir, prepare_cache), never re-resolved:
-    # these two are writable by the PR's code, which could have swapped them
-    # for a symlink to something denied above.
-    allow = [Path(str(path)) for path in (run_dir, cache) if path]
+    # these are writable by the PR's code, which could have swapped them for a
+    # symlink to something denied above.
+    allow = [Path(str(path)) for path in (source, scratch, cache) if path]
     if cache is None:
         allow.append(Path(os.path.realpath(str(repository_cache_root(config, config_dir, repo)))))
     exposed = [tool for tool in tools if _inside(tool, allow)]
@@ -712,10 +716,9 @@ def sandbox_profile(
         raise ValueError(f"{inside[0]} (on the way to a protected path) is inside a directory the run step may write")
     lines += [f"(deny file-write* (literal {_quote(path)}))" for path in pinned]
     lines += [f"(allow file-read* file-write* (subpath {_quote(str(path))}))" for path in dict.fromkeys(map(str, allow))]
-    # The granted roots themselves (and the clone under the run directory) stay
-    # where they are: the PR's code may change what is inside, not swap them.
-    roots = [str(path) for path in allow] + ([str(Path(str(run_dir)) / "source")] if run_dir else [])
-    lines += [f"(deny file-write* (literal {_quote(path)}))" for path in dict.fromkeys(roots)]
+    # The granted roots themselves stay where they are: the PR's code may
+    # change what is inside, not swap them.
+    lines += [f"(deny file-write* (literal {_quote(str(path))}))" for path in dict.fromkeys(allow)]
     # Their parent directories may be stat()ed (realpath, mkdir -p walk up the
     # tree), never listed or read.
     ancestors: List[str] = []
@@ -1175,27 +1178,33 @@ def run_stage(
     try:
         cache = prepare_cache(config, config_dir, repo)
         run_dir = checked_run_dir(Path(source_dir).parent)
+        source = run_dir / Path(source_dir).name
+        _plain_dir(source, repair=False)
         env = run_environ(config, config_dir, repo=repo, cache=cache)
-        profile = sandbox_profile(config, config_dir, run_dir=run_dir, repo=repo, cache=cache)
     except (OSError, ValueError) as exc:
         reason = _one_line(f"the sandbox would not protect what publish runs: {exc}")
         return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
-    if profile is not None and not os.access(SANDBOX_EXEC, os.X_OK):
-        # Fail closed: a deployment that asked for the sandbox never runs the PR's code without it.
-        reason = f"visual_outline.ui_diff.sandbox is set but {SANDBOX_EXEC} is not available on this host"
-        return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
-    run_prefix = [SANDBOX_EXEC, "-p", profile] if profile is not None else []
-    published_profile = publish_profile(config, config_dir, _publish_parent(config, config_dir) if profile else None)
-    publish_prefix = [SANDBOX_EXEC, "-p", published_profile] if published_profile is not None else []
     # A private temp directory per run: ui-diff's worktrees land in it, so every
     # install and dev server this run started works under it and can be found.
     # mkdtemp + rmtree(ignore_errors), not TemporaryDirectory: on Python 3.9 its
     # cleanup raises on a file an install left read-only, which would turn a
-    # finished UI diff into a failure.
-    # Inside this review's run directory, which the sandbox lets this run (and
-    # no other) read and write.
+    # finished UI diff into a failure. Beside the clone, in this review's run
+    # directory; the sandbox grants this directory and the clone, nothing else
+    # of the run directory.
     run_tmp = tempfile.mkdtemp(prefix="rol-ui-diff-run-", dir=str(run_dir))
     try:
+        try:
+            profile = sandbox_profile(config, config_dir, source=source, scratch=Path(run_tmp), repo=repo, cache=cache)
+        except (OSError, ValueError) as exc:
+            reason = _one_line(f"the sandbox would not protect what publish runs: {exc}")
+            return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
+        if profile is not None and not os.access(SANDBOX_EXEC, os.X_OK):
+            # Fail closed: a deployment that asked for the sandbox never runs the PR's code without it.
+            reason = f"visual_outline.ui_diff.sandbox is set but {SANDBOX_EXEC} is not available on this host"
+            return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
+        run_prefix = [SANDBOX_EXEC, "-p", profile] if profile is not None else []
+        published_profile = publish_profile(config, config_dir, _publish_parent(config, config_dir) if profile else None)
+        publish_prefix = [SANDBOX_EXEC, "-p", published_profile] if published_profile is not None else []
         env["TMPDIR"] = run_tmp
         timeout = int(settings.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS)
         publish_timeout = int(settings.get("publish_timeout_seconds") or DEFAULT_PUBLISH_TIMEOUT_SECONDS)
