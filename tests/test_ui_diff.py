@@ -283,17 +283,21 @@ class SandboxTest(unittest.TestCase):
         for path in ("/srv/rol/data/work", "/srv/rol/data/ui-diff"):
             self.assertIn(f'(deny file-read* file-write* (subpath "{os.path.realpath(path)}"))', lines,
                           "other reviews' clones and other repositories' caches")
-        self.assertTrue(all(line.startswith("(deny") for line in lines[2:-1]))
-        self.assertEqual(lines[-1], f'(allow file-read* file-write* (subpath "{os.path.realpath("/srv/rol/data/ui-diff")}"))')
+        rules = [line for line in lines if not line.startswith("(allow file-read-metadata")]
+        self.assertTrue(all(line.startswith("(deny") for line in rules[2:-1]))
+        self.assertEqual(rules[-1], f'(allow file-read* file-write* (subpath "{os.path.realpath("/srv/rol/data/ui-diff")}"))')
 
     def test_this_run_and_this_repositorys_caches_are_allowed_last(self) -> None:
         profile = ui_diff.sandbox_profile(self.config(), Path("/srv/rol/config"),
                                           run_dir=Path("/srv/rol/data/work/acme-corp__web/pr-7"), repo="Acme-Corp/Web")
-        lines = profile.splitlines()
+        lines = [line for line in profile.splitlines() if not line.startswith("(allow file-read-metadata")]
         self.assertEqual(lines[-2:], [
             f'(allow file-read* file-write* (subpath "{os.path.realpath("/srv/rol/data/work/acme-corp__web/pr-7")}"))',
             f'(allow file-read* file-write* (subpath "{os.path.realpath("/srv/rol/data/ui-diff/repositories/acme-corp/web")}"))',
         ])
+        # Ancestors may be stat()ed (realpath, mkdir -p), not listed.
+        self.assertIn(f'(allow file-read-metadata (literal "{os.path.realpath("/srv/rol/data/work")}"))', profile)
+        self.assertNotIn(f'(allow file-read* file-write* (subpath "{os.path.realpath("/srv/rol/data/work")}"))', profile)
 
     def test_a_protected_program_inside_a_writable_place_is_refused(self) -> None:
         config = self.config()

@@ -511,6 +511,14 @@ def sandbox_profile(
     lines += [f"(deny file-read* file-write* (subpath {_sbpl(path)}))" for path in dict.fromkeys(map(str, deny))]
     lines += [f"(deny file-write* (subpath {_sbpl(path)}))" for path in dict.fromkeys(map(str, deny_write))]
     lines += [f"(allow file-read* file-write* (subpath {_sbpl(path)}))" for path in dict.fromkeys(map(str, allow))]
+    # Their parent directories may be stat()ed (realpath, mkdir -p walk up the
+    # tree), never listed or read.
+    ancestors: List[str] = []
+    for path in allow:
+        for parent in Path(path).parents:
+            if str(parent) != os.sep and str(parent) not in ancestors:
+                ancestors.append(str(parent))
+    lines += [f"(allow file-read-metadata (literal {_sbpl(path)}))" for path in ancestors]
     return "\n".join(lines) + "\n"
 
 
