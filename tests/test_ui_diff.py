@@ -55,6 +55,8 @@ FAKE_UI_DIFF = textwrap.dedent(
             config_file.write_text(behaviour["replace_config_with"])
         if behaviour.get("run_sleep"):
             time.sleep(behaviour["run_sleep"])
+        if behaviour.get("exit_right_away"):
+            sys.exit(0 if (out / "report.json").write_text("{}") else 0)
         if behaviour.get("run_exit"):
             print(json.dumps({"error": "Server never became ready", "hint": "check startCommand"}))
             sys.exit(behaviour["run_exit"])
@@ -244,6 +246,11 @@ class SectionTest(unittest.TestCase):
         self.assertIn("## 왜 이 변경인가", body)
         self.assertEqual(ui_diff.merge_section(body, None).strip(), outline)
 
+    def test_a_section_that_cannot_fit_with_its_markers_is_left_out(self) -> None:
+        body = ui_diff.merge_section("x" * (ui_diff.MAX_COMMENT_CHARS - 500), ui_diff.build_section("y" * 5000, [], HEAD, 1))
+        self.assertNotIn(ui_diff.SECTION_END, body)
+        self.assertNotIn("review-of-legends:ui-diff", body)
+
     def test_an_oversized_section_is_cut_to_fit_one_comment(self) -> None:
         section = ui_diff.build_section("x" * 80000, [], HEAD, 1)
         body = ui_diff.merge_section("outline", section)
@@ -354,11 +361,37 @@ class RunStageTest(unittest.TestCase):
         self.assertEqual(outcome.status, "ok", outcome.detail)
         self.assertTrue(_gone(int(pid_file.read_text())), "the leftover dev server was killed")
 
+    def test_a_child_detached_just_before_a_fast_exit_is_swept(self) -> None:
+        pid_file = self.tmp / "child.pid"
+        self.behaviour(spawn_child=str(pid_file), exit_right_away=True)
+        self.run_stage(_config(self.tmp))
+        self.assertTrue(_gone(int(pid_file.read_text())), "found by its working directory, not the tree")
+
+    def test_a_queued_stage_gives_up_on_cancel_without_running(self) -> None:
+        self.behaviour()
+        slots = ui_diff._slots(1)
+        held = slots.acquire(timeout=5)
+        self.assertTrue(held)
+        try:
+            def write(path: Path, text: str) -> None:
+                path.write_text(text, encoding="utf-8")
+
+            job = ui_diff.Job(lambda event: ui_diff.run_stage(
+                _config(self.tmp), self.tmp, self.source, self.artifacts, REPO, _pr(),
+                lambda env: env, self.logs.append, write, cancel=event,
+            ), HEAD).start()
+            self.assertIsNone(job.result(0.3), "it waits for the slot")
+            self.assertTrue(job.cancel(10))
+            outcome = job.result(0)
+            self.assertEqual(outcome.status, "failed")
+            self.assertIn("slot", outcome.section)
+            self.assertEqual(self.records(), [], "ui-diff never ran")
+        finally:
+            slots.release()
+
     def test_a_cancelled_stage_stops_its_processes(self) -> None:
-        import threading
         pid_file = self.tmp / "child.pid"
         self.behaviour(run_sleep=60, spawn_child=str(pid_file))
-        cancel = threading.Event()
 
         def write(path: Path, text: str) -> None:
             path.write_text(text, encoding="utf-8")
@@ -378,7 +411,6 @@ class RunStageTest(unittest.TestCase):
         self.assertEqual(outcome.status, "failed")
         self.assertIn("could not wait for it any longer", outcome.section)
         self.assertTrue(_gone(int(pid_file.read_text())))
-        del cancel
 
     def test_a_refused_push_falls_back_to_a_text_only_section(self) -> None:
         self.behaviour(publish_exit=3)
@@ -550,7 +582,6 @@ class ReviewIntegrationTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
         self.uploads: list[bool] = []
-        self.stage_delay = 0.0
         self.stage_hook = None
 
     def tearDown(self) -> None:
@@ -585,9 +616,6 @@ class ReviewIntegrationTest(unittest.TestCase):
             self.uploads.append(kw.get("upload", True))
             if self.stage_hook is not None:
                 self.stage_hook(**kw)
-            if self.stage_delay:
-                import time as _time
-                _time.sleep(self.stage_delay)
             if stage is not None:
                 return stage
             return ui_diff.Outcome(ui_diff.build_section("### UI diff — 1 changed", [], HEAD, 2), "ok")
@@ -647,6 +675,13 @@ class ReviewIntegrationTest(unittest.TestCase):
         self.assertEqual(update[1], 41)
         self.assertIn("1 changed", update[2])
         self.assertNotIn("9 changed", update[2])
+
+    def test_someone_elses_marker_comment_is_never_edited(self) -> None:
+        old = svc.VISUAL_MARKER + "\n\n## pasted by a person"
+        client = _Client([{"id": 41, "body": old, "user": {"login": "someone"}}])
+        svc.post_ui_diff_section(client, {"visual_marker": svc.VISUAL_MARKER}, 7, "section")
+        self.assertEqual([call[0] for call in client.calls if call[0] in ("update", "create")], ["create"])
+        self.assertIn(ui_diff.OUTLINE_PENDING, client.calls[-1][1])
 
     def test_without_an_outline_the_section_is_posted_as_pending(self) -> None:
         client = _Client()

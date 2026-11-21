@@ -273,7 +273,8 @@ def merge_section(body: str, section: Optional[str]) -> str:
         return merged
     room = MAX_COMMENT_CHARS - len(base) - 400
     inner = section.strip()
-    if room <= 0:
+    if room <= len(SECTION_START) + 200:
+        # Not even a cut section fits with its markers: leave the outline alone.
         return base + "\n"
     cut = inner[:room]
     if not cut.endswith(SECTION_END):
@@ -327,7 +328,7 @@ class Outcome(object):
 
 
 _SLOTS_LOCK = threading.Lock()
-_SLOTS: Dict[int, threading.BoundedSemaphore] = {}
+_SLOTS: List[threading.BoundedSemaphore] = []
 
 
 def _acquire(slots: threading.BoundedSemaphore, wait: float, cancel: Optional[threading.Event]) -> bool:
@@ -342,11 +343,15 @@ def _acquire(slots: threading.BoundedSemaphore, wait: float, cancel: Optional[th
 
 
 def _slots(limit: int) -> threading.BoundedSemaphore:
-    """One semaphore per configured limit: ui-diff runs two dev servers and a browser."""
+    """The one semaphore every UI diff takes: ui-diff runs two dev servers and a browser.
+
+    Sized by the first ``max_concurrent`` it sees; a changed limit takes effect
+    after a restart, so runs admitted under the old limit are never forgotten.
+    """
     with _SLOTS_LOCK:
-        if limit not in _SLOTS:
-            _SLOTS[limit] = threading.BoundedSemaphore(limit)
-        return _SLOTS[limit]
+        if not _SLOTS:
+            _SLOTS.append(threading.BoundedSemaphore(limit))
+        return _SLOTS[0]
 
 
 def cache_root(config: Dict[str, Any], config_dir: Path) -> Path:
@@ -434,6 +439,42 @@ def _descendant_groups(root_pid: int) -> List[int]:
     return groups
 
 
+def _groups_working_under(paths: List[str]) -> List[int]:
+    """The process groups of this user's processes whose working directory is
+    inside one of ``paths`` (lsof), best effort.
+
+    A detached dev server that outlived ui-diff has been reparented, so the
+    process tree no longer leads to it; its working directory (a worktree in
+    the run's private temp directory, or the clone) still does.
+    """
+    roots = [os.path.realpath(path).rstrip(os.sep) + os.sep for path in paths if path]
+    if not roots:
+        return []
+    try:
+        listing = subprocess.run(
+            ["lsof", "-a", "-u", str(os.getuid()), "-d", "cwd", "-F", "pn"],
+            capture_output=True, text=True, timeout=30, check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    groups: List[int] = []
+    own = os.getpid()
+    pid = 0
+    for line in listing.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith("n") and pid and pid != own:
+            cwd = os.path.realpath(line[1:]).rstrip(os.sep) + os.sep
+            if any(cwd.startswith(root) for root in roots):
+                try:
+                    group = os.getpgid(pid)
+                except OSError:
+                    continue
+                if group > 1 and group not in groups:
+                    groups.append(group)
+    return groups
+
+
 def _kill_groups(groups: List[int], sig: int) -> None:
     for group in groups:
         try:
@@ -452,16 +493,19 @@ def _run_group(
     env: Dict[str, str],
     timeout: int,
     cancel: Optional[threading.Event] = None,
+    sweep: Optional[List[str]] = None,
 ) -> Tuple[Optional[int], str, str]:
     """Run ``args`` in its own session and leave nothing of it running.
 
     ui-diff starts installs and dev servers detached, each in its own process
     group, and once ui-diff exits they are reparented and can no longer be told
     apart. So while it runs, every descendant's group is recorded; when it ends —
-    normally, past ``timeout`` or on ``cancel`` — those groups get SIGKILL. A run
-    that has to be stopped first gets SIGTERM (ui-diff then stops its own
-    servers). Output goes to files, not pipes, so a child that inherits them
-    cannot hold the call open. ``(exit, stdout, stderr)``, exit None when stopped.
+    normally, past ``timeout`` or on ``cancel`` — those groups, its own group and
+    the group of every process still working under ``sweep`` (a child that
+    detached between two polls) get SIGKILL. A run that has to be stopped first
+    gets SIGTERM (ui-diff then stops its own servers). Output goes to files, not
+    pipes, so a child that inherits them cannot hold the call open.
+    ``(exit, stdout, stderr)``, exit None when stopped.
     """
     with tempfile.TemporaryFile() as out_file, tempfile.TemporaryFile() as err_file:
         proc = subprocess.Popen(
@@ -497,7 +541,9 @@ def _run_group(
                     proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     pass
-        # The sweep: anything ui-diff left behind (a dev server it did not stop).
+        # The sweep: anything ui-diff left behind (a dev server it did not stop),
+        # found by the tree it had and by where it works.
+        groups += [group for group in [proc.pid] + _groups_working_under(list(sweep or [])) if group not in groups]
         _kill_groups([group for group in groups if group != os.getpgid(0)], signal.SIGKILL)
         out_file.seek(0)
         err_file.seek(0)
@@ -697,6 +743,44 @@ def run_stage(
     command = [str(arg) for arg in settings.get("command") or []]
     out_dir = Path(source_dir) / ".ui-diff"
     env = run_environ(config, config_dir)
+    # A private temp directory per run: ui-diff's worktrees land in it, so every
+    # process this run started works under it (or the clone) and can be found.
+    run_tmp = tempfile.mkdtemp(prefix="rol-ui-diff-run-")
+    env["TMPDIR"] = run_tmp
+    try:
+        return _run_stage_in(
+            settings, command, env, run_tmp, config_path, config_source, config_settings, out_dir,
+            source_dir, artifact_dir, repo, number, base_sha, head_sha, publish_env, log, write_text,
+            clock, started, upload, cancel,
+        )
+    finally:
+        shutil.rmtree(run_tmp, ignore_errors=True)
+
+
+def _run_stage_in(
+    settings: Dict[str, Any],
+    command: List[str],
+    env: Dict[str, str],
+    run_tmp: str,
+    config_path: Path,
+    config_source: str,
+    config_settings: Dict[str, Any],
+    out_dir: Path,
+    source_dir: Path,
+    artifact_dir: Path,
+    repo: str,
+    number: int,
+    base_sha: str,
+    head_sha: str,
+    publish_env: Callable[[Dict[str, str]], Dict[str, str]],
+    log: Callable[[str], None],
+    write_text: Callable[[Path, str], None],
+    clock: Callable[[], float],
+    started: float,
+    upload: bool,
+    cancel: Optional[threading.Event],
+) -> Outcome:
+    """run_stage after its checks: capture, then publish (see run_stage)."""
     timeout = int(settings.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS)
     publish_timeout = int(settings.get("publish_timeout_seconds") or DEFAULT_PUBLISH_TIMEOUT_SECONDS)
     slots = _slots(int(settings.get("max_concurrent") or 1))
@@ -711,7 +795,9 @@ def run_stage(
         run_args = command + [
             "run", "--config", str(config_path), "--base", base_sha, "--head", head_sha, "--out", str(out_dir),
         ]
-        code, stdout, stderr = _run_group(run_args, Path(source_dir), env, timeout, cancel)
+        code, stdout, stderr = _run_group(
+            run_args, Path(source_dir), env, timeout, cancel, sweep=[run_tmp, str(source_dir)]
+        )
         write_text(artifact_dir / "ui-diff.run.stdout.txt", stdout)
         write_text(artifact_dir / "ui-diff.run.stderr.txt", stderr)
         if code != 0:
@@ -740,7 +826,8 @@ def run_stage(
                 notes.append("Dry run: screenshots were not uploaded.")
             elif settings.get("upload", True):
                 code, stdout, stderr = _run_group(
-                    publish_args, workspace, _harden_git(publish_env(dict(env))), publish_timeout, cancel
+                    publish_args, workspace, _harden_git(publish_env(dict(env))), publish_timeout, cancel,
+                    sweep=[str(workspace)],
                 )
                 write_text(artifact_dir / "ui-diff.publish.stdout.txt", stdout)
                 write_text(artifact_dir / "ui-diff.publish.stderr.txt", stderr)
@@ -758,7 +845,8 @@ def run_stage(
                 notes.append("Screenshots are not uploaded on this deployment (visual_outline.ui_diff.upload is off).")
             if status == "text-only":
                 code, stdout, stderr = _run_group(
-                    publish_args + ["--no-upload"], workspace, _harden_git(env), publish_timeout, cancel
+                    publish_args + ["--no-upload"], workspace, _harden_git(env), publish_timeout, cancel,
+                    sweep=[str(workspace)],
                 )
                 write_text(artifact_dir / "ui-diff.render.stderr.txt", stderr)
                 if code != 0:
@@ -796,13 +884,10 @@ class Job(object):
     failure outcome.
     """
 
-    def __init__(
-        self, target: Callable[[threading.Event], Outcome], head_sha: str, clock: Callable[[], float] = time.monotonic
-    ) -> None:
+    def __init__(self, target: Callable[[threading.Event], Outcome], head_sha: str) -> None:
         self._target = target
         self._head_sha = head_sha
-        self._clock = clock
-        self._started = clock()
+        self._started = time.monotonic()
         self._outcome: Optional[Outcome] = None
         self._cancel = threading.Event()
         self._thread = threading.Thread(target=self._run, name="ui-diff", daemon=True)
@@ -816,7 +901,7 @@ class Job(object):
             self._outcome = self._target(self._cancel)
         except Exception as exc:  # noqa: BLE001 - the stage is best effort
             reason = _one_line(f"{exc.__class__.__name__}: {exc}")
-            self._outcome = Outcome(failure_section(reason, self._head_sha, self._clock() - self._started), "failed", reason)
+            self._outcome = Outcome(failure_section(reason, self._head_sha, time.monotonic() - self._started), "failed", reason)
 
     def result(self, timeout: float) -> Optional[Outcome]:
         """The outcome, or None when the thread is still running after ``timeout``."""

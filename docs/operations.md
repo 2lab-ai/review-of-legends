@@ -739,8 +739,10 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   refused (ui-diff exits 3) and the section is posted text-only (changed captures, percentages,
   summary) with a note saying why. `upload: false` posts text-only on purpose.
 - **Processes.** ui-diff starts installs and dev servers detached, in their own process groups.
-  While it runs the daemon records every descendant's group every 2 seconds; when it ends, those
-  groups get SIGKILL, so a dev server it left behind does not outlive the run. A run past its
+  Each run gets a private `TMPDIR` (ui-diff's worktrees land in it). While it runs the daemon
+  records every descendant's group every 2 seconds; when it ends, those groups, ui-diff's own
+  group and the group of every process still working under that temp directory or the clone
+  (`lsof`) get SIGKILL, so a dev server it left behind does not outlive the run. A run past its
   timeout gets SIGTERM first (ui-diff stops its own servers), then SIGKILL. A review that cannot
   wait any longer (past `timeout_seconds` + 2 × `publish_timeout_seconds` and a slot wait) stops the
   UI diff the same way before it removes the clone.
@@ -753,7 +755,8 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   `["/opt/homebrew/bin/node", "/opt/ui-diff/skills/ui-diff/bin/ui-diff.mjs"]`; without it the UI
   diff never runs), `configs`, `env`, `cache_dir` (default `../data/ui-diff`, relative to the
   config), `timeout_seconds` (run, default 1500), `publish_timeout_seconds` (default 300),
-  `max_concurrent` (ui-diff runs at once across reviews, default 1), `assets_branch` (default
+  `max_concurrent` (ui-diff runs at once across reviews, default 1; a change takes effect after a
+  restart), `assets_branch` (default
   `ui-diff-assets`), `upload` (default `true`).
 - **Install** ui-diff once on the host, at a pinned commit, outside the deployed tree:
   `git clone https://github.com/imuratalpay/ui-diff.git /opt/ui-diff && git -C /opt/ui-diff checkout

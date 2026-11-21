@@ -4446,6 +4446,20 @@ class RepositoryVisualOutlineTest(AppTestCase):
         self.assertEqual((row["enabled_source"], row["ui_diff_source"], row["ui_diff"]), ("default", "default", False))
         self.assertEqual(self.store.calls_named("delete_setting")[-1][1][0], "visual_outline_repositories")
 
+    def test_unreadable_saved_choices_show_the_config_and_say_so(self) -> None:
+        class UnreadableOutline(FakeDashboardStore):
+            def get_setting(self, key: str):
+                if key == "visual_outline_repositories":
+                    raise OSError("disk I/O error")
+                return super().get_setting(key)
+
+        self.store = UnreadableOutline()
+        client = self.make_client()
+        self.login(client)
+        payload = client.get("/api/settings/repositories").json()
+        self.assertEqual(payload["error"], dashboard_web.OUTLINE_SETTINGS_UNREADABLE)
+        self.assertEqual(self.rows(payload)["acme-corp/Gamma"]["enabled_source"], "default")
+
     def test_the_ui_diff_cannot_be_switched_on_without_an_install(self) -> None:
         self.write_config(ui_diff_command=False)
         client = self.make_client()

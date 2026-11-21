@@ -186,6 +186,10 @@ UNREADABLE_REPOSITORIES = (
     "changed. Repair or delete the 'repositories' row in the dashboard store, then try again."
 )
 STORE_READ_FAILED = "The dashboard store could not be read, so nothing was changed; try again."
+OUTLINE_SETTINGS_UNREADABLE = (
+    "The visual outline choices saved here could not be read; the switches show config/reviewer.json, "
+    "and the service falls back to it the same way."
+)
 UNREADABLE_ADMINS = (
     "The saved admin list cannot be read (it is not an object with an 'added' list), so nothing was "
     "changed. Repair or delete the 'admins' row in the dashboard store, then try again."
@@ -2273,17 +2277,20 @@ def create_app(
         value = row.get("value") if isinstance(row, dict) else None
         return value if isinstance(value, dict) else None
 
-    def _read_outline_setting(active_store: Any) -> Any:
-        """Best effort, for display: a store that cannot be read shows the config's answers."""
-        if active_store is None:
-            return None
-        try:
-            return _outline_value(active_store.get_setting(ui_diff.SETTING))
-        except Exception:  # noqa: BLE001 - shown from the config instead
-            return None
-
     def _payload_with_outline(config: Dict[str, Any], stored: Any) -> Dict[str, Any]:
-        return _repository_payload(config, stored, _read_outline_setting(store))
+        """The repository payload with the saved outline choices; a store that
+        cannot be read shows the config's answers and says so."""
+        outline_stored = None
+        unreadable = False
+        if store is not None:
+            try:
+                outline_stored = _outline_value(store.get_setting(ui_diff.SETTING))
+            except Exception:  # noqa: BLE001 - shown from the config instead, with a note
+                unreadable = True
+        payload = _repository_payload(config, stored, outline_stored)
+        if unreadable:
+            payload["error"] = OUTLINE_SETTINGS_UNREADABLE
+        return payload
 
     def _stored_added_entries(active_store: Any) -> List[Any]:
         """The stored ``added`` list exactly as saved, [] when there is no setting.
