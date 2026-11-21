@@ -67,6 +67,17 @@ FAKE_UI_DIFF = textwrap.dedent(
                 outcome = type(exc).__name__
             with record.open("a") as handle:
                 handle.write(json.dumps({"args": ["write"], "write": outcome, "env": {}, "cwd": "", "config": None}) + "\\n")
+        if behaviour.get("relink"):
+            # Swap a symlink on the way to the ui-diff install for one to a forged tool.
+            link, forged = behaviour["relink"]
+            try:
+                os.rename(link, link + ".old")
+                os.symlink(forged, link)
+                outcome = "relinked"
+            except OSError as exc:
+                outcome = type(exc).__name__
+            with record.open("a") as handle:
+                handle.write(json.dumps({"args": ["relink"], "relink": outcome, "env": {}, "cwd": "", "config": None}) + "\\n")
         if behaviour.get("read_secret"):
             try:
                 Path(behaviour["read_secret"]).read_text()
@@ -351,6 +362,73 @@ class SandboxTest(unittest.TestCase):
             self.assertIn(f'(deny file-write* (subpath "{path}"))', profile)
         self.assertNotIn("relative/bin", profile)
 
+    def chain(self, root: Path) -> Path:
+        """``tools/ui-diff.mjs -> shared/ui-links/current/bin/ui-diff.mjs``, ``shared/ui-links -> ui``,
+        ``ui/current -> releases/v1``: three links, one inside another's target."""
+        (root / "ui" / "releases" / "v1" / "bin").mkdir(parents=True)
+        (root / "ui" / "releases" / "v1" / "bin" / "ui-diff.mjs").write_text("")
+        os.symlink("releases/v1", str(root / "ui" / "current"))
+        (root / "shared").mkdir()
+        os.symlink(str(root / "ui"), str(root / "shared" / "ui-links"))
+        (root / "tools").mkdir()
+        os.symlink(str(root / "shared" / "ui-links" / "current" / "bin" / "ui-diff.mjs"), str(root / "tools" / "ui-diff.mjs"))
+        return root / "tools" / "ui-diff.mjs"
+
+    def test_traversal_follows_every_link_one_hop_at_a_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(os.path.realpath(tmp))
+            names = ui_diff._traversed(self.chain(root))
+        expected = [str(root / name) for name in (
+            "tools", "tools/ui-diff.mjs", "shared", "shared/ui-links", "ui", "ui/current",
+            "ui/releases", "ui/releases/v1", "ui/releases/v1/bin", "ui/releases/v1/bin/ui-diff.mjs",
+        )]
+        # The real directories down to the temp root, then each entry in lookup order.
+        down = [str(parent) for parent in reversed(root.parents) if str(parent) != os.sep] + [str(root)]
+        self.assertEqual(names, down + expected)
+
+    def test_every_link_on_the_way_to_what_publish_runs_is_pinned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(os.path.realpath(tmp))
+            config = self.config()
+            config["visual_outline"]["ui_diff"]["command"] = ["/usr/bin/env", str(self.chain(root))]
+            profile = ui_diff.sandbox_profile(config, Path("/srv/rol/config"))
+        for name in ("tools/ui-diff.mjs", "shared", "shared/ui-links", "ui", "ui/current", "ui/releases", "ui/releases/v1"):
+            self.assertIn(f'(deny file-write* (literal "{root / name}"))', profile, name)
+
+    def test_tilde_paths_are_expanded_before_they_are_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(os.path.realpath(tmp))
+            (home / "keys").mkdir()
+            config = self.config(deny=["~/tenants/private"])
+            config["github_app"]["private_key_path"] = "~/keys/app.pem"
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                profile = ui_diff.sandbox_profile(config, Path("/srv/rol/config"))
+                publish = ui_diff.publish_profile(config, Path("/srv/rol/config"))
+        for text in (profile, publish):
+            self.assertIn(f'(deny file-read* file-write* (subpath "{home / "keys"}"))', text)
+        self.assertIn(f'(deny file-write* (literal "{home / "tenants"}"))', profile)
+        self.assertNotIn("~", profile)
+        self.assertNotIn("~", publish)
+
+    def test_a_pinned_entry_inside_a_writable_place_is_refused(self) -> None:
+        # Whatever lies on the way to a protected path must stay out of the run's reach.
+        config = self.config(deny=["/srv/rol/data/work/x/pr-7/link/secret"])
+        with self.assertRaises(ValueError):
+            ui_diff.sandbox_profile(config, Path("/srv/rol/config"), run_dir=Path("/srv/rol/data/work/x/pr-7"))
+
+    def test_without_a_sandbox_a_symlinked_cache_is_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            browsers = root / "preinstalled-browsers"
+            browsers.mkdir()
+            (root / "cache").mkdir()
+            os.symlink(str(browsers), str(root / "cache" / "ms-playwright"))
+            config = {"repositories": [REPO], "visual_outline": {"ui_diff": {"cache_dir": str(root / "cache")}}}
+            cache = ui_diff.prepare_cache(config, root, REPO)
+            self.assertEqual(cache, root / "cache")
+            self.assertTrue(os.path.islink(str(root / "cache" / "ms-playwright")), "the operator's link stays")
+            self.assertTrue((cache / "home").is_dir())
+
     def test_paths_are_quoted(self) -> None:
         profile = ui_diff.sandbox_profile(self.config(deny=['/tmp/a "b"\\c']), Path("/srv/rol/config"))
         self.assertIn('"b\\"', profile)
@@ -446,7 +524,7 @@ class RunStageTest(unittest.TestCase):
         self.assertEqual(run["args"][run["args"].index("--head") + 1], HEAD)
         for name in ("GH_TOKEN", "GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY"):
             self.assertNotIn(name, run["env"], f"run must not see {name}")
-        cache = Path(os.path.realpath(self.tmp / "cache"))
+        cache = self.tmp / "cache"  # no sandbox: the configured path as it is
         self.assertEqual(run["env"]["HOME"], str(cache / "home"))
         self.assertEqual(run["env"]["PLAYWRIGHT_BROWSERS_PATH"], str(cache / "ms-playwright"))
         self.assertEqual(run["env"]["GIT_CONFIG_GLOBAL"], os.devnull)
@@ -714,25 +792,24 @@ class RunStageTest(unittest.TestCase):
         self.source.mkdir(parents=True)
         return config, service
 
+    def fake_sandbox(self) -> Path:
+        """Drops "-p PROFILE" and runs the rest: the argv shape is checked end to end
+        on any platform; the real sandbox is exercised below on macOS."""
+        fake_sandbox = self.tmp / "tools" / "sandbox-exec"
+        fake_sandbox.parent.mkdir(exist_ok=True)
+        fake_sandbox.write_text('#!/bin/sh\nshift 2\nexec "$@"\n')
+        fake_sandbox.chmod(0o755)
+        return fake_sandbox
+
     def test_only_the_run_step_is_sandboxed(self) -> None:
         self.behaviour()
         config, service = self.sandboxed_config(self.tmp / "secret")
-        calls = []
-        real = ui_diff._run_group
-
-        def spy(args, *rest, **kw):
-            calls.append(list(args))
-            return real(args, *rest, **kw)
-
-        fake_sandbox = self.tmp / "tools" / "sandbox-exec"
-        fake_sandbox.parent.mkdir()
-        # Drops "-p PROFILE" and runs the rest: the argv shape is checked here end to
-        # end (the stage reaches publish); the real sandbox is exercised below on macOS.
-        fake_sandbox.write_text('#!/bin/sh\nshift 2\nexec "$@"\n')
-        fake_sandbox.chmod(0o755)
-        with mock.patch.object(ui_diff, "_run_group", spy), mock.patch.object(ui_diff, "SANDBOX_EXEC", str(fake_sandbox)):
+        fake_sandbox = self.fake_sandbox()
+        with mock.patch.object(ui_diff, "_run_group", wraps=ui_diff._run_group) as run_group, \
+                mock.patch.object(ui_diff, "SANDBOX_EXEC", str(fake_sandbox)):
             outcome = ui_diff.run_stage(config, service, self.source, self.artifacts, REPO, _pr(),
                                         lambda env: env, self.logs.append, lambda p, t: p.write_text(t))
+        calls = [list(call.args[0]) for call in run_group.call_args_list]
         self.assertEqual(outcome.status, "ok", outcome.detail)
         self.assertEqual(calls[0][:2], [str(fake_sandbox), "-p"])
         self.assertIn("(deny file-read* file-write*", calls[0][2])
@@ -754,7 +831,6 @@ class RunStageTest(unittest.TestCase):
         repo_cache = ui_diff.repository_cache_root(config, service, REPO)
         repo_cache.parent.mkdir(parents=True)
         os.symlink(str(key_dir), str(repo_cache))
-        os.symlink(str(key_dir), str(self.tmp / "home-link"))
         cache = ui_diff.prepare_cache(config, service, REPO)
         self.assertFalse(os.path.islink(str(repo_cache)), "the planted link was removed")
         self.assertTrue((cache / "home").is_dir())
@@ -770,15 +846,19 @@ class RunStageTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             ui_diff.checked_run_dir(self.tmp / "linked-run")
 
-    def test_the_publish_copy_is_made_outside_the_run_directory(self) -> None:
+    def test_the_publish_copy_is_made_outside_both_places_the_run_may_write(self) -> None:
         self.behaviour()
-        outcome = self.run_stage(_config(self.tmp))
+        config, service = self.sandboxed_config(self.tmp / "secret")
+        with mock.patch.object(ui_diff, "SANDBOX_EXEC", str(self.fake_sandbox())):
+            outcome = ui_diff.run_stage(config, service, self.source, self.artifacts, REPO, _pr(),
+                                        lambda env: env, self.logs.append, lambda p, t: p.write_text(t))
         self.assertEqual(outcome.status, "ok", outcome.detail)
-        _, publish = self.records()
-        workspace = Path(publish["cwd"]).resolve()
-        self.assertFalse(workspace.is_relative_to(self.source.parent.resolve()) and
-                         not workspace.is_relative_to(Path(os.path.realpath(self.tmp / "cache"))),
-                         "publish works where the run step cannot write")
+        publish = next(record for record in self.records() if record["args"][0] == "publish")
+        workspace = Path(os.path.realpath(publish["cwd"]))
+        run_dir = Path(os.path.realpath(self.source.parent))
+        repo_cache = Path(os.path.realpath(ui_diff.repository_cache_root(config, service, REPO)))
+        for granted in (run_dir, repo_cache):
+            self.assertFalse(workspace.is_relative_to(granted), f"publish works inside {granted}")
         self.assertTrue(workspace.is_relative_to(Path(os.path.realpath(self.tmp / "cache")) / "publish"))
 
     def test_a_missing_sandbox_tool_fails_closed(self) -> None:
@@ -827,6 +907,30 @@ class RunStageTest(unittest.TestCase):
         write = next(record for record in self.records() if record["args"] == ["write"])
         self.assertEqual(write["write"], "PermissionError")
         self.assertNotEqual(moved.read_text(), "tampered")
+
+    @unittest.skipUnless(sys.platform == "darwin" and os.access(ui_diff.SANDBOX_EXEC, os.X_OK), "macOS sandbox-exec")
+    def test_the_sandbox_keeps_the_prs_code_from_swapping_a_link_on_the_way_to_publish(self) -> None:
+        # The command reaches the install through a directory symlink; the run
+        # step tries to point that link at a forged tool in its own directory.
+        config, service = self.sandboxed_config(self.tmp / "secret")
+        link = self.tmp / "tool-link"
+        os.symlink(str(self.tmp / "tool"), str(link))
+        settings = config["visual_outline"]["ui_diff"]
+        settings["command"][1] = str(link / Path(settings["command"][1]).name)
+        forged = self.source.parent / "forged"
+        forged.mkdir()
+        (forged / Path(settings["command"][1]).name).write_text(
+            "import json, os\n"
+            "open(os.environ['FAKE_RECORD'], 'a').write(json.dumps({'args': ['forged']}) + '\\n')\n"
+        )
+        (self.tmp / "tool" / "behaviour.json").write_text(json.dumps({"relink": [str(link), str(forged)]}))
+        outcome = ui_diff.run_stage(config, service, self.source, self.artifacts, REPO, _pr(),
+                                    lambda env: env, self.logs.append, lambda p, t: p.write_text(t))
+        self.assertEqual(outcome.status, "ok", outcome.detail)
+        relink = next(record for record in self.records() if record["args"] == ["relink"])
+        self.assertEqual(relink["relink"], "PermissionError")
+        self.assertEqual(os.readlink(str(link)), str(self.tmp / "tool"))
+        self.assertNotIn(["forged"], [record["args"] for record in self.records()], "publish ran the original install")
 
     def test_a_dry_run_never_hands_out_the_credential(self) -> None:
         self.behaviour()

@@ -420,20 +420,55 @@ def _publish_programs(settings: Dict[str, Any], path: str) -> List[str]:
     return programs
 
 
-def _symlink_entries(paths: List[Any]) -> List[str]:
-    """Every symlink on the way to each of ``paths`` (the paths as given, unresolved):
-    replacing one of them redirects the path without touching its target."""
-    links: List[str] = []
-    for raw in paths:
-        text = os.path.abspath(os.path.expanduser(str(raw)))
-        current = Path(os.sep)
-        for part in Path(text).parts[1:]:
-            current = current / part
-            if os.path.islink(str(current)) and str(current) not in links:
-                links.append(str(current))
-                # Keep walking from where the link really leads.
-                current = Path(os.path.realpath(str(current)))
-    return links
+def _expanded(raw: Any) -> str:
+    """A configured path as an absolute name: ``~`` expanded first, never normalised
+    (``..`` after a symlink means the link target's parent, as the kernel walks it)."""
+    text = os.path.expanduser(str(raw))
+    return text if os.path.isabs(text) else os.path.join(os.getcwd(), text)
+
+
+#: Symlinks followed per path before giving up (the kernel's own limit is 32).
+MAX_LINK_HOPS = 40
+
+
+def _traversed(raw: Any) -> List[str]:
+    """Every directory entry the kernel looks up to resolve ``raw``, in order.
+
+    Walked one component at a time, following each symlink one hop at a time
+    into its target: every unresolved directory on the way, every link, every
+    link inside a link's target, and every directory of the final path. Renaming
+    or replacing any one of them redirects ``raw`` without touching what it
+    finally names, so the sandbox pins all of them. Each name is the entry's
+    real location (its parent is a real directory), the way the sandbox sees it.
+    """
+    names: List[str] = []
+    pending = list(Path(_expanded(raw)).parts[1:])
+    current = Path(os.sep)
+    hops = 0
+    while pending:
+        part = pending.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            current = current.parent
+            continue
+        candidate = current / part
+        if str(candidate) not in names:
+            names.append(str(candidate))
+        if not os.path.islink(str(candidate)):
+            current = candidate
+            continue
+        hops += 1
+        if hops > MAX_LINK_HOPS:
+            break
+        target = os.readlink(str(candidate))
+        if os.path.isabs(target):
+            current = Path(os.sep)
+            pending = list(Path(target).parts[1:]) + pending
+        else:
+            # Relative to the directory holding the link: ``current`` already.
+            pending = list(Path(target).parts) + pending
+    return names
 
 
 def _protected_tool_dirs(settings: Dict[str, Any], path: str) -> List[Path]:
@@ -519,6 +554,17 @@ def prepare_cache(config: Dict[str, Any], config_dir: Path, repo: str) -> Path:
     entry replaced by a fresh directory, so neither the next run's environment
     nor its sandbox rules follow it.
     """
+    if not _sandboxed(config):
+        # No sandbox, no PR-writable cache to distrust: the operator's layout as
+        # it is (a cache directory symlinked to preinstalled browsers stays).
+        root = cache_root(config, config_dir)
+        for name in ("home", "npm-cache", "ms-playwright"):
+            (root / name).mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(str(root / name), 0o700)
+            except OSError:
+                pass
+        return root
     root = Path(os.path.realpath(str(cache_root(config, config_dir))))
     root.mkdir(parents=True, exist_ok=True)
     target = repository_cache_root(config, config_dir, repo)
@@ -566,8 +612,9 @@ def _secret_paths(config: Dict[str, Any], config_dir: Path, block: Dict[str, Any
     deny: List[Any] = list(block.get("deny") or [])
     app = config.get("github_app")
     if isinstance(app, dict) and app.get("private_key_path"):
-        # Resolved first: a symlinked key is protected where it really lives.
-        deny.append(Path(os.path.realpath(str(app["private_key_path"]))).parent)
+        # Resolved first (``~`` expanded before that): a symlinked key is
+        # protected where it really lives.
+        deny.append(Path(os.path.realpath(os.path.expanduser(str(app["private_key_path"])))).parent)
     deny.append(service_root / "data" / "dashboard")
     state = Path(os.path.expanduser(str(config.get("state_path") or "data/state.json")))
     deny.append(state if state.is_absolute() else service_root / state)
@@ -610,8 +657,13 @@ def sandbox_profile(
     the ``deny_write`` paths. Then, last (later rules win), reading and writing
     this review's own run directory and this repository's caches.
 
-    ValueError when a protected program sits inside one of those two writable
-    places: the run step could replace it before publish runs it.
+    Every entry the kernel looks up on the way to each denied or protected
+    path, each program publish runs, each PATH entry and the App key is pinned
+    as it is (no rename, no replacement): see ``_traversed``.
+
+    ValueError when a protected program, or an entry on the way to anything
+    pinned, sits inside one of those two writable places: the run step could
+    replace it before publish runs it.
     """
     settings = ui_diff_block(config)
     block = settings.get("sandbox")
@@ -622,8 +674,17 @@ def sandbox_profile(
     deny_write: List[Any] = [service_root] + list(block.get("deny_write") or [])
     # Everything the unsandboxed publish step executes must be out of the run
     # step's reach: the directories on PATH, and every program it starts.
-    tools = _protected_tool_dirs(settings, _run_path(settings, os.environ))
+    run_path = _run_path(settings, os.environ)
+    tools = _protected_tool_dirs(settings, run_path)
     deny_write += tools
+    # Reached by name at publish time: each program and each PATH entry.
+    reached: List[Any] = _publish_programs(settings, run_path) + [
+        entry for entry in run_path.split(os.pathsep) if os.path.isabs(entry)
+    ]
+    app = config.get("github_app")
+    if isinstance(app, dict) and app.get("private_key_path"):
+        # The key as the daemon names it, symlinks and all.
+        reached.append(str(app["private_key_path"]))
     # Granted as checked (checked_run_dir, prepare_cache), never re-resolved:
     # these two are writable by the PR's code, which could have swapped them
     # for a symlink to something denied above.
@@ -636,19 +697,19 @@ def sandbox_profile(
     lines = ["(version 1)", "(allow default)"] + _ESCAPE_RULES
     lines += [f"(deny file-read* file-write* (subpath {_sbpl(path)}))" for path in dict.fromkeys(map(str, deny))]
     lines += [f"(deny file-write* (subpath {_sbpl(path)}))" for path in dict.fromkeys(map(str, deny_write))]
-    # A protected or denied directory could still be swapped through its parent
-    # (renamed away and reached at a new name, a symlink put in its place):
-    # every ancestor entry is pinned, and so is every symlink on the way to it
-    # or to a program publish runs.
+    # A protected or denied path could still be redirected without touching it:
+    # an ancestor renamed away (and reached at its new name), a symlink on the
+    # way replaced. Every entry the kernel looks up to reach each of them, and
+    # each program publish runs and each PATH entry, is pinned (_traversed).
     pinned: List[str] = []
-    for path in dict.fromkeys(map(str, list(deny_write) + list(deny))):
-        for parent in [Path(os.path.realpath(path))] + list(Path(os.path.realpath(path)).parents):
-            if str(parent) != os.sep and str(parent) not in pinned:
-                pinned.append(str(parent))
-    pinned += [link for link in _symlink_entries(
-        list(deny_write) + list(deny) + _publish_programs(settings, _run_path(settings, os.environ))
-        + _run_path(settings, os.environ).split(os.pathsep)
-    ) if link not in pinned]
+    for path in dict.fromkeys(map(str, list(deny_write) + list(deny) + reached)):
+        for name in _traversed(path):
+            if name != os.sep and name not in pinned:
+                pinned.append(name)
+    # Strictly inside: a granted root itself is pinned below as well.
+    inside = [name for name in pinned if any(Path(name) != root and Path(name).is_relative_to(root) for root in allow)]
+    if inside:
+        raise ValueError(f"{inside[0]} (on the way to a protected path) is inside a directory the run step may write")
     lines += [f"(deny file-write* (literal {_quote(path)}))" for path in pinned]
     lines += [f"(allow file-read* file-write* (subpath {_quote(str(path))}))" for path in dict.fromkeys(map(str, allow))]
     # The granted roots themselves (and the clone under the run directory) stay
