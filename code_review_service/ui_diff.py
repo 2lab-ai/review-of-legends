@@ -15,11 +15,15 @@ stock Python 3.9):
   branch and writes the comment markdown, which becomes a section of the
   outline comment. ``run`` starts the PR's own code (its install scripts and dev
   server), so it gets an allowlisted environment without any credential; only
-  ``publish``, which runs ui-diff's own code, gets the GitHub token.
+  ``publish``, which runs ui-diff's own code, gets the GitHub token. With
+  ``visual_outline.ui_diff.container`` set, ``run`` happens inside a Docker
+  container that gets a copy of the clone and nothing else of the host, and
+  only its ``.ui-diff`` output (regular files) comes back.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -27,10 +31,12 @@ import shutil
 import signal
 import stat
 import subprocess
+import tarfile
 import tempfile
 import threading
 import time
-from pathlib import Path
+import uuid
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 #: Dashboard store key of the operator's per-repository choices:
@@ -239,6 +245,9 @@ def validate(config: Dict[str, Any]) -> None:
                 isinstance(path, str) and os.path.isabs(os.path.expanduser(path)) for path in paths
             ):
                 raise ValueError(f"config.visual_outline.ui_diff.sandbox.{key} must be a list of absolute paths")
+    container = settings.get("container")
+    if container is not None:
+        _validate_container(container)
     configs = settings.get("configs")
     if configs is not None:
         if not isinstance(configs, dict):
@@ -248,6 +257,37 @@ def validate(config: Dict[str, Any]) -> None:
                 continue
             if not isinstance(value, dict):
                 raise ValueError(f"config.visual_outline.ui_diff.configs[{name}] must be a ui-diff.config.json object")
+
+
+_CONTAINER_KEYS = ("image", "docker", "command", "memory", "cpus", "shm_size", "pids_limit")
+_IMAGE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:@+-]{0,254}")
+_LIMIT_PATTERN = re.compile(r"[0-9]+(\.[0-9]+)?[bkmgBKMG]?")
+
+
+def _validate_container(container: Any) -> None:
+    where = "config.visual_outline.ui_diff.container"
+    if not isinstance(container, dict):
+        raise ValueError(f"{where} must be an object")
+    for key in container:
+        if not key.startswith("_") and key not in _CONTAINER_KEYS:
+            raise ValueError(f"{where} has an unknown key: {key}")
+    if not isinstance(container.get("image"), str) or not _IMAGE_PATTERN.fullmatch(container["image"]):
+        raise ValueError(f"{where}.image must be an image reference (name[:tag])")
+    docker = container.get("docker")
+    if docker is not None and (not isinstance(docker, str) or not docker.strip()):
+        raise ValueError(f"{where}.docker must be the docker CLI's path or name")
+    command = container.get("command")
+    if command is not None and (
+        not isinstance(command, list) or not command or not all(isinstance(arg, str) and arg for arg in command)
+    ):
+        raise ValueError(f"{where}.command must be a non-empty list of strings")
+    for key in ("memory", "cpus", "shm_size"):
+        value = container.get(key)
+        if value is not None and not _LIMIT_PATTERN.fullmatch(str(value)):
+            raise ValueError(f"{where}.{key} must be a number (memory and shm_size may end in b, k, m or g)")
+    limit = container.get("pids_limit")
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+        raise ValueError(f"{where}.pids_limit must be a positive integer")
 
 
 def validate_stored(value: Any, known_repositories: List[str]) -> Dict[str, Any]:
@@ -1069,7 +1109,9 @@ def _publish_base(env: Dict[str, str], workspace: Path) -> Dict[str, str]:
 
 
 def _publish_parent(config: Dict[str, Any], config_dir: Path) -> Path:
-    parent = Path(os.path.realpath(str(cache_root(config, config_dir)))) / "publish"
+    root = Path(os.path.realpath(str(cache_root(config, config_dir))))
+    root.mkdir(parents=True, exist_ok=True)
+    parent = root / "publish"
     _plain_dir(parent, repair=True)
     return parent
 
@@ -1128,6 +1170,280 @@ def publish_workspace(
         shutil.rmtree(str(workspace), ignore_errors=True)
         raise
     return workspace
+
+
+#: Where the clone goes and what runs, inside the image (container/ui-diff/Dockerfile).
+CONTAINER_WORK = "/work"
+CONTAINER_COMMAND = ["node", "/opt/ui-diff/skills/ui-diff/bin/ui-diff.mjs"]
+#: How long copying the clone in or the result out may take.
+CONTAINER_COPY_TIMEOUT_SECONDS = 600
+
+
+def container_settings(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """``visual_outline.ui_diff.container`` when set: run inside Docker."""
+    block = ui_diff_block(config).get("container")
+    return block if isinstance(block, dict) else None
+
+
+def _docker_environ() -> Dict[str, str]:
+    """The docker CLI's own environment (host side, trusted): PATH, HOME, the locale and DOCKER_*."""
+    env = {"PATH": _run_path({}, os.environ)}
+    for name, value in os.environ.items():
+        if name in ("HOME", "LANG") or name.startswith("DOCKER_"):
+            env[name] = value
+    return env
+
+
+def container_volume(repo: str) -> str:
+    """The Docker volume holding one repository's caches (npm, HOME): never shared
+    across repositories. Readable name, plus a digest of ``owner/name`` so two
+    repositories whose cleaned names coincide never share one."""
+    key = _repo_key(repo)
+    owner, _, name = key.partition("/")
+    clean = [re.sub(r"[^a-z0-9_.]", "_", part)[:40] for part in (owner, name)]
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+    return "rol-ui-diff-" + "-".join(clean) + "-" + digest
+
+
+_COPY_NAME = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def container_create_args(
+    config: Dict[str, Any], repo: str, name: str, base_sha: str, head_sha: str, clone: str = "source"
+) -> List[str]:
+    """``docker create`` for one run: no host path mounted, no capability, no new
+    privileges, this repository's cache volume only; the image's ui-diff runs
+    ``run`` on the copy of the clone at /work/<clone>."""
+    block = container_settings(config) or {}
+    workdir = f"{CONTAINER_WORK}/{clone}"
+    settings = ui_diff_block(config)
+    args = [
+        str(block.get("docker") or "docker"), "create", "--name", name, "--init",
+        "--label", "review-of-legends.ui-diff=1",
+        "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+        # Not root: the daemon's own ids, which own the copied clone (docker cp
+        # keeps them), so the run can write it and git trusts it.
+        "--user", f"{os.getuid()}:{os.getgid()}",
+        "--pids-limit", str(block.get("pids_limit") or 4096),
+        # Chromium keeps its frames in /dev/shm; Docker's 64 MB default makes
+        # screenshots of long pages fail ("Unable to capture screenshot").
+        "--shm-size", str(block.get("shm_size") or "1g"),
+        "-v", f"{container_volume(repo)}:/cache",
+        "-w", workdir,
+    ]
+    if block.get("memory") is not None:
+        args += ["--memory", str(block["memory"])]
+    if block.get("cpus") is not None:
+        args += ["--cpus", str(block["cpus"])]
+    env = {
+        "HOME": "/cache/home",
+        "npm_config_cache": "/cache/npm",
+        "CI": "1",
+        "NO_COLOR": "1",
+        "LANG": "C.UTF-8",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    env.update({str(key): str(value) for key, value in (settings.get("env") or {}).items()})
+    for key, value in env.items():
+        args += ["-e", f"{key}={value}"]
+    command = [str(arg) for arg in block.get("command") or CONTAINER_COMMAND]
+    return args + [str(block["image"]), "sh", "-c", 'mkdir -p "$HOME" && exec "$@"', "sh"] + command + [
+        "run", "--config", f"{workdir}/{CONFIG_FILENAME}",
+        "--base", base_sha, "--head", head_sha, "--out", f"{workdir}/.ui-diff",
+    ]
+
+
+def extract_output(archive: Path, dest: Path) -> int:
+    """The run's ``.ui-diff`` from ``docker cp``'s tar stream into ``dest`` (a fresh
+    directory): regular files only, each under ``dest``, within the publish caps.
+    Links, devices, absolute names and ``..`` are dropped; nothing is ever
+    followed. Returns the number of files written."""
+    total = 0
+    count = 0
+    with tarfile.open(str(archive), mode="r:") as stream:
+        for member in stream:
+            if not member.isreg():
+                continue
+            parts = PurePosixPath(member.name).parts
+            # docker cp roots the stream at the copied directory's own name.
+            if len(parts) < 2 or parts[0] != ".ui-diff" or any(part in ("", ".", "..") for part in parts[1:]):
+                continue
+            if member.size > MAX_PUBLISH_FILE_BYTES:
+                continue
+            total += member.size
+            count += 1
+            if total > MAX_PUBLISH_TOTAL_BYTES or count > MAX_PUBLISH_FILES:
+                raise ValueError(
+                    f".ui-diff holds more than {MAX_PUBLISH_FILES} files or "
+                    f"{MAX_PUBLISH_TOTAL_BYTES // (1024 * 1024)} MiB"
+                )
+            target = dest.joinpath(*parts[1:])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = stream.extractfile(member)
+            if source is None:
+                continue
+            fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            with os.fdopen(fd, "wb") as handle, source:
+                shutil.copyfileobj(source, handle)
+    return count
+
+
+#: Tar headers and padding on top of the publish caps, for the output stream.
+MAX_ARCHIVE_SLACK_BYTES = 64 * 1024 * 1024
+
+
+def _copy_out(args: List[str], env: Dict[str, str], archive: Path, limit: int, timeout: int) -> Tuple[int, str]:
+    """Run ``args`` (``docker cp … -``) into ``archive``, never more than ``limit``
+    bytes on the host: past it the copy is killed, and a watchdog kills it at
+    ``timeout`` even while a read waits on a stalled stream. ``(exit, detail)``."""
+    with tempfile.TemporaryFile() as err_file, archive.open("wb") as handle:
+        proc = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err_file)
+        expired = threading.Event()
+
+        def expire() -> None:
+            expired.set()
+            proc.kill()
+
+        watchdog = threading.Timer(timeout, expire)
+        watchdog.daemon = True
+        watchdog.start()
+        written = 0
+        too_big = False
+        try:
+            assert proc.stdout is not None
+            while True:
+                chunk = proc.stdout.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > limit:
+                    too_big = True
+                    proc.kill()
+                    break
+                handle.write(chunk)
+        finally:
+            watchdog.cancel()
+            if proc.stdout is not None:
+                proc.stdout.close()
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+        err = _tail(err_file)
+    if too_big:
+        return 1, f"the output is larger than {limit // (1024 * 1024)} MiB"
+    if expired.is_set():
+        return 1, f"timed out after {timeout} seconds"
+    return proc.returncode, err[-2000:]
+
+
+def run_in_container(
+    config: Dict[str, Any],
+    repo: str,
+    source: Path,
+    scratch: Path,
+    base_sha: str,
+    head_sha: str,
+    timeout: int,
+    cancel: Optional[threading.Event] = None,
+) -> Tuple[Optional[int], str, str, Path]:
+    """``ui-diff run`` in a fresh container on a copy of ``source``; its output comes
+    back to ``scratch/out``. ``(exit, stdout, stderr, out_dir)``, exit None when
+    stopped. The container is removed whatever happens."""
+    block = container_settings(config) or {}
+    docker = str(block.get("docker") or "docker")
+    if not _COPY_NAME.fullmatch(source.name) or ":" in str(source):
+        # docker cp reads "x:y" as a container path.
+        raise ValueError(f"the clone's path cannot be handed to docker cp: {source}")
+    env = _docker_environ()
+    name = "rol-ui-diff-" + uuid.uuid4().hex[:16]
+    out_dir = scratch / "out"
+    out_dir.mkdir(mode=0o700)
+    try:
+        code, stdout, stderr = _container_steps(config, repo, source, scratch, base_sha, head_sha, timeout, cancel,
+                                                docker, env, name, out_dir)
+    finally:
+        # Also stops it: a docker CLI killed on timeout leaves its container running.
+        left = _remove_container(docker, env, name)
+    if left:
+        stderr += f"\n(the container {name} could not be removed: {left}; remove it with docker rm -f {name})"
+    return code, stdout, stderr, out_dir
+
+
+def _remove_container(docker: str, env: Dict[str, str], name: str) -> str:
+    """``docker rm -f``; empty when gone, otherwise why not."""
+    try:
+        removed = subprocess.run([docker, "rm", "-f", name], env=env, capture_output=True, text=True, timeout=120,
+                                 check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"{exc.__class__.__name__}: {exc}"
+    return "" if removed.returncode == 0 else _one_line(removed.stderr or f"exit {removed.returncode}")
+
+
+def _container_steps(
+    config: Dict[str, Any],
+    repo: str,
+    source: Path,
+    scratch: Path,
+    base_sha: str,
+    head_sha: str,
+    timeout: int,
+    cancel: Optional[threading.Event],
+    docker: str,
+    env: Dict[str, str],
+    name: str,
+    out_dir: Path,
+) -> Tuple[Optional[int], str, str]:
+    """create, copy in, start, copy out: ``run_in_container`` without the removal."""
+    created = subprocess.run(
+        container_create_args(config, repo, name, base_sha, head_sha, clone=source.name),
+        env=env, capture_output=True, text=True, timeout=120, check=False,
+    )
+    if created.returncode != 0:
+        return created.returncode, created.stdout, "docker create failed: " + created.stderr
+    # The clone directory itself (its owner kept, so the run may write it),
+    # symlinks copied as links (never followed on the host).
+    code, stdout, stderr = _run_group(
+        # -a: keep the clone's uid/gid, which the run's --user matches.
+        [docker, "cp", "-a", str(source), f"{name}:{CONTAINER_WORK}/"], scratch, env,
+        CONTAINER_COPY_TIMEOUT_SECONDS, cancel,
+    )
+    if code != 0:
+        return code, stdout, "copying the clone into the container failed: " + stderr
+    code, stdout, stderr = _run_group([docker, "start", "-a", name], scratch, env, timeout, cancel)
+    if code != 0:
+        return code, stdout, stderr
+    archive = scratch / "out.tar"
+    returncode, detail = _copy_out(
+        [docker, "cp", f"{name}:{CONTAINER_WORK}/{source.name}/.ui-diff", "-"], env, archive,
+        MAX_PUBLISH_TOTAL_BYTES + MAX_ARCHIVE_SLACK_BYTES, CONTAINER_COPY_TIMEOUT_SECONDS,
+    )
+    if returncode != 0:
+        return returncode, stdout, stderr + "\ncopying the result out of the container failed: " + detail
+    extract_output(archive, out_dir)
+    archive.unlink()
+    return code, stdout, stderr
+
+
+def host_environ(settings: Dict[str, Any], source: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """The host-side environment of the publish step when ``run`` happens in a container."""
+    source = os.environ if source is None else source
+    env = {
+        "PATH": _run_path(settings, source),
+        "LANG": source.get("LANG") or "en_US.UTF-8",
+        "TMPDIR": source.get("TMPDIR") or "/tmp",
+        "CI": "1",
+        "NO_COLOR": "1",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    for name, value in (settings.get("env") or {}).items():
+        env[str(name)] = str(value)
+    return env
 
 
 def run_stage(
@@ -1189,13 +1505,19 @@ def run_stage(
             "no ui-diff config",
         )
     command = [str(arg) for arg in settings.get("command") or []]
+    container = container_settings(config)
     out_dir = Path(source_dir) / ".ui-diff"
     try:
-        cache = prepare_cache(config, config_dir, repo)
         run_dir = checked_run_dir(Path(source_dir).parent)
         source = run_dir / Path(source_dir).name
         _plain_dir(source, repair=False)
-        env = run_environ(config, config_dir, repo=repo, cache=cache)
+        if container is None:
+            cache: Optional[Path] = prepare_cache(config, config_dir, repo)
+            env = run_environ(config, config_dir, repo=repo, cache=cache)
+        else:
+            # The PR's code runs in the container; the host runs only publish.
+            cache = None
+            env = host_environ(settings)
     except (OSError, ValueError) as exc:
         reason = _one_line(f"the sandbox would not protect what publish runs: {exc}")
         return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
@@ -1214,17 +1536,24 @@ def run_stage(
         reason = _one_line(f"could not make the UI diff's temp directory: {exc}")
         return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
     try:
-        try:
-            profile = sandbox_profile(config, config_dir, source=source, scratch=Path(run_tmp), repo=repo, cache=cache)
-        except (OSError, ValueError) as exc:
-            reason = _one_line(f"the sandbox would not protect what publish runs: {exc}")
-            return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
-        if profile is not None and not os.access(SANDBOX_EXEC, os.X_OK):
-            # Fail closed: a deployment that asked for the sandbox never runs the PR's code without it.
+        profile: Optional[str] = None
+        if container is None:
+            try:
+                profile = sandbox_profile(
+                    config, config_dir, source=source, scratch=Path(run_tmp), repo=repo, cache=cache
+                )
+            except (OSError, ValueError) as exc:
+                reason = _one_line(f"the sandbox would not protect what publish runs: {exc}")
+                return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
+        # Publish is sandboxed too when a sandbox is set, container or not.
+        published_profile = publish_profile(
+            config, config_dir, _publish_parent(config, config_dir) if _sandboxed(config) else None
+        )
+        if (profile is not None or published_profile is not None) and not os.access(SANDBOX_EXEC, os.X_OK):
+            # Fail closed: a deployment that asked for the sandbox never runs without it.
             reason = f"visual_outline.ui_diff.sandbox is set but {SANDBOX_EXEC} is not available on this host"
             return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
         run_prefix = [SANDBOX_EXEC, "-p", profile] if profile is not None else []
-        published_profile = publish_profile(config, config_dir, _publish_parent(config, config_dir) if profile else None)
         publish_prefix = [SANDBOX_EXEC, "-p", published_profile] if published_profile is not None else []
         env["TMPDIR"] = run_tmp
         timeout = int(settings.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS)
@@ -1238,14 +1567,23 @@ def run_stage(
             return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
         try:
             log(f"{repo} pr #{number}: ui-diff capturing base {base_sha[:12]} and head {head_sha[:12]}")
-            run_args = run_prefix + command + [
-                "run", "--config", str(config_path), "--base", base_sha, "--head", head_sha, "--out", str(out_dir),
-            ]
-            code, stdout, stderr = _run_group(
-                # Only the run's own temp directory: the reviewer agents work in the
-                # clone at the same time, and must never be swept with it.
-                run_args, Path(source_dir), env, timeout, cancel, sweep=[run_tmp]
-            )
+            if container is None:
+                run_args = run_prefix + command + [
+                    "run", "--config", str(config_path), "--base", base_sha, "--head", head_sha, "--out", str(out_dir),
+                ]
+                code, stdout, stderr = _run_group(
+                    # Only the run's own temp directory: the reviewer agents work in the
+                    # clone at the same time, and must never be swept with it.
+                    run_args, Path(source_dir), env, timeout, cancel, sweep=[run_tmp]
+                )
+            else:
+                try:
+                    code, stdout, stderr, out_dir = run_in_container(
+                        config, repo, source, Path(run_tmp), base_sha, head_sha, timeout, cancel
+                    )
+                except (OSError, ValueError, subprocess.SubprocessError, tarfile.TarError) as exc:
+                    reason = _one_line(f"the UI diff container failed: {exc.__class__.__name__}: {exc}")
+                    return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
             write_text(artifact_dir / "ui-diff.run.stdout.txt", stdout)
             write_text(artifact_dir / "ui-diff.run.stderr.txt", stderr)
             if code != 0:
@@ -1330,17 +1668,22 @@ def run_stage(
 
 #: The common parent of every run's temp directory, directly under /tmp so the
 #: paths stay short; the sandbox denies it and grants each run its own child.
+#: One per daemon user (``rol-ud-<uid>``): another account cannot own it.
 SCRATCH_PARENT = "rol-ud"
 
 
 def scratch_root() -> Path:
-    """``/tmp/rol-ud`` (``/private/tmp/rol-ud`` on macOS) as a checked plain
-    directory of mode 0700, short enough for any socket a browser puts under a
-    run's TMPDIR; the configured temp directory when /tmp cannot take it."""
+    """``/tmp/rol-ud-<uid>`` (``/private/tmp/…`` on macOS) as a checked plain
+    directory this user owns, mode 0700, short enough for any socket a browser
+    puts under a run's TMPDIR; the configured temp directory when /tmp cannot
+    give one (read-only, or the name taken by another account)."""
     for base in ("/tmp", tempfile.gettempdir()):
-        root = Path(os.path.realpath(base)) / SCRATCH_PARENT
+        root = Path(os.path.realpath(base)) / f"{SCRATCH_PARENT}-{os.getuid()}"
         try:
             _plain_dir(root, repair=True)
+            info = os.lstat(str(root))
+            if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                raise ValueError(f"{root} is not this user's private directory")
             return root
         except (OSError, ValueError):
             continue

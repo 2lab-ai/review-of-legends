@@ -730,10 +730,11 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   block; remote, branch, repository and image link base
   are passed on the command line, so a repository's config cannot point the upload anywhere else
   or allow a public upload.
-- **Trust.** This is still the PR's code running on the review host as the daemon's user, without
-  a sandbox: it can read whatever that user can, the App key included. Turn the UI diff on only
+- **Trust.** Without `container` (below) this is the PR's code running on the review host as the
+  daemon's user: it can read whatever that user can, the App key and other processes' environment
+  included (the macOS sandbox below narrows files, not that). Turn the UI diff on that way only
   for private repositories whose PR authors you already trust with that host (as with a
-  self-hosted CI runner). Only a head that GitHub places in the repository itself runs (by
+  self-hosted CI runner); otherwise use `container`. Only a head that GitHub places in the repository itself runs (by
   repository id when GitHub sends both): a fork's PR, or one whose fork was deleted, never does.
   `once --dry-run` renders the section text-only and pushes nothing.
 - **Sandbox (macOS).** With `visual_outline.ui_diff.sandbox` set, the run step runs under
@@ -776,6 +777,25 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   KERN_PROCARGS2`) and the sandbox has no rule for it. On a host where processes of the daemon's
   user carry secrets in their environment (other services' tokens and keys), the PR's code can
   read them: run the daemon as a user whose processes hold none, or keep the UI diff off there.
+- **Container (Docker, recommended).** With `visual_outline.ui_diff.container` set, the run step
+  happens in a fresh Docker container per run instead of on the host: `docker create` (no host
+  path mounted, the Docker socket never, `--cap-drop ALL`, `--security-opt no-new-privileges`, a
+  PID limit, optional `memory`/`cpus`, and one Docker volume per repository at `/cache` for its
+  npm cache and `HOME`), `docker cp` of the clone's contents to `/work/source` (symlinks copied as
+  links), `docker start -a`, then `docker cp` of `/work/source/.ui-diff` back as a tar stream, of
+  which only regular files under `.ui-diff` are written on the host (links, devices, absolute names
+  and `..` dropped, the publish size caps applied); `docker rm -f` removes the container whatever
+  happened, a timeout or a cancel included. The PR's code then sees none of the host's files or
+  processes. It still has the network (the install needs it), which on Docker Desktop includes
+  the host's own ports through `host.docker.internal`. Publish runs on the host as before (under
+  the publish profile when `sandbox` is also set). The image is built from
+  `container/ui-diff/Dockerfile` (Playwright's browsers, git, CJK fonts and ui-diff at a pinned
+  commit): `docker build -t rol-ui-diff:<commit> container/ui-diff`. Keys: `image` (required),
+  `docker` (the CLI, default `docker` on `PATH`; on macOS usually
+  `/Applications/Docker.app/Contents/Resources/bin/docker`), `command` (in the image, default
+  `["node", "/opt/ui-diff/skills/ui-diff/bin/ui-diff.mjs"]`), `memory`, `cpus`, `shm_size`
+  (Chromium's `/dev/shm`, default `1g`; Docker's 64 MB fails long screenshots), `pids_limit`
+  (default 4096). The host-side `command` is still needed: publish runs it.
 - **Pushing needs Contents: write.** The default App has Contents: read; without write, the push is
   refused (ui-diff exits 3) and the section is posted text-only (changed captures, percentages,
   summary) with a note saying why. `upload: false` posts text-only on purpose.
@@ -800,7 +820,7 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   `max_concurrent` (ui-diff runs at once across reviews, default 1; a change takes effect after a
   restart), `assets_branch` (default
   `ui-diff-assets`), `upload` (default `true`), `sandbox` (`{"deny": [...], "deny_write": [...]}`,
-  absolute paths; see above).
+  absolute paths; see above), `container` (see above).
 - **Install** ui-diff once on the host, at a pinned commit, outside the deployed tree:
   `git clone https://github.com/imuratalpay/ui-diff.git /opt/ui-diff && git -C /opt/ui-diff checkout
   --detach <commit>`, then with the same `HOME`/`npm_config_cache`/`PLAYWRIGHT_BROWSERS_PATH` as
