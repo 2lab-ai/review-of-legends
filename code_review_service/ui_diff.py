@@ -263,11 +263,9 @@ def strip_section(body: str) -> str:
         text = (text[:start].rstrip() + "\n" + text[end + len(SECTION_END):].lstrip("\n")).rstrip() + "\n"
 
 
-def merge_section(body: str, section: Optional[str]) -> str:
+def merge_section(body: str, section: str) -> str:
     """The outline comment with ``section`` as its only UI diff section (at the end)."""
     base = strip_section(body).rstrip()
-    if not section:
-        return base + "\n"
     merged = f"{base}\n\n{section.strip()}\n"
     if len(merged) <= MAX_COMMENT_CHARS:
         return merged
@@ -485,6 +483,8 @@ def _kill_groups(groups: List[int], sig: int) -> None:
 
 #: How often a running ui-diff is checked: its descendants recorded, a cancel noticed.
 POLL_SECONDS = 2.0
+#: How long ui-diff gets after SIGTERM to stop its own servers, before SIGKILL.
+TERM_GRACE_SECONDS = 20.0
 
 
 def _run_group(
@@ -533,7 +533,7 @@ def _run_group(
             groups += [group for group in _descendant_groups(proc.pid) if group not in groups]
             _kill_groups([proc.pid], signal.SIGTERM)
             try:
-                proc.wait(timeout=20)
+                proc.wait(timeout=TERM_GRACE_SECONDS)
             except subprocess.TimeoutExpired:
                 groups += [group for group in _descendant_groups(proc.pid) if group not in groups]
                 _kill_groups([proc.pid], signal.SIGKILL)
@@ -646,6 +646,9 @@ def _harden_git(env: Dict[str, str]) -> Dict[str, str]:
 
 #: A file in .ui-diff larger than this is not copied for publishing (a screenshot never is).
 MAX_PUBLISH_FILE_BYTES = 64 * 1024 * 1024
+#: ... and the whole copy stays under these (a real run is a few dozen images).
+MAX_PUBLISH_TOTAL_BYTES = 1024 * 1024 * 1024
+MAX_PUBLISH_FILES = 5000
 
 
 def publish_workspace(out_dir: Path, settings: Dict[str, Any], env: Dict[str, str]) -> Path:
@@ -668,6 +671,12 @@ def publish_workspace(out_dir: Path, settings: Dict[str, Any], env: Dict[str, st
             raise OSError(f"git init failed: {init.stderr.strip()[:200]}")
         target = workspace / ".ui-diff"
         source = Path(out_dir)
+        # os.walk follows a symlink given as its top, whatever followlinks says.
+        root = os.lstat(str(source))
+        if not stat.S_ISDIR(root.st_mode):
+            raise ValueError(".ui-diff is not a plain directory")
+        total = 0
+        count = 0
         for directory, subdirs, files in os.walk(str(source), followlinks=False):
             relative = Path(directory).relative_to(source)
             (target / relative).mkdir(parents=True, exist_ok=True)
@@ -680,6 +689,13 @@ def publish_workspace(out_dir: Path, settings: Dict[str, Any], env: Dict[str, st
                     continue
                 if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_PUBLISH_FILE_BYTES:
                     continue
+                total += info.st_size
+                count += 1
+                if total > MAX_PUBLISH_TOTAL_BYTES or count > MAX_PUBLISH_FILES:
+                    raise ValueError(
+                        f".ui-diff holds more than {MAX_PUBLISH_FILES} files or "
+                        f"{MAX_PUBLISH_TOTAL_BYTES // (1024 * 1024)} MiB"
+                    )
                 shutil.copyfile(path, str(target / relative / name), follow_symlinks=False)
         copied = {key: value for key, value in settings.items() if key != "publish"}
         (workspace / CONFIG_FILENAME).write_text(json.dumps(copied, indent=2) + "\n", encoding="utf-8")
@@ -744,136 +760,110 @@ def run_stage(
     out_dir = Path(source_dir) / ".ui-diff"
     env = run_environ(config, config_dir)
     # A private temp directory per run: ui-diff's worktrees land in it, so every
-    # process this run started works under it (or the clone) and can be found.
+    # install and dev server this run started works under it and can be found.
+    # mkdtemp + rmtree(ignore_errors), not TemporaryDirectory: on Python 3.9 its
+    # cleanup raises on a file an install left read-only, which would turn a
+    # finished UI diff into a failure.
     run_tmp = tempfile.mkdtemp(prefix="rol-ui-diff-run-")
-    env["TMPDIR"] = run_tmp
     try:
-        return _run_stage_in(
-            settings, command, env, run_tmp, config_path, config_source, config_settings, out_dir,
-            source_dir, artifact_dir, repo, number, base_sha, head_sha, publish_env, log, write_text,
-            clock, started, upload, cancel,
-        )
+        env["TMPDIR"] = run_tmp
+        timeout = int(settings.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS)
+        publish_timeout = int(settings.get("publish_timeout_seconds") or DEFAULT_PUBLISH_TIMEOUT_SECONDS)
+        slots = _slots(int(settings.get("max_concurrent") or 1))
+        log(f"{repo} pr #{number}: ui-diff waiting for a slot ({config_source} config)")
+        # Bounded, so join_timeout always covers the wait plus this run: a review
+        # never removes its clone under a UI diff that started late.
+        if not _acquire(slots, _run_budget(settings), cancel):
+            reason = "other UI diffs kept every slot busy for the whole wait; the next head tries again"
+            return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
+        try:
+            log(f"{repo} pr #{number}: ui-diff capturing base {base_sha[:12]} and head {head_sha[:12]}")
+            run_args = command + [
+                "run", "--config", str(config_path), "--base", base_sha, "--head", head_sha, "--out", str(out_dir),
+            ]
+            code, stdout, stderr = _run_group(
+                # Only the run's own temp directory: the reviewer agents work in the
+                # clone at the same time, and must never be swept with it.
+                run_args, Path(source_dir), env, timeout, cancel, sweep=[run_tmp]
+            )
+            write_text(artifact_dir / "ui-diff.run.stdout.txt", stdout)
+            write_text(artifact_dir / "ui-diff.run.stderr.txt", stderr)
+            if code != 0:
+                reason = _failure_reason(code, stdout, stderr, timeout, cancel)
+                return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
+            notes: List[str] = []
+            branch = str(settings.get("assets_branch") or DEFAULT_ASSETS_BRANCH)
+            try:
+                workspace = publish_workspace(out_dir, config_settings, env)
+            except (OSError, ValueError) as exc:
+                reason = _one_line(f"could not prepare the publish step: {exc}")
+                return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
+            published = workspace / ".ui-diff"
+            publish_args = command + [
+                "publish", "--config", str(workspace / CONFIG_FILENAME), "--out", str(published), "--pr", str(number),
+                "--no-comment",
+                # Pinned here so a repository's own config cannot point the upload
+                # (and the credential) or the image links anywhere else.
+                "--repo", repo, "--remote", f"https://github.com/{repo}.git", "--branch", branch,
+                "--link-base", f"https://github.com/{repo}/raw/{branch}",
+            ]
+            try:
+                status = "ok"
+                if not upload:
+                    status = "text-only"
+                    notes.append("Dry run: screenshots were not uploaded.")
+                elif settings.get("upload", True):
+                    code, stdout, stderr = _run_group(
+                        publish_args, workspace, _harden_git(publish_env(dict(env))), publish_timeout, cancel,
+                        sweep=[str(workspace)],
+                    )
+                    write_text(artifact_dir / "ui-diff.publish.stdout.txt", stdout)
+                    write_text(artifact_dir / "ui-diff.publish.stderr.txt", stderr)
+                    if code != 0:
+                        reason = _failure_reason(code, stdout, stderr, publish_timeout, cancel)
+                        if code == EXIT_GIT_ACCESS:
+                            reason = (
+                                f"the GitHub App could not push to the {branch} branch of {repo} "
+                                f"(it needs the Contents: write permission; ui-diff said: {reason})"
+                            )
+                        notes.append(f"Screenshots were not uploaded: {reason}.")
+                        status = "text-only"
+                else:
+                    status = "text-only"
+                    notes.append("Screenshots are not uploaded on this deployment (visual_outline.ui_diff.upload is off).")
+                if status == "text-only":
+                    code, stdout, stderr = _run_group(
+                        publish_args + ["--no-upload"], workspace, _harden_git(env), publish_timeout, cancel,
+                        sweep=[str(workspace)],
+                    )
+                    write_text(artifact_dir / "ui-diff.render.stderr.txt", stderr)
+                    if code != 0:
+                        reason = _failure_reason(code, stdout, stderr, publish_timeout, cancel)
+                        return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
+                try:
+                    markdown = (published / "comment.md").read_text(encoding="utf-8")
+                except OSError as exc:
+                    reason = f"ui-diff wrote no comment ({exc.__class__.__name__})"
+                    return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
+                report = published / "report.json"
+                if report.is_file():
+                    try:
+                        write_text(artifact_dir / "ui-diff.report.json", report.read_text(encoding="utf-8"))
+                    except OSError:
+                        pass
+            finally:
+                shutil.rmtree(str(workspace), ignore_errors=True)
+        finally:
+            slots.release()
+        write_text(artifact_dir / "ui-diff.comment.md", markdown)
+        section = build_section(markdown, notes, head_sha, clock() - started)
+        return Outcome(section, status, "; ".join(notes))
     finally:
         shutil.rmtree(run_tmp, ignore_errors=True)
 
 
-def _run_stage_in(
-    settings: Dict[str, Any],
-    command: List[str],
-    env: Dict[str, str],
-    run_tmp: str,
-    config_path: Path,
-    config_source: str,
-    config_settings: Dict[str, Any],
-    out_dir: Path,
-    source_dir: Path,
-    artifact_dir: Path,
-    repo: str,
-    number: int,
-    base_sha: str,
-    head_sha: str,
-    publish_env: Callable[[Dict[str, str]], Dict[str, str]],
-    log: Callable[[str], None],
-    write_text: Callable[[Path, str], None],
-    clock: Callable[[], float],
-    started: float,
-    upload: bool,
-    cancel: Optional[threading.Event],
-) -> Outcome:
-    """run_stage after its checks: capture, then publish (see run_stage)."""
-    timeout = int(settings.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS)
-    publish_timeout = int(settings.get("publish_timeout_seconds") or DEFAULT_PUBLISH_TIMEOUT_SECONDS)
-    slots = _slots(int(settings.get("max_concurrent") or 1))
-    log(f"{repo} pr #{number}: ui-diff waiting for a slot ({config_source} config)")
-    # Bounded, so join_timeout always covers the wait plus this run: a review
-    # never removes its clone under a UI diff that started late.
-    if not _acquire(slots, _run_budget(settings), cancel):
-        reason = "other UI diffs kept every slot busy for the whole wait; the next head tries again"
-        return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
-    try:
-        log(f"{repo} pr #{number}: ui-diff capturing base {base_sha[:12]} and head {head_sha[:12]}")
-        run_args = command + [
-            "run", "--config", str(config_path), "--base", base_sha, "--head", head_sha, "--out", str(out_dir),
-        ]
-        code, stdout, stderr = _run_group(
-            run_args, Path(source_dir), env, timeout, cancel, sweep=[run_tmp, str(source_dir)]
-        )
-        write_text(artifact_dir / "ui-diff.run.stdout.txt", stdout)
-        write_text(artifact_dir / "ui-diff.run.stderr.txt", stderr)
-        if code != 0:
-            reason = _failure_reason(code, stdout, stderr, timeout, cancel)
-            return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
-        notes: List[str] = []
-        branch = str(settings.get("assets_branch") or DEFAULT_ASSETS_BRANCH)
-        try:
-            workspace = publish_workspace(out_dir, config_settings, env)
-        except (OSError, ValueError) as exc:
-            reason = _one_line(f"could not prepare the publish step: {exc}")
-            return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
-        published = workspace / ".ui-diff"
-        publish_args = command + [
-            "publish", "--config", str(workspace / CONFIG_FILENAME), "--out", str(published), "--pr", str(number),
-            "--no-comment",
-            # Pinned here so a repository's own config cannot point the upload
-            # (and the credential) or the image links anywhere else.
-            "--repo", repo, "--remote", f"https://github.com/{repo}.git", "--branch", branch,
-            "--link-base", f"https://github.com/{repo}/raw/{branch}",
-        ]
-        try:
-            status = "ok"
-            if not upload:
-                status = "text-only"
-                notes.append("Dry run: screenshots were not uploaded.")
-            elif settings.get("upload", True):
-                code, stdout, stderr = _run_group(
-                    publish_args, workspace, _harden_git(publish_env(dict(env))), publish_timeout, cancel,
-                    sweep=[str(workspace)],
-                )
-                write_text(artifact_dir / "ui-diff.publish.stdout.txt", stdout)
-                write_text(artifact_dir / "ui-diff.publish.stderr.txt", stderr)
-                if code != 0:
-                    reason = _failure_reason(code, stdout, stderr, publish_timeout, cancel)
-                    if code == EXIT_GIT_ACCESS:
-                        reason = (
-                            f"the GitHub App could not push to the {branch} branch of {repo} "
-                            "(it needs the Contents: write permission)"
-                        )
-                    notes.append(f"Screenshots were not uploaded: {reason}.")
-                    status = "text-only"
-            else:
-                status = "text-only"
-                notes.append("Screenshots are not uploaded on this deployment (visual_outline.ui_diff.upload is off).")
-            if status == "text-only":
-                code, stdout, stderr = _run_group(
-                    publish_args + ["--no-upload"], workspace, _harden_git(env), publish_timeout, cancel,
-                    sweep=[str(workspace)],
-                )
-                write_text(artifact_dir / "ui-diff.render.stderr.txt", stderr)
-                if code != 0:
-                    reason = _failure_reason(code, stdout, stderr, publish_timeout, cancel)
-                    return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
-            try:
-                markdown = (published / "comment.md").read_text(encoding="utf-8")
-            except OSError as exc:
-                reason = f"ui-diff wrote no comment ({exc.__class__.__name__})"
-                return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
-            report = published / "report.json"
-            if report.is_file():
-                try:
-                    write_text(artifact_dir / "ui-diff.report.json", report.read_text(encoding="utf-8"))
-                except OSError:
-                    pass
-        finally:
-            shutil.rmtree(str(workspace), ignore_errors=True)
-    finally:
-        slots.release()
-    write_text(artifact_dir / "ui-diff.comment.md", markdown)
-    section = build_section(markdown, notes, head_sha, clock() - started)
-    return Outcome(section, status, "; ".join(notes))
-
-
 #: How long a cancelled stage may take to stop: a poll, ui-diff's SIGTERM grace, the SIGKILL wait.
-CANCEL_WAIT_SECONDS = POLL_SECONDS + 20 + 10 + 30
+CANCEL_WAIT_SECONDS = POLL_SECONDS + TERM_GRACE_SECONDS + 10 + 30
 
 
 class Job(object):

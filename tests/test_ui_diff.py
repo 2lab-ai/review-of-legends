@@ -44,7 +44,11 @@ FAKE_UI_DIFF = textwrap.dedent(
     if command == "run":
         if behaviour.get("spawn_child"):
             import subprocess
-            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True)
+            # Like a dev server: detached, working in a worktree under ui-diff's TMPDIR.
+            worktree = Path(os.environ["TMPDIR"]) / "ui-diff-head"
+            worktree.mkdir(parents=True, exist_ok=True)
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True,
+                                     cwd=str(worktree))
             Path(behaviour["spawn_child"]).write_text(str(child.pid))
         if behaviour.get("plant_symlink"):
             (out / "compare").mkdir(parents=True, exist_ok=True)
@@ -244,7 +248,7 @@ class SectionTest(unittest.TestCase):
         self.assertNotIn("1 changed", body)
         self.assertIn("> Screenshots were not uploaded: x.", body)
         self.assertIn("## 왜 이 변경인가", body)
-        self.assertEqual(ui_diff.merge_section(body, None).strip(), outline)
+        self.assertEqual(ui_diff.strip_section(body).strip(), outline)
 
     def test_a_section_that_cannot_fit_with_its_markers_is_left_out(self) -> None:
         body = ui_diff.merge_section("x" * (ui_diff.MAX_COMMENT_CHARS - 500), ui_diff.build_section("y" * 5000, [], HEAD, 1))
@@ -366,6 +370,35 @@ class RunStageTest(unittest.TestCase):
         self.behaviour(spawn_child=str(pid_file), exit_right_away=True)
         self.run_stage(_config(self.tmp))
         self.assertTrue(_gone(int(pid_file.read_text())), "found by its working directory, not the tree")
+
+    def test_a_reviewer_working_in_the_clone_is_never_swept(self) -> None:
+        import subprocess
+        reviewer = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True,
+                                    cwd=str(self.source))
+        try:
+            pid_file = self.tmp / "child.pid"
+            self.behaviour(spawn_child=str(pid_file), exit_right_away=True)
+            self.run_stage(_config(self.tmp))
+            self.assertTrue(_gone(int(pid_file.read_text())))
+            self.assertIsNone(reviewer.poll(), "a reviewer process in the clone was killed")
+        finally:
+            reviewer.kill()
+            reviewer.wait()
+
+    def test_a_root_symlink_is_never_copied_for_publishing(self) -> None:
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "report.json").write_text("{}", encoding="utf-8")
+        os.symlink(str(elsewhere), str(self.source / ".ui-diff"))
+        with self.assertRaises(ValueError):
+            ui_diff.publish_workspace(self.source / ".ui-diff", {}, {"PATH": os.environ.get("PATH", "")})
+
+    def test_a_worker_that_ignores_sigterm_is_killed(self) -> None:
+        script = self.tmp / "stubborn.py"
+        script.write_text("import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(60)\n")
+        with mock.patch.object(ui_diff, "TERM_GRACE_SECONDS", 0.5):
+            code, _, _ = ui_diff._run_group([sys.executable, str(script)], self.tmp, dict(os.environ), 1)
+        self.assertIsNone(code)
 
     def test_a_queued_stage_gives_up_on_cancel_without_running(self) -> None:
         self.behaviour()

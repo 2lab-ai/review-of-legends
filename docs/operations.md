@@ -724,8 +724,8 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   `PLAYWRIGHT_BROWSERS_PATH` under `cache_dir`, the host's git config left out, plus
   `visual_outline.ui_diff.env`. Only `publish` — ui-diff's own code — gets the App's installation
   token (for `gh` and the push). It runs in a fresh temporary repository outside the clone, with a
-  copy of `.ui-diff` that keeps regular files only (no symlink, FIFO or file over 64 MiB), git hooks
-  switched off, and the ui-diff config as read before the PR's code ran, without its `publish`
+  copy of `.ui-diff` that keeps regular files only (no symlink — `.ui-diff` itself included — FIFO or
+  file over 64 MiB; at most 5000 files and 1 GiB), git hooks switched off, and the ui-diff config as read before the PR's code ran, without its `publish`
   block; remote, branch, repository and image link base
   are passed on the command line, so a repository's config cannot point the upload anywhere else
   or allow a public upload.
@@ -741,8 +741,9 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
 - **Processes.** ui-diff starts installs and dev servers detached, in their own process groups.
   Each run gets a private `TMPDIR` (ui-diff's worktrees land in it). While it runs the daemon
   records every descendant's group every 2 seconds; when it ends, those groups, ui-diff's own
-  group and the group of every process still working under that temp directory or the clone
-  (`lsof`) get SIGKILL, so a dev server it left behind does not outlive the run. A run past its
+  group and the group of every process still working under that temp directory (`lsof`) get
+  SIGKILL, so a dev server it left behind does not outlive the run. The clone itself is never a
+  sweep root: the reviewer agents work in it at the same time. A run past its
   timeout gets SIGTERM first (ui-diff stops its own servers), then SIGKILL. A review that cannot
   wait any longer (past `timeout_seconds` + 2 × `publish_timeout_seconds` and a slot wait) stops the
   UI diff the same way before it removes the clone.

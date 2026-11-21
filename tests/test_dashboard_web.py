@@ -4460,6 +4460,19 @@ class RepositoryVisualOutlineTest(AppTestCase):
         self.assertEqual(payload["error"], dashboard_web.OUTLINE_SETTINGS_UNREADABLE)
         self.assertEqual(self.rows(payload)["acme-corp/Gamma"]["enabled_source"], "default")
 
+    def test_resetting_one_repository_keeps_the_others(self) -> None:
+        client = self.make_client()
+        identity = self.login(client)
+        self.assertEqual(self.put(client, identity, "acme-corp/Gamma", {"ui_diff": True}).status_code, 200)
+        self.assertEqual(self.put(client, identity, "acme-corp/review-of-legends", {"enabled": True}).status_code, 200)
+        response = self.put(client, identity, "acme-corp/Gamma", {"ui_diff": None})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.store.calls_named("set_setting")[-1][1][1],
+                         {"repositories": {"acme-corp/review-of-legends": {"enabled": True}}})
+        rows = self.rows(response.json())
+        self.assertEqual(rows["acme-corp/review-of-legends"]["enabled_source"], "dashboard")
+        self.assertEqual(rows["acme-corp/Gamma"]["ui_diff_source"], "default")
+
     def test_the_ui_diff_cannot_be_switched_on_without_an_install(self) -> None:
         self.write_config(ui_diff_command=False)
         client = self.make_client()
