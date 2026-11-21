@@ -526,13 +526,27 @@ class SandboxTest(unittest.TestCase):
 
     def test_the_scratch_root_is_short_private_and_falls_back(self) -> None:
         root = ui_diff.scratch_root()
-        self.assertEqual(root.name, ui_diff.SCRATCH_PARENT)
-        self.assertLess(len(str(root)), 30)
-        self.assertEqual(os.lstat(str(root)).st_mode & 0o777, 0o700)
+        self.assertEqual(root.name, f"{ui_diff.SCRATCH_PARENT}-{os.getuid()}")
+        self.assertLess(len(str(root)), 36)
+        self.assertEqual((os.lstat(str(root)).st_mode & 0o777, os.lstat(str(root)).st_uid), (0o700, os.getuid()))
+        real_plain = ui_diff._plain_dir
+        tmp_root = os.path.realpath("/tmp")
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(ui_diff, "_plain_dir", side_effect=[OSError("read-only"), None]), \
+            def read_only_tmp(path, repair):
+                if str(path).startswith(tmp_root + os.sep):
+                    raise OSError("read-only")
+                return real_plain(path, repair)
+
+            with mock.patch.object(ui_diff, "_plain_dir", read_only_tmp), \
                     mock.patch.object(ui_diff.tempfile, "gettempdir", return_value=tmp):
-                self.assertEqual(ui_diff.scratch_root(), Path(os.path.realpath(tmp)) / ui_diff.SCRATCH_PARENT)
+                self.assertEqual(ui_diff.scratch_root(), Path(os.path.realpath(tmp)) / root.name)
+            # A directory under that name owned by another account is never used.
+            with mock.patch.object(ui_diff.os, "getuid", return_value=os.getuid() + 1), \
+                    mock.patch.object(ui_diff.tempfile, "gettempdir", return_value=tmp):
+                with self.assertRaises(OSError):
+                    ui_diff.scratch_root()
+        shutil_rm = __import__("shutil").rmtree
+        shutil_rm(os.path.join(tmp_root, f"{ui_diff.SCRATCH_PARENT}-{os.getuid() + 1}"), ignore_errors=True)
 
     def test_without_a_sandbox_a_symlinked_cache_is_kept(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

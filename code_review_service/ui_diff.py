@@ -1585,17 +1585,22 @@ def run_stage(
 
 #: The common parent of every run's temp directory, directly under /tmp so the
 #: paths stay short; the sandbox denies it and grants each run its own child.
+#: One per daemon user (``rol-ud-<uid>``): another account cannot own it.
 SCRATCH_PARENT = "rol-ud"
 
 
 def scratch_root() -> Path:
-    """``/tmp/rol-ud`` (``/private/tmp/rol-ud`` on macOS) as a checked plain
-    directory of mode 0700, short enough for any socket a browser puts under a
-    run's TMPDIR; the configured temp directory when /tmp cannot take it."""
+    """``/tmp/rol-ud-<uid>`` (``/private/tmp/…`` on macOS) as a checked plain
+    directory this user owns, mode 0700, short enough for any socket a browser
+    puts under a run's TMPDIR; the configured temp directory when /tmp cannot
+    give one (read-only, or the name taken by another account)."""
     for base in ("/tmp", tempfile.gettempdir()):
-        root = Path(os.path.realpath(base)) / SCRATCH_PARENT
+        root = Path(os.path.realpath(base)) / f"{SCRATCH_PARENT}-{os.getuid()}"
         try:
             _plain_dir(root, repair=True)
+            info = os.lstat(str(root))
+            if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                raise ValueError(f"{root} is not this user's private directory")
             return root
         except (OSError, ValueError):
             continue
