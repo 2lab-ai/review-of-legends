@@ -84,6 +84,14 @@ FAKE_UI_DIFF = textwrap.dedent(
         print(json.dumps({"stats": {"changed": 1}}))
         sys.exit(0)
     if command == "publish":
+        if behaviour.get("publish_reads"):
+            try:
+                Path(behaviour["publish_reads"]).read_text()
+                seen = "read"
+            except OSError as exc:
+                seen = type(exc).__name__
+            with record.open("a") as handle:
+                handle.write(json.dumps({"args": ["publish-read"], "seen": seen, "env": {}, "cwd": "", "config": None}) + "\\n")
         upload = "--no-upload" not in args
         if upload and behaviour.get("publish_exit"):
             print(json.dumps({"error": "git could not access the remote"}))
@@ -283,18 +291,30 @@ class SandboxTest(unittest.TestCase):
         for path in ("/srv/rol/data/work", "/srv/rol/data/ui-diff"):
             self.assertIn(f'(deny file-read* file-write* (subpath "{os.path.realpath(path)}"))', lines,
                           "other reviews' clones and other repositories' caches")
-        rules = [line for line in lines if not line.startswith("(allow file-read-metadata")]
-        self.assertTrue(all(line.startswith("(deny") for line in rules[2:-1]))
-        self.assertEqual(rules[-1], f'(allow file-read* file-write* (subpath "{os.path.realpath("/srv/rol/data/ui-diff")}"))')
+        allow = f'(allow file-read* file-write* (subpath "{os.path.realpath("/srv/rol/data/ui-diff")}"))'
+        self.assertIn(allow, lines)
+        index = lines.index(allow)
+        self.assertTrue(all(line.startswith("(deny") for line in lines[2:index]), "every deny comes before the grant")
+        self.assertIn("(deny job-creation)", lines)
+        self.assertIn('(deny process-exec (literal "/usr/bin/osascript"))', lines)
+        # Ancestors of protected directories are pinned against rename/replace.
+        self.assertIn(f'(deny file-write* (literal "{os.path.realpath("/srv")}"))', lines)
 
     def test_this_run_and_this_repositorys_caches_are_allowed_last(self) -> None:
         profile = ui_diff.sandbox_profile(self.config(), Path("/srv/rol/config"),
                                           run_dir=Path("/srv/rol/data/work/acme-corp__web/pr-7"), repo="Acme-Corp/Web")
-        lines = [line for line in profile.splitlines() if not line.startswith("(allow file-read-metadata")]
-        self.assertEqual(lines[-2:], [
-            f'(allow file-read* file-write* (subpath "{os.path.realpath("/srv/rol/data/work/acme-corp__web/pr-7")}"))',
-            f'(allow file-read* file-write* (subpath "{os.path.realpath("/srv/rol/data/ui-diff/repositories/acme-corp/web")}"))',
+        lines = profile.splitlines()
+        run = os.path.realpath("/srv/rol/data/work/acme-corp__web/pr-7")
+        repo_cache = os.path.realpath("/srv/rol/data/ui-diff/repositories/acme-corp/web")
+        grants = [line for line in lines if line.startswith("(allow file-read* file-write*")]
+        self.assertEqual(grants, [
+            f'(allow file-read* file-write* (subpath "{run}"))',
+            f'(allow file-read* file-write* (subpath "{repo_cache}"))',
         ])
+        after = lines[lines.index(grants[-1]) + 1:]
+        # The granted roots and the clone cannot be swapped out from under the daemon.
+        for path in (run, repo_cache, run + "/source"):
+            self.assertIn(f'(deny file-write* (literal "{path}"))', after)
         # Ancestors may be stat()ed (realpath, mkdir -p), not listed.
         self.assertIn(f'(allow file-read-metadata (literal "{os.path.realpath("/srv/rol/data/work")}"))', profile)
         self.assertNotIn(f'(allow file-read* file-write* (subpath "{os.path.realpath("/srv/rol/data/work")}"))', profile)
@@ -719,7 +739,11 @@ class RunStageTest(unittest.TestCase):
         self.assertEqual(calls[0][3], sys.executable, "the ui-diff command follows the profile")
         publish = [args for args in calls if "publish" in args]
         self.assertTrue(publish, "the stage reached publish")
-        self.assertTrue(all(args[0] == sys.executable for args in publish), "publish is never wrapped")
+        # Publish has its own profile: secrets unreadable, none of the run step's write limits.
+        self.assertTrue(all(args[:2] == [str(fake_sandbox), "-p"] for args in publish))
+        self.assertNotEqual(publish[0][2], calls[0][2])
+        self.assertIn(f'(deny file-read* file-write* (subpath "{os.path.realpath(self.tmp / "secret")}"))', publish[0][2])
+        self.assertNotIn("(allow file-read* file-write*", publish[0][2])
 
     def test_a_planted_cache_symlink_is_replaced_before_anything_follows_it(self) -> None:
         config, service = self.sandboxed_config(self.tmp / "secret")
@@ -776,6 +800,19 @@ class RunStageTest(unittest.TestCase):
         self.assertEqual(outcome.status, "ok", outcome.detail)
         secret = next(record for record in self.records() if record["args"] == ["secret"])
         self.assertEqual(secret["secret"], "PermissionError")
+
+    @unittest.skipUnless(sys.platform == "darwin" and os.access(ui_diff.SANDBOX_EXEC, os.X_OK), "macOS sandbox-exec")
+    def test_publish_cannot_read_the_secrets_either(self) -> None:
+        secret_dir = self.tmp / "secret"
+        secret_dir.mkdir()
+        (secret_dir / "app.pem").write_text("PRIVATE KEY")
+        config, service = self.sandboxed_config(secret_dir, publish_reads=str(secret_dir / "app.pem"))
+        outcome = ui_diff.run_stage(config, service, self.source, self.artifacts, REPO, _pr(),
+                                    lambda env: env, self.logs.append, lambda p, t: p.write_text(t))
+        self.assertEqual(outcome.status, "ok", outcome.detail)
+        seen = [record["seen"] for record in self.records() if record["args"] == ["publish-read"]]
+        self.assertTrue(seen)
+        self.assertEqual(set(seen), {"PermissionError"})
 
     @unittest.skipUnless(sys.platform == "darwin" and os.access(ui_diff.SANDBOX_EXEC, os.X_OK), "macOS sandbox-exec")
     def test_the_sandbox_keeps_the_prs_code_from_rewriting_what_publish_runs(self) -> None:

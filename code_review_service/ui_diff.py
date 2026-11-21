@@ -475,14 +475,26 @@ def _plain_dir(path: Path, repair: bool) -> None:
     try:
         info = os.lstat(str(path))
     except FileNotFoundError:
-        os.mkdir(str(path), 0o700)
-        return
-    if stat.S_ISDIR(info.st_mode):
-        return
-    if not repair:
-        raise ValueError(f"{path} is not a plain directory")
-    os.unlink(str(path))
-    os.mkdir(str(path), 0o700)
+        try:
+            os.mkdir(str(path), 0o700)
+        except FileExistsError:
+            pass  # another run created it first: check what is there now
+        info = os.lstat(str(path))
+    if not stat.S_ISDIR(info.st_mode):
+        if not repair:
+            raise ValueError(f"{path} is not a plain directory")
+        os.unlink(str(path))
+        try:
+            os.mkdir(str(path), 0o700)
+        except FileExistsError:
+            pass
+        if not stat.S_ISDIR(os.lstat(str(path)).st_mode):
+            raise ValueError(f"{path} is not a plain directory")
+    if repair:
+        try:
+            os.chmod(str(path), 0o700)
+        except OSError:
+            pass
 
 
 def prepare_cache(config: Dict[str, Any], config_dir: Path, repo: str) -> Path:
@@ -513,6 +525,54 @@ def checked_run_dir(run_dir: Path) -> Path:
     return Path(os.path.realpath(str(run_dir.parent))) / run_dir.name
 
 
+#: Ways out of an allow-default profile that are not file operations: launchd
+#: jobs, LaunchServices opens, AppleEvents (and the tools that send them), the
+#: keychain. AppleEvents sent by a program of the PR's own still depend on
+#: macOS Automation consent, which a headless review daemon does not hold.
+_ESCAPE_RULES = [
+    "(deny job-creation)",
+    "(deny lsopen)",
+    "(deny appleevent-send)",
+    '(deny mach-lookup (global-name "com.apple.SecurityServer"))',
+    '(deny process-exec (literal "/usr/bin/osascript"))',
+    '(deny process-exec (literal "/usr/bin/automator"))',
+    '(deny process-exec (literal "/usr/bin/shortcuts"))',
+    '(deny process-exec (literal "/usr/bin/open"))',
+]
+
+
+def _secret_paths(config: Dict[str, Any], config_dir: Path, block: Dict[str, Any]) -> List[Any]:
+    """What no ui-diff step may read or write: the configured ``deny`` paths, the
+    GitHub App key's directory (resolved), the dashboard database, the review
+    ledger, and the review work directory (other reviews' clones)."""
+    service_root = Path(config_dir).resolve().parent
+    work = Path(os.path.expanduser(str(config.get("work_dir") or "data/work")))
+    work = work if work.is_absolute() else service_root / work
+    deny: List[Any] = list(block.get("deny") or [])
+    app = config.get("github_app")
+    if isinstance(app, dict) and app.get("private_key_path"):
+        # Resolved first: a symlinked key is protected where it really lives.
+        deny.append(Path(os.path.realpath(str(app["private_key_path"]))).parent)
+    deny.append(service_root / "data" / "dashboard")
+    state = Path(os.path.expanduser(str(config.get("state_path") or "data/state.json")))
+    deny.append(state if state.is_absolute() else service_root / state)
+    deny.append(work)
+    return deny
+
+
+def publish_profile(config: Dict[str, Any], config_dir: Path) -> Optional[str]:
+    """The sandbox for ``ui-diff publish`` (it holds the token): it may not read
+    or write the secret paths, so a report the PR's code tampered with cannot
+    make it upload the App key. It works in its own copy under cache_dir."""
+    block = ui_diff_block(config).get("sandbox")
+    if not isinstance(block, dict):
+        return None
+    lines = ["(version 1)", "(allow default)"] + _ESCAPE_RULES
+    lines += [f"(deny file-read* file-write* (subpath {_sbpl(path)}))"
+              for path in dict.fromkeys(map(str, _secret_paths(config, config_dir, block)))]
+    return "\n".join(lines) + "\n"
+
+
 def sandbox_profile(
     config: Dict[str, Any],
     config_dir: Path,
@@ -538,17 +598,7 @@ def sandbox_profile(
     if not isinstance(block, dict):
         return None
     service_root = Path(config_dir).resolve().parent
-    work = Path(os.path.expanduser(str(config.get("work_dir") or "data/work")))
-    work = work if work.is_absolute() else service_root / work
-    deny: List[Any] = list(block.get("deny") or [])
-    app = config.get("github_app")
-    if isinstance(app, dict) and app.get("private_key_path"):
-        # Resolved first: a symlinked key is protected where it really lives.
-        deny.append(Path(os.path.realpath(str(app["private_key_path"]))).parent)
-    deny.append(service_root / "data" / "dashboard")
-    state = Path(os.path.expanduser(str(config.get("state_path") or "data/state.json")))
-    deny.append(state if state.is_absolute() else service_root / state)
-    deny += [work, cache_root(config, config_dir)]
+    deny = _secret_paths(config, config_dir, block) + [cache_root(config, config_dir)]
     deny_write: List[Any] = [service_root] + list(block.get("deny_write") or [])
     # Everything the unsandboxed publish step executes must be out of the run
     # step's reach: the directories on PATH, and every program it starts.
@@ -563,10 +613,22 @@ def sandbox_profile(
     exposed = [tool for tool in tools if _inside(tool, allow)]
     if exposed:
         raise ValueError(f"{exposed[0]} (run by publish) is inside a directory the run step may write")
-    lines = ["(version 1)", "(allow default)"]
+    lines = ["(version 1)", "(allow default)"] + _ESCAPE_RULES
     lines += [f"(deny file-read* file-write* (subpath {_sbpl(path)}))" for path in dict.fromkeys(map(str, deny))]
     lines += [f"(deny file-write* (subpath {_sbpl(path)}))" for path in dict.fromkeys(map(str, deny_write))]
+    # A protected directory could still be swapped through its parent (renamed
+    # away, a symlink put in its place): every ancestor entry is pinned too.
+    pinned: List[str] = []
+    for path in dict.fromkeys(map(str, deny_write)):
+        for parent in Path(os.path.realpath(path)).parents:
+            if str(parent) != os.sep and str(parent) not in pinned:
+                pinned.append(str(parent))
+    lines += [f"(deny file-write* (literal {_quote(path)}))" for path in pinned]
     lines += [f"(allow file-read* file-write* (subpath {_quote(str(path))}))" for path in dict.fromkeys(map(str, allow))]
+    # The granted roots themselves (and the clone under the run directory) stay
+    # where they are: the PR's code may change what is inside, not swap them.
+    roots = [str(path) for path in allow] + ([str(Path(str(run_dir)) / "source")] if run_dir else [])
+    lines += [f"(deny file-write* (literal {_quote(path)}))" for path in dict.fromkeys(roots)]
     # Their parent directories may be stat()ed (realpath, mkdir -p walk up the
     # tree), never listed or read.
     ancestors: List[str] = []
@@ -1036,6 +1098,8 @@ def run_stage(
         reason = f"visual_outline.ui_diff.sandbox is set but {SANDBOX_EXEC} is not available on this host"
         return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
     run_prefix = [SANDBOX_EXEC, "-p", profile] if profile is not None else []
+    published_profile = publish_profile(config, config_dir)
+    publish_prefix = [SANDBOX_EXEC, "-p", published_profile] if published_profile is not None else []
     # A private temp directory per run: ui-diff's worktrees land in it, so every
     # install and dev server this run started works under it and can be found.
     # mkdtemp + rmtree(ignore_errors), not TemporaryDirectory: on Python 3.9 its
@@ -1095,7 +1159,8 @@ def run_stage(
                     notes.append("Dry run: screenshots were not uploaded.")
                 elif settings.get("upload", True):
                     code, stdout, stderr = _run_group(
-                        publish_args, workspace, _harden_git(publish_env(_publish_base(env, workspace))),
+                        publish_prefix + publish_args, workspace,
+                        _harden_git(publish_env(_publish_base(env, workspace))),
                         publish_timeout, cancel, sweep=[str(workspace)],
                     )
                     write_text(artifact_dir / "ui-diff.publish.stdout.txt", stdout)
@@ -1114,7 +1179,8 @@ def run_stage(
                     notes.append("Screenshots are not uploaded on this deployment (visual_outline.ui_diff.upload is off).")
                 if status == "text-only":
                     code, stdout, stderr = _run_group(
-                        publish_args + ["--no-upload"], workspace, _harden_git(_publish_base(env, workspace)),
+                        publish_prefix + publish_args + ["--no-upload"], workspace,
+                        _harden_git(_publish_base(env, workspace)),
                         publish_timeout, cancel, sweep=[str(workspace)],
                     )
                     write_text(artifact_dir / "ui-diff.render.stderr.txt", stderr)
