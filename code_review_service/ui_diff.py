@@ -410,6 +410,32 @@ def _run_path(settings: Dict[str, Any], source: Any) -> str:
     return os.pathsep.join(entries)
 
 
+def _publish_programs(settings: Dict[str, Any], path: str) -> List[str]:
+    """Every program the publish step starts: each command argument naming a file, git and gh."""
+    programs: List[str] = []
+    for item in [str(arg) for arg in settings.get("command") or []] + ["git", "gh"]:
+        found = item if os.path.isabs(item) else shutil.which(item, path=path)
+        if found and found not in programs:
+            programs.append(found)
+    return programs
+
+
+def _symlink_entries(paths: List[Any]) -> List[str]:
+    """Every symlink on the way to each of ``paths`` (the paths as given, unresolved):
+    replacing one of them redirects the path without touching its target."""
+    links: List[str] = []
+    for raw in paths:
+        text = os.path.abspath(os.path.expanduser(str(raw)))
+        current = Path(os.sep)
+        for part in Path(text).parts[1:]:
+            current = current / part
+            if os.path.islink(str(current)) and str(current) not in links:
+                links.append(str(current))
+                # Keep walking from where the link really leads.
+                current = Path(os.path.realpath(str(current)))
+    return links
+
+
 def _protected_tool_dirs(settings: Dict[str, Any], path: str) -> List[Path]:
     """Directories the run step must not write so publish runs only what was installed.
 
@@ -421,20 +447,7 @@ def _protected_tool_dirs(settings: Dict[str, Any], path: str) -> List[Path]:
     resolved first.
     """
     dirs: List[Path] = [Path(os.path.realpath(entry)) for entry in path.split(os.pathsep) if os.path.isabs(entry)]
-    programs: List[str] = []
-    for arg in settings.get("command") or []:
-        text = str(arg)
-        if os.path.isabs(text):
-            programs.append(text)
-        else:
-            found = shutil.which(text, path=path)
-            if found:
-                programs.append(found)
-    for tool in ("git", "gh"):
-        found = shutil.which(tool, path=path)
-        if found:
-            programs.append(found)
-    for program in programs:
+    for program in _publish_programs(settings, path):
         real = Path(os.path.realpath(program))
         if not real.is_file():
             continue
@@ -534,6 +547,8 @@ _ESCAPE_RULES = [
     "(deny lsopen)",
     "(deny appleevent-send)",
     '(deny mach-lookup (global-name "com.apple.SecurityServer"))',
+    # No looking into other processes (a concurrent publish's environment).
+    "(deny process-info* (target others))",
     '(deny process-exec (literal "/usr/bin/osascript"))',
     '(deny process-exec (literal "/usr/bin/automator"))',
     '(deny process-exec (literal "/usr/bin/shortcuts"))',
@@ -560,16 +575,21 @@ def _secret_paths(config: Dict[str, Any], config_dir: Path, block: Dict[str, Any
     return deny
 
 
-def publish_profile(config: Dict[str, Any], config_dir: Path) -> Optional[str]:
+def publish_profile(config: Dict[str, Any], config_dir: Path, workspace_root: Optional[Path] = None) -> Optional[str]:
     """The sandbox for ``ui-diff publish`` (it holds the token): it may not read
     or write the secret paths, so a report the PR's code tampered with cannot
-    make it upload the App key. It works in its own copy under cache_dir."""
+    make it upload the App key. Its own copy under ``workspace_root`` stays
+    readable and writable even when that sits under a denied path."""
     block = ui_diff_block(config).get("sandbox")
     if not isinstance(block, dict):
         return None
     lines = ["(version 1)", "(allow default)"] + _ESCAPE_RULES
     lines += [f"(deny file-read* file-write* (subpath {_sbpl(path)}))"
               for path in dict.fromkeys(map(str, _secret_paths(config, config_dir, block)))]
+    if workspace_root is not None:
+        lines.append(f"(allow file-read* file-write* (subpath {_sbpl(workspace_root)}))")
+        lines += [f"(allow file-read-metadata (literal {_quote(str(parent))}))"
+                  for parent in Path(os.path.realpath(str(workspace_root))).parents if str(parent) != os.sep]
     return "\n".join(lines) + "\n"
 
 
@@ -616,13 +636,19 @@ def sandbox_profile(
     lines = ["(version 1)", "(allow default)"] + _ESCAPE_RULES
     lines += [f"(deny file-read* file-write* (subpath {_sbpl(path)}))" for path in dict.fromkeys(map(str, deny))]
     lines += [f"(deny file-write* (subpath {_sbpl(path)}))" for path in dict.fromkeys(map(str, deny_write))]
-    # A protected directory could still be swapped through its parent (renamed
-    # away, a symlink put in its place): every ancestor entry is pinned too.
+    # A protected or denied directory could still be swapped through its parent
+    # (renamed away and reached at a new name, a symlink put in its place):
+    # every ancestor entry is pinned, and so is every symlink on the way to it
+    # or to a program publish runs.
     pinned: List[str] = []
-    for path in dict.fromkeys(map(str, deny_write)):
-        for parent in Path(os.path.realpath(path)).parents:
+    for path in dict.fromkeys(map(str, list(deny_write) + list(deny))):
+        for parent in [Path(os.path.realpath(path))] + list(Path(os.path.realpath(path)).parents):
             if str(parent) != os.sep and str(parent) not in pinned:
                 pinned.append(str(parent))
+    pinned += [link for link in _symlink_entries(
+        list(deny_write) + list(deny) + _publish_programs(settings, _run_path(settings, os.environ))
+        + _run_path(settings, os.environ).split(os.pathsep)
+    ) if link not in pinned]
     lines += [f"(deny file-write* (literal {_quote(path)}))" for path in pinned]
     lines += [f"(allow file-read* file-write* (subpath {_quote(str(path))}))" for path in dict.fromkeys(map(str, allow))]
     # The granted roots themselves (and the clone under the run directory) stay
@@ -1098,7 +1124,7 @@ def run_stage(
         reason = f"visual_outline.ui_diff.sandbox is set but {SANDBOX_EXEC} is not available on this host"
         return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
     run_prefix = [SANDBOX_EXEC, "-p", profile] if profile is not None else []
-    published_profile = publish_profile(config, config_dir)
+    published_profile = publish_profile(config, config_dir, _publish_parent(config, config_dir) if profile else None)
     publish_prefix = [SANDBOX_EXEC, "-p", published_profile] if published_profile is not None else []
     # A private temp directory per run: ui-diff's worktrees land in it, so every
     # install and dev server this run started works under it and can be found.

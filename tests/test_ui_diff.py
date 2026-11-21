@@ -743,7 +743,9 @@ class RunStageTest(unittest.TestCase):
         self.assertTrue(all(args[:2] == [str(fake_sandbox), "-p"] for args in publish))
         self.assertNotEqual(publish[0][2], calls[0][2])
         self.assertIn(f'(deny file-read* file-write* (subpath "{os.path.realpath(self.tmp / "secret")}"))', publish[0][2])
-        self.assertNotIn("(allow file-read* file-write*", publish[0][2])
+        grants = [line for line in publish[0][2].splitlines() if line.startswith("(allow file-read* file-write*")]
+        self.assertEqual(grants, [f'(allow file-read* file-write* (subpath "{os.path.realpath(self.tmp / "cache" / "publish")}"))'],
+                         "publish may use only its own copy")
 
     def test_a_planted_cache_symlink_is_replaced_before_anything_follows_it(self) -> None:
         config, service = self.sandboxed_config(self.tmp / "secret")
