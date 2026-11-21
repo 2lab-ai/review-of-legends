@@ -280,10 +280,27 @@ class SandboxTest(unittest.TestCase):
             self.assertIn(f'(deny file-read* file-write* (subpath "{os.path.realpath(path)}"))', lines)
         for path in ("/srv/rol", "/srv/other"):
             self.assertIn(f'(deny file-write* (subpath "{os.path.realpath(path)}"))', lines)
+        for path in ("/srv/rol/data/work", "/srv/rol/data/ui-diff"):
+            self.assertIn(f'(deny file-read* file-write* (subpath "{os.path.realpath(path)}"))', lines,
+                          "other reviews' clones and other repositories' caches")
+        self.assertTrue(all(line.startswith("(deny") for line in lines[2:-1]))
+        self.assertEqual(lines[-1], f'(allow file-read* file-write* (subpath "{os.path.realpath("/srv/rol/data/ui-diff")}"))')
+
+    def test_this_run_and_this_repositorys_caches_are_allowed_last(self) -> None:
+        profile = ui_diff.sandbox_profile(self.config(), Path("/srv/rol/config"),
+                                          run_dir=Path("/srv/rol/data/work/acme-corp__web/pr-7"), repo="Acme-Corp/Web")
+        lines = profile.splitlines()
         self.assertEqual(lines[-2:], [
-            f'(allow file-write* (subpath "{os.path.realpath("/srv/rol/data/work")}"))',
-            f'(allow file-write* (subpath "{os.path.realpath("/srv/rol/data/ui-diff")}"))',
+            f'(allow file-read* file-write* (subpath "{os.path.realpath("/srv/rol/data/work/acme-corp__web/pr-7")}"))',
+            f'(allow file-read* file-write* (subpath "{os.path.realpath("/srv/rol/data/ui-diff/repositories/acme-corp/web")}"))',
         ])
+
+    def test_a_protected_program_inside_a_writable_place_is_refused(self) -> None:
+        config = self.config()
+        config["visual_outline"]["ui_diff"]["command"] = ["/usr/bin/env", "/srv/rol/data/work/x/pr-7/ui-diff.mjs"]
+        with mock.patch.object(ui_diff, "_protected_tool_dirs", lambda settings, path: [Path("/srv/rol/data/work/x/pr-7")]):
+            with self.assertRaises(ValueError):
+                ui_diff.sandbox_profile(config, Path("/srv/rol/config"), run_dir=Path("/srv/rol/data/work/x/pr-7"))
 
     def test_every_program_publish_runs_is_write_protected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -298,12 +315,15 @@ class SandboxTest(unittest.TestCase):
             skill = root / "ui" / "skills" / "ui-diff" / "bin"
             skill.mkdir(parents=True)
             (skill / "ui-diff.mjs").write_text("")
-            os.symlink(str(skill / "ui-diff.mjs"), str(root / "ui-diff-link.mjs"))
+            links = root / "links"
+            links.mkdir()
+            os.symlink(str(skill / "ui-diff.mjs"), str(links / "ui-diff-link.mjs"))
             config = self.config()
-            config["visual_outline"]["ui_diff"]["command"] = [str(linked / "node"), str(root / "ui-diff-link.mjs")]
+            config["visual_outline"]["ui_diff"]["command"] = [str(linked / "node"), str(links / "ui-diff-link.mjs")]
             with mock.patch.dict(os.environ, {"PATH": f"{linked}:relative/bin"}):
                 profile = ui_diff.sandbox_profile(config, Path("/srv/rol/config"))
-        for path in (linked, keg.parent, root / "brew", root / "ui" / "skills" / "ui-diff"):
+        # The symlink's own directory too: replacing a link is a write there.
+        for path in (linked, keg.parent, root / "brew", root / "ui" / "skills" / "ui-diff", links):
             self.assertIn(f'(deny file-write* (subpath "{path}"))', profile)
         self.assertNotIn("relative/bin", profile)
 
@@ -663,6 +683,10 @@ class RunStageTest(unittest.TestCase):
         settings["env"] = {"FAKE_RECORD": str(self.tmp / "record.jsonl")}
         service = self.tmp / "svc" / "config"
         service.mkdir(parents=True)
+        # This review's run directory (the sandbox lets the run write only there),
+        # away from the tool directory it must not be able to rewrite.
+        self.source = self.tmp / "run" / "source"
+        self.source.mkdir(parents=True)
         return config, service
 
     def test_only_the_run_step_is_sandboxed(self) -> None:

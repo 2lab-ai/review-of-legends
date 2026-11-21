@@ -739,11 +739,19 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
 - **Sandbox (macOS).** With `visual_outline.ui_diff.sandbox` set, the run step runs under
   `/usr/bin/sandbox-exec` with a profile that allows everything except: reading or writing the
   `deny` paths (e.g. the daemon user's home and other tenants' trees), the GitHub App key's
-  directory, `data/dashboard` and the review ledger; writing the service tree (its review work
-  directory and the ui-diff caches excepted), every directory on the run's `PATH`, the real install
+  directory (resolved), `data/dashboard`, the review ledger, the review work directory (other
+  reviews' clones) and the ui-diff caches (other repositories'); writing the service tree, every
+  directory on the run's `PATH`, the real install
   of every program publish starts afterwards outside the sandbox (the command's interpreter and
   script, `git`, `gh`; a program inside a Homebrew `Cellar` protects the whole Homebrew prefix),
-  and the `deny_write` paths. Set
+  the directory of each symlink that leads to one, and the `deny_write` paths. Last, this review's
+  own run directory (its clone, ui-diff's worktrees and the publish copy all live there) and this
+  repository's own caches are readable and writable again: under a sandbox the caches are kept per
+  repository (`cache_dir/repositories/<owner>/<name>`), so one repository's PR code cannot plant
+  a package or a browser build another repository's run picks up. A protected program inside one
+  of those two writable places fails the stage instead of running unprotected. Publish holds the
+  token in its environment, which macOS does not show to other processes, and only runs after the
+  run step's processes were swept, inside the same slot. Set
   it on any host where a PR author must not reach other credentials. A configured sandbox fails
   closed: without `sandbox-exec` the PR's code is not run and the section says why. The work
   directory and `cache_dir` must not sit under a `deny` path. Publish runs ui-diff's own code

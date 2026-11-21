@@ -435,55 +435,88 @@ def _protected_tool_dirs(settings: Dict[str, Any], path: str) -> List[Path]:
         real = Path(os.path.realpath(program))
         if not real.is_file():
             continue
+        # The entry itself too: a symlink is replaced in the directory it sits in.
+        dirs.append(Path(os.path.abspath(program)).parent)
         dirs.append(real.parent)
         if real.parent.name == "bin" and len(real.parents) > 2:
             dirs.append(real.parents[1])
         if "Cellar" in real.parts:
             # A Homebrew keg loads libraries from its sibling kegs: the whole prefix.
             dirs.append(Path(*real.parts[: real.parts.index("Cellar")]))
-    unique: List[Path] = []
-    for item in dirs:
-        if item not in unique and str(item) != os.sep:
-            unique.append(item)
-    return unique
+    return [item for item in dict.fromkeys(dirs) if str(item) != os.sep]
 
 
-def sandbox_profile(config: Dict[str, Any], config_dir: Path) -> Optional[str]:
+def _sandboxed(config: Dict[str, Any]) -> bool:
+    return isinstance(ui_diff_block(config).get("sandbox"), dict)
+
+
+def repository_cache_root(config: Dict[str, Any], config_dir: Path, repo: str) -> Path:
+    """The caches a run uses: shared, or one set per repository under a sandbox,
+    so one repository's PR code cannot plant anything another repository's run
+    picks up (an npm package, a browser build)."""
+    root = cache_root(config, config_dir)
+    if not _sandboxed(config) or not repo:
+        return root
+    owner, _, name = _repo_key(repo).partition("/")
+    return root / "repositories" / re.sub(r"[^a-z0-9._-]", "_", owner) / re.sub(r"[^a-z0-9._-]", "_", name)
+
+
+def _inside(path: Path, roots: List[Path]) -> bool:
+    text = str(path).rstrip(os.sep) + os.sep
+    return any(text.startswith(str(root).rstrip(os.sep) + os.sep) for root in roots)
+
+
+def sandbox_profile(
+    config: Dict[str, Any], config_dir: Path, run_dir: Optional[Path] = None, repo: str = ""
+) -> Optional[str]:
     """The sandbox profile for ``ui-diff run``, or None when no sandbox is configured.
 
     Everything is allowed except: reading or writing the ``deny`` paths, the
-    GitHub App key's directory, the dashboard database and the review ledger;
-    writing the service tree (the review work directory and the ui-diff caches
-    excepted), the ui-diff install and the ``deny_write`` paths. Later rules
-    win in a profile, so the two write exceptions come last.
+    GitHub App key's directory, the dashboard database, the review ledger, the
+    review work directory and the ui-diff caches (other reviews, other
+    repositories); writing the service tree, every directory on PATH, the
+    install of every program publish starts afterwards outside the sandbox and
+    the ``deny_write`` paths. Then, last (later rules win), reading and writing
+    this review's own run directory and this repository's caches.
+
+    ValueError when a protected program sits inside one of those two writable
+    places: the run step could replace it before publish runs it.
     """
     settings = ui_diff_block(config)
     block = settings.get("sandbox")
     if not isinstance(block, dict):
         return None
     service_root = Path(config_dir).resolve().parent
+    work = Path(os.path.expanduser(str(config.get("work_dir") or "data/work")))
+    work = work if work.is_absolute() else service_root / work
     deny: List[Any] = list(block.get("deny") or [])
     app = config.get("github_app")
     if isinstance(app, dict) and app.get("private_key_path"):
-        deny.append(Path(str(app["private_key_path"])).parent)
+        # Resolved first: a symlinked key is protected where it really lives.
+        deny.append(Path(os.path.realpath(str(app["private_key_path"]))).parent)
     deny.append(service_root / "data" / "dashboard")
     state = Path(os.path.expanduser(str(config.get("state_path") or "data/state.json")))
     deny.append(state if state.is_absolute() else service_root / state)
+    deny += [work, cache_root(config, config_dir)]
     deny_write: List[Any] = [service_root] + list(block.get("deny_write") or [])
     # Everything the unsandboxed publish step executes must be out of the run
-    # step's reach: the directories on PATH, and the real install of every
-    # program it starts (the command's interpreter and script, git, gh).
-    deny_write += _protected_tool_dirs(settings, _run_path(settings, os.environ))
-    work = Path(os.path.expanduser(str(config.get("work_dir") or "data/work")))
-    allow_write = [work if work.is_absolute() else service_root / work, cache_root(config, config_dir)]
+    # step's reach: the directories on PATH, and every program it starts.
+    tools = _protected_tool_dirs(settings, _run_path(settings, os.environ))
+    deny_write += tools
+    allow = [Path(os.path.realpath(str(path))) for path in (run_dir, repository_cache_root(config, config_dir, repo)) if path]
+    exposed = [tool for tool in tools if _inside(tool, allow)]
+    if exposed:
+        raise ValueError(f"{exposed[0]} (run by publish) is inside a directory the run step may write")
     lines = ["(version 1)", "(allow default)"]
-    lines += [f"(deny file-read* file-write* (subpath {_sbpl(path)}))" for path in deny]
-    lines += [f"(deny file-write* (subpath {_sbpl(path)}))" for path in deny_write]
-    lines += [f"(allow file-write* (subpath {_sbpl(path)}))" for path in allow_write]
+    lines += [f"(deny file-read* file-write* (subpath {_sbpl(path)}))" for path in dict.fromkeys(map(str, deny))]
+    lines += [f"(deny file-write* (subpath {_sbpl(path)}))" for path in dict.fromkeys(map(str, deny_write))]
+    lines += [f"(allow file-read* file-write* (subpath {_sbpl(path)}))" for path in dict.fromkeys(map(str, allow))]
     return "\n".join(lines) + "\n"
 
 
-def run_environ(config: Dict[str, Any], config_dir: Path, base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+def run_environ(
+    config: Dict[str, Any], config_dir: Path, base: Optional[Dict[str, str]] = None, repo: str = ""
+) -> Dict[str, str]:
     """The environment ``ui-diff run`` gets: no credential, a private HOME and caches.
 
     The PR's install scripts and dev server run under it, so nothing from the
@@ -493,7 +526,7 @@ def run_environ(config: Dict[str, Any], config_dir: Path, base: Optional[Dict[st
     """
     source = os.environ if base is None else base
     settings = ui_diff_block(config)
-    root = cache_root(config, config_dir)
+    root = repository_cache_root(config, config_dir, repo)
     for name in ("home", "npm-cache", "ms-playwright"):
         (root / name).mkdir(parents=True, exist_ok=True)
         try:
@@ -806,7 +839,9 @@ def _publish_base(env: Dict[str, str], workspace: Path) -> Dict[str, str]:
     return base
 
 
-def publish_workspace(out_dir: Path, settings: Dict[str, Any], env: Dict[str, str]) -> Path:
+def publish_workspace(
+    out_dir: Path, settings: Dict[str, Any], env: Dict[str, str], parent: Optional[Path] = None
+) -> Path:
     """A fresh repository for ``ui-diff publish``, outside the clone the PR's code ran in.
 
     The PR's install scripts could write the clone's ``.git`` (hooks, config)
@@ -817,7 +852,7 @@ def publish_workspace(out_dir: Path, settings: Dict[str, Any], env: Dict[str, st
     passes remote, branch and link base itself; a repository cannot allow a
     public upload).
     """
-    workspace = Path(tempfile.mkdtemp(prefix="rol-ui-diff-publish-"))
+    workspace = Path(tempfile.mkdtemp(prefix="rol-ui-diff-publish-", dir=str(parent) if parent else None))
     try:
         init = subprocess.run(
             ["git", "init", "-q", str(workspace)], env=env, capture_output=True, text=True, timeout=60, check=False
@@ -920,8 +955,13 @@ def run_stage(
         )
     command = [str(arg) for arg in settings.get("command") or []]
     out_dir = Path(source_dir) / ".ui-diff"
-    env = run_environ(config, config_dir)
-    profile = sandbox_profile(config, config_dir)
+    env = run_environ(config, config_dir, repo=repo)
+    run_dir = Path(source_dir).parent
+    try:
+        profile = sandbox_profile(config, config_dir, run_dir=run_dir, repo=repo)
+    except ValueError as exc:
+        reason = _one_line(f"the sandbox would not protect what publish runs: {exc}")
+        return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
     if profile is not None and not os.access(SANDBOX_EXEC, os.X_OK):
         # Fail closed: a deployment that asked for the sandbox never runs the PR's code without it.
         reason = f"visual_outline.ui_diff.sandbox is set but {SANDBOX_EXEC} is not available on this host"
@@ -932,7 +972,9 @@ def run_stage(
     # mkdtemp + rmtree(ignore_errors), not TemporaryDirectory: on Python 3.9 its
     # cleanup raises on a file an install left read-only, which would turn a
     # finished UI diff into a failure.
-    run_tmp = tempfile.mkdtemp(prefix="rol-ui-diff-run-")
+    # Inside this review's run directory, which the sandbox lets this run (and
+    # no other) read and write.
+    run_tmp = tempfile.mkdtemp(prefix="rol-ui-diff-run-", dir=str(run_dir))
     try:
         env["TMPDIR"] = run_tmp
         timeout = int(settings.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS)
@@ -962,7 +1004,7 @@ def run_stage(
             notes: List[str] = []
             branch = str(settings.get("assets_branch") or DEFAULT_ASSETS_BRANCH)
             try:
-                workspace = publish_workspace(out_dir, config_settings, env)
+                workspace = publish_workspace(out_dir, config_settings, env, parent=run_dir)
             except (OSError, ValueError) as exc:
                 reason = _one_line(f"could not prepare the publish step: {exc}")
                 return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
