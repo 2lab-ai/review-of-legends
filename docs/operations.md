@@ -758,8 +758,8 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   inside a link's target, and each directory of the final path; so are the granted roots. Such
   an entry inside a granted place fails the stage. Without a sandbox the cache directories are
   used as configured (a cache symlinked to preinstalled browsers stays). Beyond files, the profile refuses launchd job creation, LaunchServices opens,
-  AppleEvents, the keychain service, looking into other processes, and `osascript`/`automator`/
-  `shortcuts`/`open`; a program the PR's own code builds to send AppleEvents still needs macOS
+  AppleEvents, the keychain service, `proc_info` looks into other processes, and
+  `osascript`/`automator`/`shortcuts`/`open`; a program the PR's own code builds to send AppleEvents still needs macOS
   Automation consent, which a headless review daemon does not hold. Publish also runs sandboxed,
   with the secret paths unreadable (its own copy under `cache_dir/publish` excepted), so a report
   the PR's code tampered with cannot make it upload the App key: under a sandbox the caches are kept per
@@ -771,7 +771,11 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   it on any host where a PR author must not reach other credentials. A configured sandbox fails
   closed: without `sandbox-exec` the PR's code is not run and the section says why. The work
   directory and `cache_dir` must not sit under a `deny` path. This is an allow-default profile
-  that closes the paths and services above, not a full jail.
+  that closes the paths and services above, not a full jail. **It does not hide other processes'
+  arguments and environment:** macOS gives those to any process of the same user (`sysctl
+  KERN_PROCARGS2`) and the sandbox has no rule for it. On a host where processes of the daemon's
+  user carry secrets in their environment (other services' tokens and keys), the PR's code can
+  read them: run the daemon as a user whose processes hold none, or keep the UI diff off there.
 - **Pushing needs Contents: write.** The default App has Contents: read; without write, the push is
   refused (ui-diff exits 3) and the section is posted text-only (changed captures, percentages,
   summary) with a note saying why. `upload: false` posts text-only on purpose.

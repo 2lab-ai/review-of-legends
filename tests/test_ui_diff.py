@@ -330,18 +330,18 @@ class SandboxTest(unittest.TestCase):
     def test_this_clone_this_runs_temp_and_this_repositorys_caches_are_allowed_last(self) -> None:
         run = os.path.realpath("/srv/rol/data/work/acme-corp__web/pr-7")
         profile = ui_diff.sandbox_profile(self.config(), Path("/srv/rol/config"), source=Path(run) / "source",
-                                          scratch=Path(run) / "rol-ui-diff-run-x", repo="Acme-Corp/Web")
+                                          scratch=Path(run) / "ud-x", repo="Acme-Corp/Web")
         lines = profile.splitlines()
         repo_cache = os.path.realpath("/srv/rol/data/ui-diff/repositories/acme-corp/web")
         grants = [line for line in lines if line.startswith("(allow file-read* file-write*")]
         self.assertEqual(grants, [
             f'(allow file-read* file-write* (subpath "{run}/source"))',
-            f'(allow file-read* file-write* (subpath "{run}/rol-ui-diff-run-x"))',
+            f'(allow file-read* file-write* (subpath "{run}/ud-x"))',
             f'(allow file-read* file-write* (subpath "{repo_cache}"))',
         ])
         after = lines[lines.index(grants[-1]) + 1:]
         # The granted roots cannot be swapped out from under the daemon.
-        for path in (run + "/source", run + "/rol-ui-diff-run-x", repo_cache):
+        for path in (run + "/source", run + "/ud-x", repo_cache):
             self.assertIn(f'(deny file-write* (literal "{path}"))', after)
         # The run directory itself (the service's artifacts) is not granted: its
         # entry may be stat()ed on the way to the clone, nothing more.
@@ -434,6 +434,25 @@ class SandboxTest(unittest.TestCase):
         config = self.config(deny=["/srv/rol/data/work/x/pr-7/link/secret"])
         with self.assertRaises(ValueError):
             ui_diff.sandbox_profile(config, Path("/srv/rol/config"), source=Path("/srv/rol/data/work/x/pr-7"))
+
+    def test_a_mode_repair_never_follows_a_link_swapped_in_after_the_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            protected = root / "protected"
+            protected.mkdir()
+            protected.chmod(0o755)
+            os.symlink(str(protected), str(root / "home"))
+            real_dir = os.lstat(str(protected))
+            # The check saw a directory; by the chmod the entry is a link (the race).
+            with mock.patch.object(ui_diff.os, "lstat", lambda path: real_dir):
+                ui_diff._plain_dir(root / "home", repair=True)
+            self.assertEqual(protected.stat().st_mode & 0o777, 0o755)
+
+    def test_relative_path_entries_are_dropped(self) -> None:
+        settings = {"command": ["/usr/local/bin/node", "x.mjs"]}
+        path = ui_diff._run_path(settings, {"PATH": "../../../bin:/opt/tools/bin:.:bin"})
+        self.assertEqual(path.split(os.pathsep)[:2], ["/usr/local/bin", "/opt/tools/bin"])
+        self.assertTrue(all(os.path.isabs(entry) for entry in path.split(os.pathsep)))
 
     def test_without_a_sandbox_a_symlinked_cache_is_kept(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

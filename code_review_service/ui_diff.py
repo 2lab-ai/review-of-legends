@@ -405,7 +405,10 @@ def _run_path(settings: Dict[str, Any], source: Any) -> str:
     for entry in str(source.get("PATH") or "").split(os.pathsep) + [
         "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
     ]:
-        if entry and entry not in entries:
+        # Absolute entries only: a relative one means a different directory in
+        # each step's working directory (the clone, the publish copy), so what
+        # is protected for one step is not what the other step finds.
+        if entry and os.path.isabs(entry) and entry not in entries:
             entries.append(entry)
     return os.pathsep.join(entries)
 
@@ -539,10 +542,20 @@ def _plain_dir(path: Path, repair: bool) -> None:
         if not stat.S_ISDIR(os.lstat(str(path)).st_mode):
             raise ValueError(f"{path} is not a plain directory")
     if repair:
+        # Through a no-follow descriptor: a concurrent run's PR code could swap
+        # the entry for a symlink after the lstat above, and a path chmod would
+        # follow it to whatever it names.
         try:
-            os.chmod(str(path), 0o700)
+            fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            return
+        try:
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                os.fchmod(fd, 0o700)
         except OSError:
             pass
+        finally:
+            os.close(fd)
 
 
 def prepare_cache(config: Dict[str, Any], config_dir: Path, repo: str) -> Path:
@@ -593,7 +606,10 @@ _ESCAPE_RULES = [
     "(deny lsopen)",
     "(deny appleevent-send)",
     '(deny mach-lookup (global-name "com.apple.SecurityServer"))',
-    # No looking into other processes (a concurrent publish's environment).
+    # No proc_info looks into other processes (their open files, paths). This
+    # does not hide their arguments and environment: macOS hands those to any
+    # process of the same user (sysctl KERN_PROCARGS2) and the sandbox has no
+    # rule for it, so secrets in other processes' environments stay readable.
     "(deny process-info* (target others))",
     '(deny process-exec (literal "/usr/bin/osascript"))',
     '(deny process-exec (literal "/usr/bin/automator"))',
@@ -1191,7 +1207,8 @@ def run_stage(
     # finished UI diff into a failure. Beside the clone, in this review's run
     # directory; the sandbox grants this directory and the clone, nothing else
     # of the run directory.
-    run_tmp = tempfile.mkdtemp(prefix="rol-ui-diff-run-", dir=str(run_dir))
+    # A short name: browsers put Unix sockets under TMPDIR (104-byte limit on macOS).
+    run_tmp = tempfile.mkdtemp(prefix="ud-", dir=str(run_dir))
     try:
         try:
             profile = sandbox_profile(config, config_dir, source=source, scratch=Path(run_tmp), repo=repo, cache=cache)
