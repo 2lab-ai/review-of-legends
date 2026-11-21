@@ -725,16 +725,17 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   `visual_outline.ui_diff.env`. Only `publish` — ui-diff's own code — gets the App's installation
   token (for `gh` and the push). It runs in a fresh temporary repository outside the clone, with a
   copy of `.ui-diff` that keeps regular files only (no symlink — `.ui-diff` itself included — FIFO or
-  file over 64 MiB; at most 5000 files and 1 GiB), git hooks switched off, and the ui-diff config as read before the PR's code ran, without its `publish`
+  file over 64 MiB; at most 5000 files and 1 GiB), a fresh `HOME` with no npm user config (the run
+  step's `HOME` and caches were writable by the PR's code), git hooks switched off, and the ui-diff config as read before the PR's code ran, without its `publish`
   block; remote, branch, repository and image link base
   are passed on the command line, so a repository's config cannot point the upload anywhere else
   or allow a public upload.
 - **Trust.** This is still the PR's code running on the review host as the daemon's user, without
   a sandbox: it can read whatever that user can, the App key included. Turn the UI diff on only
   for private repositories whose PR authors you already trust with that host (as with a
-  self-hosted CI runner). Only a head that GitHub places in the repository itself runs: a fork's
-  PR, or one whose fork was deleted, never does. `once --dry-run` renders the section text-only
-  and pushes nothing.
+  self-hosted CI runner). Only a head that GitHub places in the repository itself runs (by
+  repository id when GitHub sends both): a fork's PR, or one whose fork was deleted, never does.
+  `once --dry-run` renders the section text-only and pushes nothing.
 - **Pushing needs Contents: write.** The default App has Contents: read; without write, the push is
   refused (ui-diff exits 3) and the section is posted text-only (changed captures, percentages,
   summary) with a note saying why. `upload: false` posts text-only on purpose.

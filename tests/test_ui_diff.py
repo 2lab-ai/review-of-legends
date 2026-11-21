@@ -176,6 +176,11 @@ class RepositorySettingsTest(unittest.TestCase):
             {"visual_outline": {"ui_diff": {"timeout_seconds": 0}}},
             {"visual_outline": {"ui_diff": {"max_concurrent": True}}},
             {"visual_outline": {"ui_diff": {"assets_branch": "../main"}}},
+            {"visual_outline": {"ui_diff": {"assets_branch": "assets.lock"}}},
+            {"visual_outline": {"ui_diff": {"assets_branch": "assets/"}}},
+            {"visual_outline": {"ui_diff": {"assets_branch": "a//b"}}},
+            {"visual_outline": {"ui_diff": {"assets_branch": "a@{b"}}},
+            {"visual_outline": {"ui_diff": {"assets_branch": "a/.hidden"}}},
             {"visual_outline": {"ui_diff": {"env": {"HOME": "/tmp"}}}},
             {"visual_outline": {"ui_diff": {"env": {"GIT_CONFIG_COUNT": "1"}}}},
             {"visual_outline": {"ui_diff": {"env": {"VITE_MODE": 1}}}},
@@ -228,6 +233,10 @@ class RepositorySettingsTest(unittest.TestCase):
         config["visual_outline"]["repositories"] = {}
         self.assertNotIn(["codex", "exec"], svc.runner_commands(config))
         self.assertIn(["codex", "exec"], svc.runner_commands(config, outline_enabled=True))
+        # ...and a repository switched off is left out even where the config turns it on elsewhere.
+        config["visual_outline"]["enabled"] = True
+        self.assertNotIn(["codex", "exec"], svc.runner_commands(config, outline_enabled=False))
+        config["visual_outline"]["enabled"] = False
         policy = {"model": "m", "source": "config"}
         self.assertFalse(svc.policy_applies_everywhere(config, policy, outline_enabled=True))
         self.assertTrue(svc.policy_applies_everywhere(config, policy, outline_enabled=False))
@@ -319,6 +328,10 @@ class RunStageTest(unittest.TestCase):
         self.assertEqual(run["env"]["PLAYWRIGHT_BROWSERS_PATH"], str(self.tmp / "cache" / "ms-playwright"))
         self.assertEqual(run["env"]["GIT_CONFIG_GLOBAL"], os.devnull)
         self.assertEqual(publish["env"]["GH_TOKEN"], "token-for-publish")
+        # publish never shares the HOME (or npm config) the PR's code could write.
+        self.assertNotEqual(publish["env"]["HOME"], run["env"]["HOME"])
+        self.assertEqual(publish["env"]["npm_config_userconfig"], os.devnull)
+        self.assertNotIn("PLAYWRIGHT_BROWSERS_PATH", publish["env"])
         args = publish["args"]
         self.assertIn("--no-comment", args)
         self.assertEqual(args[args.index("--remote") + 1], f"https://github.com/{REPO}.git")
@@ -395,10 +408,35 @@ class RunStageTest(unittest.TestCase):
 
     def test_a_worker_that_ignores_sigterm_is_killed(self) -> None:
         script = self.tmp / "stubborn.py"
-        script.write_text("import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(60)\n")
+        pid_file = self.tmp / "stubborn.pid"
+        script.write_text(
+            "import os, signal, sys, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\ntime.sleep(60)\n"
+        )
         with mock.patch.object(ui_diff, "TERM_GRACE_SECONDS", 0.5):
             code, _, _ = ui_diff._run_group([sys.executable, str(script)], self.tmp, dict(os.environ), 1)
         self.assertIsNone(code)
+        self.assertTrue(_gone(int(pid_file.read_text())), "the SIGTERM-ignoring worker survived")
+
+    def test_a_cancelled_step_is_never_started(self) -> None:
+        import threading
+        cancel = threading.Event()
+        cancel.set()
+        marker = self.tmp / "started"
+        code, out, err = ui_diff._run_group(
+            [sys.executable, "-c", f"open({str(marker)!r}, 'w').write('x')"], self.tmp, dict(os.environ), 10, cancel
+        )
+        self.assertEqual((code, out, err), (None, "", ""))
+        self.assertFalse(marker.exists())
+
+    def test_the_same_repository_is_decided_by_id(self) -> None:
+        self.behaviour()
+        renamed = _pr(head_repo="acme-corp/old-name")
+        renamed["head"]["repo"]["id"] = renamed["base"]["repo"]["id"] = 42
+        self.assertNotEqual(self.run_stage(_config(self.tmp), renamed).status, "skipped")
+        impostor = _pr()
+        impostor["head"]["repo"]["id"], impostor["base"]["repo"]["id"] = 7, 42
+        self.assertEqual(self.run_stage(_config(self.tmp), impostor).status, "skipped")
 
     def test_a_queued_stage_gives_up_on_cancel_without_running(self) -> None:
         self.behaviour()
@@ -802,6 +840,38 @@ class ReviewIntegrationTest(unittest.TestCase):
             self.review(client, self.config())
         self.assertTrue(removed and all(removed), "the clone outlived the running UI diff")
         self.assertIn("update", [call[0] for call in client.calls], "the section still lands")
+
+    def test_a_failed_review_closes_the_required_check_before_joining(self) -> None:
+        client = _Client()
+        statuses: list[str] = []
+
+        def create_commit_status(sha, state, description, target_url, context=None):
+            if "required" in str(context):
+                statuses.append(state)
+
+        def boom(*args, **kwargs):
+            raise svc.ServiceError("GitHub said no")
+
+        client.create_commit_status = create_commit_status
+        client.create_review = boom
+        seen: list[list[str]] = []
+
+        def hold(**kw):
+            # The worker is still running here; the check must already be closed
+            # by the time the review joins it, so wait for that.
+            import time as _time
+            deadline = _time.monotonic() + 10
+            while "error" not in statuses and _time.monotonic() < deadline:
+                _time.sleep(0.05)
+            seen.append(list(statuses))
+
+        self.stage_hook = hold
+        config = self.config()
+        config["agents"][0]["required"] = True
+        with self.assertRaises(svc.ServiceError):
+            self.review(client, config)
+        self.assertEqual(seen and seen[0][-1], "error", "the required check stayed pending during the join")
+        self.assertEqual(statuses.count("error"), 1)
 
     def test_a_dashboard_switch_runs_the_outline_without_a_config_block(self) -> None:
         client = _Client()

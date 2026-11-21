@@ -6938,6 +6938,10 @@ def review_pr(
             job, ui_diff_job = ui_diff_job, None
             if job is None:
                 return
+            if sys.exc_info()[0] is not None and status_open:
+                # The attempt is failing (an error is being handled): the merge
+                # check must not stay pending while the UI diff is joined.
+                required_status("error", "review did not finish; check the dashboard")
             try:
                 outcome = job.result(ui_diff.join_timeout(config))
                 if outcome is None:

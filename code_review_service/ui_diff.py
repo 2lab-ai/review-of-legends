@@ -73,6 +73,15 @@ _RESERVED_ENV_PREFIXES = ("GIT_CONFIG", "GIT_ASKPASS", "SSH_")
 # --------------------------------------------------------------- settings
 
 
+def _valid_branch(name: Any) -> bool:
+    """A branch name git accepts (git check-ref-format), in the plain subset used here."""
+    if not isinstance(name, str) or not _BRANCH_PATTERN.fullmatch(name):
+        return False
+    if ".." in name or "//" in name or "@{" in name or name.endswith(("/", ".", ".lock")):
+        return False
+    return not any(part.startswith(".") or part.endswith(".lock") for part in name.split("/"))
+
+
 def _repo_key(repo: str) -> str:
     return str(repo or "").strip().lower()
 
@@ -202,7 +211,7 @@ def validate(config: Dict[str, Any]) -> None:
         if key in settings and not isinstance(settings[key], bool):
             raise ValueError(f"config.visual_outline.ui_diff.{key} must be true or false")
     branch = settings.get("assets_branch")
-    if branch is not None and (not isinstance(branch, str) or not _BRANCH_PATTERN.fullmatch(branch) or ".." in branch):
+    if branch is not None and not _valid_branch(branch):
         raise ValueError("config.visual_outline.ui_diff.assets_branch must be a plain branch name")
     cache_dir = settings.get("cache_dir")
     if cache_dir is not None and (not isinstance(cache_dir, str) or not cache_dir.strip()):
@@ -403,6 +412,14 @@ def run_environ(config: Dict[str, Any], config_dir: Path, base: Optional[Dict[st
     return env
 
 
+def _tool(name: str, *candidates: str) -> str:
+    """An absolute path for a system tool: launchd gives the daemon a short PATH."""
+    for candidate in candidates:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return shutil.which(name) or name
+
+
 def _descendant_groups(root_pid: int) -> List[int]:
     """The process groups of every descendant of ``root_pid`` (ps), best effort.
 
@@ -411,7 +428,8 @@ def _descendant_groups(root_pid: int) -> List[int]:
     """
     try:
         listing = subprocess.run(
-            ["ps", "-axo", "pid=,ppid=,pgid="], capture_output=True, text=True, timeout=10, check=False
+            [_tool("ps", "/bin/ps", "/usr/bin/ps"), "-axo", "pid=,ppid=,pgid="],
+            capture_output=True, text=True, timeout=10, check=False,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return []
@@ -450,7 +468,7 @@ def _groups_working_under(paths: List[str]) -> List[int]:
         return []
     try:
         listing = subprocess.run(
-            ["lsof", "-a", "-u", str(os.getuid()), "-d", "cwd", "-F", "pn"],
+            [_tool("lsof", "/usr/sbin/lsof", "/usr/bin/lsof"), "-a", "-u", str(os.getuid()), "-d", "cwd", "-F", "pn"],
             capture_output=True, text=True, timeout=30, check=False,
         ).stdout
     except (OSError, subprocess.SubprocessError):
@@ -507,6 +525,8 @@ def _run_group(
     pipes, so a child that inherits them cannot hold the call open.
     ``(exit, stdout, stderr)``, exit None when stopped.
     """
+    if cancel is not None and cancel.is_set():
+        return None, "", ""
     with tempfile.TemporaryFile() as out_file, tempfile.TemporaryFile() as err_file:
         proc = subprocess.Popen(
             args,
@@ -545,11 +565,19 @@ def _run_group(
         # found by the tree it had and by where it works.
         groups += [group for group in [proc.pid] + _groups_working_under(list(sweep or [])) if group not in groups]
         _kill_groups([group for group in groups if group != os.getpgid(0)], signal.SIGKILL)
-        out_file.seek(0)
-        err_file.seek(0)
-        out = out_file.read().decode("utf-8", "replace")
-        err = err_file.read().decode("utf-8", "replace")
+        out = _tail(out_file)
+        err = _tail(err_file)
     return (None if stopped else proc.returncode), out, err
+
+
+#: The most of a step's stdout or stderr kept (its end, where the result and the error are).
+MAX_OUTPUT_BYTES = 1024 * 1024
+
+
+def _tail(handle: Any) -> str:
+    size = handle.seek(0, os.SEEK_END)
+    handle.seek(max(0, size - MAX_OUTPUT_BYTES))
+    return handle.read().decode("utf-8", "replace")
 
 
 def _last_json(text: str) -> Dict[str, Any]:
@@ -651,6 +679,25 @@ MAX_PUBLISH_TOTAL_BYTES = 1024 * 1024 * 1024
 MAX_PUBLISH_FILES = 5000
 
 
+def _publish_base(env: Dict[str, str], workspace: Path) -> Dict[str, str]:
+    """The publish step's environment before the credential: a HOME of its own.
+
+    The run step's HOME and caches were writable by the PR's code (an
+    ``~/.npmrc`` planted there would reach npm if ui-diff rebuilt itself), so
+    publish gets a fresh HOME inside its workspace and no npm user config.
+    """
+    home = workspace / ".home"
+    home.mkdir(mode=0o700, exist_ok=True)
+    base = {key: value for key, value in env.items() if key not in ("npm_config_cache", "PLAYWRIGHT_BROWSERS_PATH")}
+    base.update({
+        "HOME": str(home),
+        "npm_config_userconfig": os.devnull,
+        "npm_config_globalconfig": os.devnull,
+        "npm_config_cache": str(home / "npm-cache"),
+    })
+    return base
+
+
 def publish_workspace(out_dir: Path, settings: Dict[str, Any], env: Dict[str, str]) -> Path:
     """A fresh repository for ``ui-diff publish``, outside the clone the PR's code ran in.
 
@@ -715,7 +762,6 @@ def run_stage(
     publish_env: Callable[[Dict[str, str]], Dict[str, str]],
     log: Callable[[str], None],
     write_text: Callable[[Path, str], None],
-    clock: Callable[[], float] = time.monotonic,
     upload: bool = True,
     cancel: Optional[threading.Event] = None,
 ) -> Outcome:
@@ -726,15 +772,23 @@ def run_stage(
     ``upload=False`` (a dry run) renders text-only and pushes nothing.
     ``cancel`` (set by ``Job.cancel``) stops whatever runs and ends the stage.
     """
+    clock = time.monotonic
     started = clock()
     settings = ui_diff_block(config)
     number = int(pr.get("number") or 0)
     head_sha = str((pr.get("head") or {}).get("sha") or "")
     base_sha = str((pr.get("base") or {}).get("sha") or "")
-    head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name")
+    head_info = (pr.get("head") or {}).get("repo") or {}
+    base_info = (pr.get("base") or {}).get("repo") or {}
+    head_repo = head_info.get("full_name")
     # Only a head that GitHub places in this very repository: a fork's head, or
-    # one whose fork was deleted (head.repo null), is someone else's code.
-    if not head_repo or _repo_key(head_repo) != _repo_key(repo):
+    # one whose fork was deleted (head.repo null), is someone else's code. The
+    # ids decide when both are known (a renamed repository keeps its id).
+    if head_info.get("id") and base_info.get("id"):
+        same = head_info.get("id") == base_info.get("id")
+    else:
+        same = bool(head_repo) and _repo_key(head_repo) == _repo_key(repo)
+    if not same:
         return Outcome(
             None, "skipped", f"the head is not in {repo} (head repository: {head_repo or 'deleted'}); ui-diff never runs it"
         )
@@ -814,8 +868,8 @@ def run_stage(
                     notes.append("Dry run: screenshots were not uploaded.")
                 elif settings.get("upload", True):
                     code, stdout, stderr = _run_group(
-                        publish_args, workspace, _harden_git(publish_env(dict(env))), publish_timeout, cancel,
-                        sweep=[str(workspace)],
+                        publish_args, workspace, _harden_git(publish_env(_publish_base(env, workspace))),
+                        publish_timeout, cancel, sweep=[str(workspace)],
                     )
                     write_text(artifact_dir / "ui-diff.publish.stdout.txt", stdout)
                     write_text(artifact_dir / "ui-diff.publish.stderr.txt", stderr)
@@ -833,8 +887,8 @@ def run_stage(
                     notes.append("Screenshots are not uploaded on this deployment (visual_outline.ui_diff.upload is off).")
                 if status == "text-only":
                     code, stdout, stderr = _run_group(
-                        publish_args + ["--no-upload"], workspace, _harden_git(env), publish_timeout, cancel,
-                        sweep=[str(workspace)],
+                        publish_args + ["--no-upload"], workspace, _harden_git(_publish_base(env, workspace)),
+                        publish_timeout, cancel, sweep=[str(workspace)],
                     )
                     write_text(artifact_dir / "ui-diff.render.stderr.txt", stderr)
                     if code != 0:
@@ -860,6 +914,8 @@ def run_stage(
         return Outcome(section, status, "; ".join(notes))
     finally:
         shutil.rmtree(run_tmp, ignore_errors=True)
+        if os.path.exists(run_tmp):
+            log(f"{repo} pr #{number}: ui-diff left {run_tmp} behind (could not remove it); remove it by hand")
 
 
 #: How long a cancelled stage may take to stop: a poll, ui-diff's SIGTERM grace, the SIGKILL wait.
