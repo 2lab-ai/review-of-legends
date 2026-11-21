@@ -1296,39 +1296,47 @@ MAX_ARCHIVE_SLACK_BYTES = 64 * 1024 * 1024
 
 def _copy_out(args: List[str], env: Dict[str, str], archive: Path, limit: int, timeout: int) -> Tuple[int, str]:
     """Run ``args`` (``docker cp … -``) into ``archive``, never more than ``limit``
-    bytes on the host: past it, or past ``timeout``, the copy is killed.
-    ``(exit, stderr tail)``."""
-    deadline = time.monotonic() + timeout
+    bytes on the host: past it the copy is killed, and a watchdog kills it at
+    ``timeout`` even while a read waits on a stalled stream. ``(exit, detail)``."""
     with tempfile.TemporaryFile() as err_file, archive.open("wb") as handle:
         proc = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err_file)
+        expired = threading.Event()
+
+        def expire() -> None:
+            expired.set()
+            proc.kill()
+
+        watchdog = threading.Timer(timeout, expire)
+        watchdog.daemon = True
+        watchdog.start()
         written = 0
-        reason = ""
+        too_big = False
         try:
             assert proc.stdout is not None
             while True:
-                if time.monotonic() > deadline:
-                    reason = f"timed out after {timeout} seconds"
-                    break
                 chunk = proc.stdout.read(1024 * 1024)
                 if not chunk:
                     break
                 written += len(chunk)
                 if written > limit:
-                    reason = f"the output is larger than {limit // (1024 * 1024)} MiB"
+                    too_big = True
+                    proc.kill()
                     break
                 handle.write(chunk)
         finally:
-            if reason:
-                proc.kill()
-            proc.stdout.close() if proc.stdout else None
+            watchdog.cancel()
+            if proc.stdout is not None:
+                proc.stdout.close()
             try:
                 proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=10)
         err = _tail(err_file)
-    if reason:
-        return 1, reason
+    if too_big:
+        return 1, f"the output is larger than {limit // (1024 * 1024)} MiB"
+    if expired.is_set():
+        return 1, f"timed out after {timeout} seconds"
     return proc.returncode, err[-2000:]
 
 
@@ -1355,40 +1363,69 @@ def run_in_container(
     out_dir = scratch / "out"
     out_dir.mkdir(mode=0o700)
     try:
-        created = subprocess.run(
-            container_create_args(config, repo, name, base_sha, head_sha, clone=source.name),
-            env=env, capture_output=True, text=True, timeout=120, check=False,
-        )
-        if created.returncode != 0:
-            return created.returncode, created.stdout, "docker create failed: " + created.stderr, out_dir
-        # The clone directory itself (its owner kept, so the run may write it),
-        # symlinks copied as links (never followed on the host).
-        code, stdout, stderr = _run_group(
-            # -a: keep the clone's uid/gid, which the run's --user matches.
-            [docker, "cp", "-a", str(source), f"{name}:{CONTAINER_WORK}/"], scratch, env,
-            CONTAINER_COPY_TIMEOUT_SECONDS, cancel,
-        )
-        if code != 0:
-            return code, stdout, "copying the clone into the container failed: " + stderr, out_dir
-        code, stdout, stderr = _run_group([docker, "start", "-a", name], scratch, env, timeout, cancel)
-        if code != 0:
-            return code, stdout, stderr, out_dir
-        archive = scratch / "out.tar"
-        returncode, detail = _copy_out(
-            [docker, "cp", f"{name}:{CONTAINER_WORK}/{source.name}/.ui-diff", "-"], env, archive,
-            MAX_PUBLISH_TOTAL_BYTES + MAX_ARCHIVE_SLACK_BYTES, CONTAINER_COPY_TIMEOUT_SECONDS,
-        )
-        if returncode != 0:
-            return returncode, stdout, stderr + "\ncopying the result out of the container failed: " + detail, out_dir
-        extract_output(archive, out_dir)
-        archive.unlink()
-        return code, stdout, stderr, out_dir
+        code, stdout, stderr = _container_steps(config, repo, source, scratch, base_sha, head_sha, timeout, cancel,
+                                                docker, env, name, out_dir)
     finally:
         # Also stops it: a docker CLI killed on timeout leaves its container running.
-        try:
-            subprocess.run([docker, "rm", "-f", name], env=env, capture_output=True, timeout=120, check=False)
-        except (OSError, subprocess.SubprocessError):
-            pass
+        left = _remove_container(docker, env, name)
+    if left:
+        stderr += f"\n(the container {name} could not be removed: {left}; remove it with docker rm -f {name})"
+    return code, stdout, stderr, out_dir
+
+
+def _remove_container(docker: str, env: Dict[str, str], name: str) -> str:
+    """``docker rm -f``; empty when gone, otherwise why not."""
+    try:
+        removed = subprocess.run([docker, "rm", "-f", name], env=env, capture_output=True, text=True, timeout=120,
+                                 check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"{exc.__class__.__name__}: {exc}"
+    return "" if removed.returncode == 0 else _one_line(removed.stderr or f"exit {removed.returncode}")
+
+
+def _container_steps(
+    config: Dict[str, Any],
+    repo: str,
+    source: Path,
+    scratch: Path,
+    base_sha: str,
+    head_sha: str,
+    timeout: int,
+    cancel: Optional[threading.Event],
+    docker: str,
+    env: Dict[str, str],
+    name: str,
+    out_dir: Path,
+) -> Tuple[Optional[int], str, str]:
+    """create, copy in, start, copy out: ``run_in_container`` without the removal."""
+    created = subprocess.run(
+        container_create_args(config, repo, name, base_sha, head_sha, clone=source.name),
+        env=env, capture_output=True, text=True, timeout=120, check=False,
+    )
+    if created.returncode != 0:
+        return created.returncode, created.stdout, "docker create failed: " + created.stderr
+    # The clone directory itself (its owner kept, so the run may write it),
+    # symlinks copied as links (never followed on the host).
+    code, stdout, stderr = _run_group(
+        # -a: keep the clone's uid/gid, which the run's --user matches.
+        [docker, "cp", "-a", str(source), f"{name}:{CONTAINER_WORK}/"], scratch, env,
+        CONTAINER_COPY_TIMEOUT_SECONDS, cancel,
+    )
+    if code != 0:
+        return code, stdout, "copying the clone into the container failed: " + stderr
+    code, stdout, stderr = _run_group([docker, "start", "-a", name], scratch, env, timeout, cancel)
+    if code != 0:
+        return code, stdout, stderr
+    archive = scratch / "out.tar"
+    returncode, detail = _copy_out(
+        [docker, "cp", f"{name}:{CONTAINER_WORK}/{source.name}/.ui-diff", "-"], env, archive,
+        MAX_PUBLISH_TOTAL_BYTES + MAX_ARCHIVE_SLACK_BYTES, CONTAINER_COPY_TIMEOUT_SECONDS,
+    )
+    if returncode != 0:
+        return returncode, stdout, stderr + "\ncopying the result out of the container failed: " + detail
+    extract_output(archive, out_dir)
+    archive.unlink()
+    return code, stdout, stderr
 
 
 def host_environ(settings: Dict[str, Any], source: Optional[Dict[str, str]] = None) -> Dict[str, str]:

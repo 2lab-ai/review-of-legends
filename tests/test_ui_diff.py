@@ -169,6 +169,13 @@ FAKE_DOCKER = textwrap.dedent(
             if behaviour.get("huge_tar"):
                 sys.stdout.buffer.write(b"\\0" * behaviour["huge_tar"])
                 sys.exit(0)
+            if behaviour.get("stall_cp"):
+                # A transfer that stops mid-stream with the pipe still open.
+                import time
+                sys.stdout.buffer.write(b"\\0" * 512)
+                sys.stdout.buffer.flush()
+                time.sleep(behaviour["stall_cp"])
+                sys.exit(0)
             local = state / name / path.lstrip("/")
             out = io.BytesIO()
             with tarfile.open(fileobj=out, mode="w") as archive:
@@ -199,6 +206,9 @@ FAKE_DOCKER = textwrap.dedent(
         (root / "cache").mkdir(exist_ok=True)
         sys.exit(subprocess.call([mapped(arg, root) for arg in spec["command"]], cwd=mapped(spec["workdir"], root), env=env))
     if args[0] == "rm":
+        if behaviour.get("rm_fails"):
+            sys.stderr.write("Error response from daemon: cannot remove container\\n")
+            sys.exit(1)
         shutil.rmtree(state / args[-1], ignore_errors=True)
         sys.exit(0)
     sys.exit(125)
@@ -1204,7 +1214,8 @@ class ContainerTest(unittest.TestCase):
         volumes = [create[i + 1] for i, arg in enumerate(create) if arg == "-v"]
         self.assertEqual(volumes, [f"{ui_diff.container_volume(REPO)}:/cache"], "no host path is mounted")
         self.assertTrue(ui_diff.container_volume(REPO).startswith("rol-ui-diff-acme_corp-web-"))
-        self.assertNotEqual(ui_diff.container_volume("a-b/c"), ui_diff.container_volume("a/b-c"))
+        # Cleaned the same ("a_b-c"), still two volumes.
+        self.assertNotEqual(ui_diff.container_volume("a+b/c"), ui_diff.container_volume("a_b/c"))
         self.assertNotIn("docker.sock", " ".join(create))
         env = [create[i + 1] for i, arg in enumerate(create) if arg == "-e"]
         self.assertFalse([item for item in env if item.startswith(("GH_TOKEN", "GITHUB_TOKEN"))])
@@ -1261,6 +1272,41 @@ class ContainerTest(unittest.TestCase):
         self.assertEqual(outcome.status, "failed")
         self.assertIn("larger than 1 MiB", outcome.section)
         self.assertEqual(self.docker_calls()[-1][:2], ["rm", "-f"])
+
+    def test_a_stalled_copy_out_times_out_and_removes_the_container(self) -> None:
+        self.behaviour()
+        (self.docker / "docker-behaviour.json").write_text(json.dumps({"stall_cp": 60}))
+        import time as _time
+        started = _time.monotonic()
+        with mock.patch.object(ui_diff, "CONTAINER_COPY_TIMEOUT_SECONDS", 2):
+            outcome = self.run_stage()
+        self.assertLess(_time.monotonic() - started, 40)
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("timed out after 2 seconds", outcome.section)
+        self.assertEqual(self.docker_calls()[-1][:2], ["rm", "-f"])
+
+    def test_a_container_that_cannot_be_removed_is_named_in_the_result(self) -> None:
+        self.behaviour(run_exit=1)
+        (self.docker / "docker-behaviour.json").write_text(json.dumps({"rm_fails": True}))
+        source = self.tmp / "run" / "source"
+        code, stdout, stderr, _ = ui_diff.run_in_container(self.config, REPO, source, Path(tempfile.mkdtemp(dir=str(self.tmp))),
+                                                           BASE, HEAD, 30)
+        self.assertEqual(code, 1)
+        self.assertIn("could not be removed", stderr)
+        self.assertIn("docker rm -f rol-ui-diff-", stderr)
+
+    def test_extraction_stops_at_the_file_count_cap(self) -> None:
+        import io, tarfile
+        archive = self.tmp / "many.tar"
+        with tarfile.open(str(archive), "w") as stream:
+            for index in range(3):
+                info = tarfile.TarInfo(f".ui-diff/{index}.png")
+                info.size = 1
+                stream.addfile(info, io.BytesIO(b"x"))
+        dest = self.tmp / "many"
+        dest.mkdir()
+        with mock.patch.object(ui_diff, "MAX_PUBLISH_FILES", 2), self.assertRaises(ValueError):
+            ui_diff.extract_output(archive, dest)
 
     def test_a_run_past_its_timeout_removes_the_container(self) -> None:
         self.behaviour(run_sleep=30)
