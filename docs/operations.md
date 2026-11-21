@@ -745,8 +745,11 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   of every program publish starts afterwards outside the sandbox (the command's interpreter and
   script, `git`, `gh`; a program inside a Homebrew `Cellar` protects the whole Homebrew prefix),
   the directory of each symlink that leads to one, and the `deny_write` paths. Last, this review's
-  own run directory (its clone, ui-diff's worktrees and the publish copy all live there) and this
-  repository's own caches are readable and writable again: under a sandbox the caches are kept per
+  own run directory (its clone and ui-diff's worktrees) and this repository's own caches are
+  readable and writable again. Both are checked with `lstat` first and granted as checked, never
+  re-resolved: a cache directory a PR's code swapped for a symlink is replaced by a fresh
+  directory, a run directory that is not a plain directory fails the stage. The publish copy is
+  made under `cache_dir/publish`, which the run step can neither read nor write: under a sandbox the caches are kept per
   repository (`cache_dir/repositories/<owner>/<name>`), so one repository's PR code cannot plant
   a package or a browser build another repository's run picks up. A protected program inside one
   of those two writable places fails the stage instead of running unprotected. Publish holds the

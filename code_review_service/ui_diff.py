@@ -386,10 +386,13 @@ def cache_root(config: Dict[str, Any], config_dir: Path) -> Path:
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 
 
+def _quote(text: str) -> str:
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def _sbpl(path: Any) -> str:
     """A path as an SBPL string literal, resolved the way the kernel sees it (/tmp is /private/tmp)."""
-    real = os.path.realpath(os.path.expanduser(str(path)))
-    return '"' + real.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return _quote(os.path.realpath(os.path.expanduser(str(path))))
 
 
 def _run_path(settings: Dict[str, Any], source: Any) -> str:
@@ -462,12 +465,60 @@ def repository_cache_root(config: Dict[str, Any], config_dir: Path, repo: str) -
 
 
 def _inside(path: Path, roots: List[Path]) -> bool:
-    text = str(path).rstrip(os.sep) + os.sep
-    return any(text.startswith(str(root).rstrip(os.sep) + os.sep) for root in roots)
+    return any(path == root or path.is_relative_to(root) for root in roots)
+
+
+def _plain_dir(path: Path, repair: bool) -> None:
+    """``path`` is a real directory afterwards: created if missing; a symlink (or any
+    other entry) a PR's code planted there is removed and replaced when ``repair``,
+    refused otherwise. Never follows the entry."""
+    try:
+        info = os.lstat(str(path))
+    except FileNotFoundError:
+        os.mkdir(str(path), 0o700)
+        return
+    if stat.S_ISDIR(info.st_mode):
+        return
+    if not repair:
+        raise ValueError(f"{path} is not a plain directory")
+    os.unlink(str(path))
+    os.mkdir(str(path), 0o700)
+
+
+def prepare_cache(config: Dict[str, Any], config_dir: Path, repo: str) -> Path:
+    """Create the run's caches and return their root, every component checked.
+
+    The per-repository caches are writable by that repository's PR code, which
+    could swap a directory for a symlink (to the App key's directory, say). The
+    path is walked from the operator's cache root down with lstat, each such
+    entry replaced by a fresh directory, so neither the next run's environment
+    nor its sandbox rules follow it.
+    """
+    root = Path(os.path.realpath(str(cache_root(config, config_dir))))
+    root.mkdir(parents=True, exist_ok=True)
+    target = repository_cache_root(config, config_dir, repo)
+    current = root
+    for part in Path(os.path.abspath(str(target))).relative_to(Path(os.path.abspath(str(cache_root(config, config_dir))))).parts:
+        current = current / part
+        _plain_dir(current, repair=True)
+    for name in ("home", "npm-cache", "ms-playwright"):
+        _plain_dir(current / name, repair=True)
+    return current
+
+
+def checked_run_dir(run_dir: Path) -> Path:
+    """This review's run directory as the sandbox may grant it: a real directory, resolved by its parent."""
+    run_dir = Path(os.path.abspath(str(run_dir)))
+    _plain_dir(run_dir, repair=False)
+    return Path(os.path.realpath(str(run_dir.parent))) / run_dir.name
 
 
 def sandbox_profile(
-    config: Dict[str, Any], config_dir: Path, run_dir: Optional[Path] = None, repo: str = ""
+    config: Dict[str, Any],
+    config_dir: Path,
+    run_dir: Optional[Path] = None,
+    repo: str = "",
+    cache: Optional[Path] = None,
 ) -> Optional[str]:
     """The sandbox profile for ``ui-diff run``, or None when no sandbox is configured.
 
@@ -503,14 +554,19 @@ def sandbox_profile(
     # step's reach: the directories on PATH, and every program it starts.
     tools = _protected_tool_dirs(settings, _run_path(settings, os.environ))
     deny_write += tools
-    allow = [Path(os.path.realpath(str(path))) for path in (run_dir, repository_cache_root(config, config_dir, repo)) if path]
+    # Granted as checked (checked_run_dir, prepare_cache), never re-resolved:
+    # these two are writable by the PR's code, which could have swapped them
+    # for a symlink to something denied above.
+    allow = [Path(str(path)) for path in (run_dir, cache) if path]
+    if cache is None:
+        allow.append(Path(os.path.realpath(str(repository_cache_root(config, config_dir, repo)))))
     exposed = [tool for tool in tools if _inside(tool, allow)]
     if exposed:
         raise ValueError(f"{exposed[0]} (run by publish) is inside a directory the run step may write")
     lines = ["(version 1)", "(allow default)"]
     lines += [f"(deny file-read* file-write* (subpath {_sbpl(path)}))" for path in dict.fromkeys(map(str, deny))]
     lines += [f"(deny file-write* (subpath {_sbpl(path)}))" for path in dict.fromkeys(map(str, deny_write))]
-    lines += [f"(allow file-read* file-write* (subpath {_sbpl(path)}))" for path in dict.fromkeys(map(str, allow))]
+    lines += [f"(allow file-read* file-write* (subpath {_quote(str(path))}))" for path in dict.fromkeys(map(str, allow))]
     # Their parent directories may be stat()ed (realpath, mkdir -p walk up the
     # tree), never listed or read.
     ancestors: List[str] = []
@@ -518,12 +574,16 @@ def sandbox_profile(
         for parent in Path(path).parents:
             if str(parent) != os.sep and str(parent) not in ancestors:
                 ancestors.append(str(parent))
-    lines += [f"(allow file-read-metadata (literal {_sbpl(path)}))" for path in ancestors]
+    lines += [f"(allow file-read-metadata (literal {_quote(path)}))" for path in ancestors]
     return "\n".join(lines) + "\n"
 
 
 def run_environ(
-    config: Dict[str, Any], config_dir: Path, base: Optional[Dict[str, str]] = None, repo: str = ""
+    config: Dict[str, Any],
+    config_dir: Path,
+    base: Optional[Dict[str, str]] = None,
+    repo: str = "",
+    cache: Optional[Path] = None,
 ) -> Dict[str, str]:
     """The environment ``ui-diff run`` gets: no credential, a private HOME and caches.
 
@@ -534,13 +594,7 @@ def run_environ(
     """
     source = os.environ if base is None else base
     settings = ui_diff_block(config)
-    root = repository_cache_root(config, config_dir, repo)
-    for name in ("home", "npm-cache", "ms-playwright"):
-        (root / name).mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(str(root / name), 0o700)
-        except OSError:
-            pass
+    root = cache if cache is not None else prepare_cache(config, config_dir, repo)
     env = {
         "PATH": _run_path(settings, source),
         "HOME": str(root / "home"),
@@ -847,6 +901,12 @@ def _publish_base(env: Dict[str, str], workspace: Path) -> Dict[str, str]:
     return base
 
 
+def _publish_parent(config: Dict[str, Any], config_dir: Path) -> Path:
+    parent = Path(os.path.realpath(str(cache_root(config, config_dir)))) / "publish"
+    _plain_dir(parent, repair=True)
+    return parent
+
+
 def publish_workspace(
     out_dir: Path, settings: Dict[str, Any], env: Dict[str, str], parent: Optional[Path] = None
 ) -> Path:
@@ -963,11 +1023,12 @@ def run_stage(
         )
     command = [str(arg) for arg in settings.get("command") or []]
     out_dir = Path(source_dir) / ".ui-diff"
-    env = run_environ(config, config_dir, repo=repo)
-    run_dir = Path(source_dir).parent
     try:
-        profile = sandbox_profile(config, config_dir, run_dir=run_dir, repo=repo)
-    except ValueError as exc:
+        cache = prepare_cache(config, config_dir, repo)
+        run_dir = checked_run_dir(Path(source_dir).parent)
+        env = run_environ(config, config_dir, repo=repo, cache=cache)
+        profile = sandbox_profile(config, config_dir, run_dir=run_dir, repo=repo, cache=cache)
+    except (OSError, ValueError) as exc:
         reason = _one_line(f"the sandbox would not protect what publish runs: {exc}")
         return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
     if profile is not None and not os.access(SANDBOX_EXEC, os.X_OK):
@@ -1012,7 +1073,9 @@ def run_stage(
             notes: List[str] = []
             branch = str(settings.get("assets_branch") or DEFAULT_ASSETS_BRANCH)
             try:
-                workspace = publish_workspace(out_dir, config_settings, env, parent=run_dir)
+                # Outside every place the run step may write (the sandbox denies the
+                # cache root except this repository's own caches).
+                workspace = publish_workspace(out_dir, config_settings, env, parent=_publish_parent(config, config_dir))
             except (OSError, ValueError) as exc:
                 reason = _one_line(f"could not prepare the publish step: {exc}")
                 return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)

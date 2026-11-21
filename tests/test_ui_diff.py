@@ -426,8 +426,9 @@ class RunStageTest(unittest.TestCase):
         self.assertEqual(run["args"][run["args"].index("--head") + 1], HEAD)
         for name in ("GH_TOKEN", "GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY"):
             self.assertNotIn(name, run["env"], f"run must not see {name}")
-        self.assertEqual(run["env"]["HOME"], str(self.tmp / "cache" / "home"))
-        self.assertEqual(run["env"]["PLAYWRIGHT_BROWSERS_PATH"], str(self.tmp / "cache" / "ms-playwright"))
+        cache = Path(os.path.realpath(self.tmp / "cache"))
+        self.assertEqual(run["env"]["HOME"], str(cache / "home"))
+        self.assertEqual(run["env"]["PLAYWRIGHT_BROWSERS_PATH"], str(cache / "ms-playwright"))
         self.assertEqual(run["env"]["GIT_CONFIG_GLOBAL"], os.devnull)
         self.assertEqual(publish["env"]["GH_TOKEN"], "token-for-publish")
         # publish never shares the HOME (or npm config) the PR's code could write.
@@ -719,6 +720,40 @@ class RunStageTest(unittest.TestCase):
         publish = [args for args in calls if "publish" in args]
         self.assertTrue(publish, "the stage reached publish")
         self.assertTrue(all(args[0] == sys.executable for args in publish), "publish is never wrapped")
+
+    def test_a_planted_cache_symlink_is_replaced_before_anything_follows_it(self) -> None:
+        config, service = self.sandboxed_config(self.tmp / "secret")
+        key_dir = self.tmp / "keys"
+        key_dir.mkdir()
+        repo_cache = ui_diff.repository_cache_root(config, service, REPO)
+        repo_cache.parent.mkdir(parents=True)
+        os.symlink(str(key_dir), str(repo_cache))
+        os.symlink(str(key_dir), str(self.tmp / "home-link"))
+        cache = ui_diff.prepare_cache(config, service, REPO)
+        self.assertFalse(os.path.islink(str(repo_cache)), "the planted link was removed")
+        self.assertTrue((cache / "home").is_dir())
+        profile = ui_diff.sandbox_profile(config, service, run_dir=ui_diff.checked_run_dir(self.source.parent),
+                                          repo=REPO, cache=cache)
+        self.assertNotIn(str(os.path.realpath(key_dir)), profile)
+        self.assertEqual(sorted(os.listdir(key_dir)), [], "nothing was created through the link")
+
+    def test_a_symlinked_run_dir_is_refused(self) -> None:
+        real = self.tmp / "elsewhere"
+        real.mkdir()
+        os.symlink(str(real), str(self.tmp / "linked-run"))
+        with self.assertRaises(ValueError):
+            ui_diff.checked_run_dir(self.tmp / "linked-run")
+
+    def test_the_publish_copy_is_made_outside_the_run_directory(self) -> None:
+        self.behaviour()
+        outcome = self.run_stage(_config(self.tmp))
+        self.assertEqual(outcome.status, "ok", outcome.detail)
+        _, publish = self.records()
+        workspace = Path(publish["cwd"]).resolve()
+        self.assertFalse(workspace.is_relative_to(self.source.parent.resolve()) and
+                         not workspace.is_relative_to(Path(os.path.realpath(self.tmp / "cache"))),
+                         "publish works where the run step cannot write")
+        self.assertTrue(workspace.is_relative_to(Path(os.path.realpath(self.tmp / "cache")) / "publish"))
 
     def test_a_missing_sandbox_tool_fails_closed(self) -> None:
         self.behaviour()
