@@ -736,6 +736,46 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   self-hosted CI runner). Only a head that GitHub places in the repository itself runs (by
   repository id when GitHub sends both): a fork's PR, or one whose fork was deleted, never does.
   `once --dry-run` renders the section text-only and pushes nothing.
+- **Sandbox (macOS).** With `visual_outline.ui_diff.sandbox` set, the run step runs under
+  `/usr/bin/sandbox-exec` with a profile that allows everything except: reading or writing the
+  `deny` paths (e.g. the daemon user's home and other tenants' trees), the GitHub App key's
+  directory (resolved), `data/dashboard`, the review ledger, the review work directory (other
+  reviews' clones) and the ui-diff caches (other repositories'); writing the service tree, every
+  directory on the run's `PATH`, the real install
+  of every program publish starts afterwards outside the sandbox (the command's interpreter and
+  script, `git`, `gh`; a program inside a Homebrew `Cellar` protects the whole Homebrew prefix),
+  the directory of each symlink that leads to one, and the `deny_write` paths (`~` is expanded
+  in all of them, and in the App key path, before anything is resolved). Last, this review's
+  clone, this run's own temp directory (ui-diff's worktrees) and this repository's own caches are
+  readable and writable again; the rest of the review's run directory (the service's artifacts,
+  the reviewers' prompts and answers) stays out of reach. They are checked with `lstat` first and
+  granted as checked, never re-resolved: a cache directory a PR's code swapped for a symlink is
+  replaced by a fresh directory, a run directory or clone that is not a plain directory fails the
+  stage. The publish copy is made under `cache_dir/publish`, which the run step can neither read
+  nor write. Every entry the kernel looks up on the way to a protected or denied path, to a
+  program publish runs, to a `PATH` entry or to the App key is pinned (no rename, no replacement
+  by a symlink): each unresolved directory, each symlink followed one hop at a time, each link
+  inside a link's target, and each directory of the final path; so are the granted roots. Such
+  an entry inside a granted place fails the stage. Without a sandbox the cache directories are
+  used as configured (a cache symlinked to preinstalled browsers stays). Beyond files, the profile refuses launchd job creation, LaunchServices opens,
+  AppleEvents, the keychain service, `proc_info` looks into other processes, and
+  `osascript`/`automator`/`shortcuts`/`open`; a program the PR's own code builds to send AppleEvents still needs macOS
+  Automation consent, which a headless review daemon does not hold. Publish also runs sandboxed,
+  with the secret paths unreadable (its own copy under `cache_dir/publish` excepted), so a report
+  the PR's code tampered with cannot make it upload the App key: under a sandbox the caches are kept per
+  repository (`cache_dir/repositories/<owner>/<name>`), so one repository's PR code cannot plant
+  a package or a browser build another repository's run picks up. A protected program inside one
+  of those two writable places fails the stage instead of running unprotected. Publish holds the
+  token in its environment, which macOS does not show to other processes, and only runs after the
+  run step's processes were swept, inside the same slot. Set
+  it on any host where a PR author must not reach other credentials. A configured sandbox fails
+  closed: without `sandbox-exec` the PR's code is not run and the section says why. The work
+  directory and `cache_dir` must not sit under a `deny` path. This is an allow-default profile
+  that closes the paths and services above, not a full jail. **It does not hide other processes'
+  arguments and environment:** macOS gives those to any process of the same user (`sysctl
+  KERN_PROCARGS2`) and the sandbox has no rule for it. On a host where processes of the daemon's
+  user carry secrets in their environment (other services' tokens and keys), the PR's code can
+  read them: run the daemon as a user whose processes hold none, or keep the UI diff off there.
 - **Pushing needs Contents: write.** The default App has Contents: read; without write, the push is
   refused (ui-diff exits 3) and the section is posted text-only (changed captures, percentages,
   summary) with a note saying why. `upload: false` posts text-only on purpose.
@@ -759,7 +799,8 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   config), `timeout_seconds` (run, default 1500), `publish_timeout_seconds` (default 300),
   `max_concurrent` (ui-diff runs at once across reviews, default 1; a change takes effect after a
   restart), `assets_branch` (default
-  `ui-diff-assets`), `upload` (default `true`).
+  `ui-diff-assets`), `upload` (default `true`), `sandbox` (`{"deny": [...], "deny_write": [...]}`,
+  absolute paths; see above).
 - **Install** ui-diff once on the host, at a pinned commit, outside the deployed tree:
   `git clone https://github.com/imuratalpay/ui-diff.git /opt/ui-diff && git -C /opt/ui-diff checkout
   --detach <commit>`, then with the same `HOME`/`npm_config_cache`/`PLAYWRIGHT_BROWSERS_PATH` as

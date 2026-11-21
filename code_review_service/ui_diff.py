@@ -225,6 +225,20 @@ def validate(config: Dict[str, Any]) -> None:
                 raise ValueError(f"config.visual_outline.ui_diff.env[{name}] must be a NAME -> string pair")
             if name in _RESERVED_ENV or name.startswith(_RESERVED_ENV_PREFIXES):
                 raise ValueError(f"config.visual_outline.ui_diff.env may not set {name}")
+    sandbox = settings.get("sandbox")
+    if sandbox is not None:
+        if not isinstance(sandbox, dict):
+            raise ValueError("config.visual_outline.ui_diff.sandbox must be an object")
+        for key in sandbox:
+            if key.startswith("_"):
+                continue
+            if key not in ("deny", "deny_write"):
+                raise ValueError(f"config.visual_outline.ui_diff.sandbox has an unknown key: {key}")
+            paths = sandbox[key]
+            if not isinstance(paths, list) or not all(
+                isinstance(path, str) and os.path.isabs(os.path.expanduser(path)) for path in paths
+            ):
+                raise ValueError(f"config.visual_outline.ui_diff.sandbox.{key} must be a list of absolute paths")
     configs = settings.get("configs")
     if configs is not None:
         if not isinstance(configs, dict):
@@ -367,7 +381,377 @@ def cache_root(config: Dict[str, Any], config_dir: Path) -> Path:
     return path if path.is_absolute() else (Path(config_dir) / path).resolve()
 
 
-def run_environ(config: Dict[str, Any], config_dir: Path, base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+#: macOS's sandbox: the run step (the PR's code) runs under a profile built from
+#: visual_outline.ui_diff.sandbox when that block is set.
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
+
+def _quote(text: str) -> str:
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _sbpl(path: Any) -> str:
+    """A path as an SBPL string literal, resolved the way the kernel sees it (/tmp is /private/tmp)."""
+    return _quote(os.path.realpath(os.path.expanduser(str(path))))
+
+
+def _run_path(settings: Dict[str, Any], source: Any) -> str:
+    """The PATH the ui-diff steps get: the configured node's directory first, then the usual ones."""
+    command = settings.get("command") or []
+    entries: List[str] = []
+    first = str(command[0]) if command else ""
+    if os.path.isabs(first):
+        entries.append(os.path.dirname(first))
+    for entry in str(source.get("PATH") or "").split(os.pathsep) + [
+        "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+    ]:
+        # Absolute entries only: a relative one means a different directory in
+        # each step's working directory (the clone, the publish copy), so what
+        # is protected for one step is not what the other step finds.
+        if entry and os.path.isabs(entry) and entry not in entries:
+            entries.append(entry)
+    return os.pathsep.join(entries)
+
+
+def _publish_programs(settings: Dict[str, Any], path: str) -> List[str]:
+    """Every program the publish step starts: each command argument naming a file, git and gh."""
+    programs: List[str] = []
+    for item in [str(arg) for arg in settings.get("command") or []] + ["git", "gh"]:
+        found = item if os.path.isabs(item) else shutil.which(item, path=path)
+        if found and found not in programs:
+            programs.append(found)
+    return programs
+
+
+def _expanded(raw: Any) -> str:
+    """A configured path as an absolute name: ``~`` expanded first, never normalised
+    (``..`` after a symlink means the link target's parent, as the kernel walks it)."""
+    text = os.path.expanduser(str(raw))
+    return text if os.path.isabs(text) else os.path.join(os.getcwd(), text)
+
+
+#: Symlinks followed per path before giving up (the kernel's own limit is 32).
+MAX_LINK_HOPS = 40
+
+
+def _traversed(raw: Any) -> List[str]:
+    """Every directory entry the kernel looks up to resolve ``raw``, in order.
+
+    Walked one component at a time, following each symlink one hop at a time
+    into its target: every unresolved directory on the way, every link, every
+    link inside a link's target, and every directory of the final path. Renaming
+    or replacing any one of them redirects ``raw`` without touching what it
+    finally names, so the sandbox pins all of them. Each name is the entry's
+    real location (its parent is a real directory), the way the sandbox sees it.
+    """
+    names: List[str] = []
+    pending = list(Path(_expanded(raw)).parts[1:])
+    current = Path(os.sep)
+    hops = 0
+    while pending:
+        part = pending.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            current = current.parent
+            continue
+        candidate = current / part
+        if str(candidate) not in names:
+            names.append(str(candidate))
+        if not os.path.islink(str(candidate)):
+            current = candidate
+            continue
+        hops += 1
+        if hops > MAX_LINK_HOPS:
+            break
+        target = os.readlink(str(candidate))
+        if os.path.isabs(target):
+            current = Path(os.sep)
+            pending = list(Path(target).parts[1:]) + pending
+        else:
+            # Relative to the directory holding the link: ``current`` already.
+            pending = list(Path(target).parts) + pending
+    return names
+
+
+def _protected_tool_dirs(settings: Dict[str, Any], path: str) -> List[Path]:
+    """Directories the run step must not write so publish runs only what was installed.
+
+    Every PATH entry, and for each program publish starts (each command
+    argument that names a file, plus git and gh) its resolved directory and,
+    for a ``bin/`` layout, the install prefix above it (ui-diff's skill
+    directory); a program inside a Homebrew ``Cellar`` protects the whole
+    Homebrew prefix, whose kegs load each other's libraries. Symlinks are
+    resolved first.
+    """
+    dirs: List[Path] = [Path(os.path.realpath(entry)) for entry in path.split(os.pathsep) if os.path.isabs(entry)]
+    for program in _publish_programs(settings, path):
+        real = Path(os.path.realpath(program))
+        if not real.is_file():
+            continue
+        # The entry itself too: a symlink is replaced in the directory it sits in.
+        dirs.append(Path(os.path.abspath(program)).parent)
+        dirs.append(real.parent)
+        if real.parent.name == "bin" and len(real.parents) > 2:
+            dirs.append(real.parents[1])
+        if "Cellar" in real.parts:
+            # A Homebrew keg loads libraries from its sibling kegs: the whole prefix.
+            dirs.append(Path(*real.parts[: real.parts.index("Cellar")]))
+    return [item for item in dict.fromkeys(dirs) if str(item) != os.sep]
+
+
+def _sandboxed(config: Dict[str, Any]) -> bool:
+    return isinstance(ui_diff_block(config).get("sandbox"), dict)
+
+
+def repository_cache_root(config: Dict[str, Any], config_dir: Path, repo: str) -> Path:
+    """The caches a run uses: shared, or one set per repository under a sandbox,
+    so one repository's PR code cannot plant anything another repository's run
+    picks up (an npm package, a browser build)."""
+    root = cache_root(config, config_dir)
+    if not _sandboxed(config) or not repo:
+        return root
+    owner, _, name = _repo_key(repo).partition("/")
+    return root / "repositories" / re.sub(r"[^a-z0-9._-]", "_", owner) / re.sub(r"[^a-z0-9._-]", "_", name)
+
+
+def _inside(path: Path, roots: List[Path]) -> bool:
+    return any(path == root or path.is_relative_to(root) for root in roots)
+
+
+def _plain_dir(path: Path, repair: bool) -> None:
+    """``path`` is a real directory afterwards: created if missing; a symlink (or any
+    other entry) a PR's code planted there is removed and replaced when ``repair``,
+    refused otherwise. Never follows the entry."""
+    try:
+        info = os.lstat(str(path))
+    except FileNotFoundError:
+        try:
+            os.mkdir(str(path), 0o700)
+        except FileExistsError:
+            pass  # another run created it first: check what is there now
+        info = os.lstat(str(path))
+    if not stat.S_ISDIR(info.st_mode):
+        if not repair:
+            raise ValueError(f"{path} is not a plain directory")
+        os.unlink(str(path))
+        try:
+            os.mkdir(str(path), 0o700)
+        except FileExistsError:
+            pass
+        if not stat.S_ISDIR(os.lstat(str(path)).st_mode):
+            raise ValueError(f"{path} is not a plain directory")
+    if repair:
+        # Through a no-follow descriptor: a concurrent run's PR code could swap
+        # the entry for a symlink after the lstat above, and a path chmod would
+        # follow it to whatever it names.
+        try:
+            fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            return
+        try:
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                os.fchmod(fd, 0o700)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+
+def prepare_cache(config: Dict[str, Any], config_dir: Path, repo: str) -> Path:
+    """Create the run's caches and return their root, every component checked.
+
+    The per-repository caches are writable by that repository's PR code, which
+    could swap a directory for a symlink (to the App key's directory, say). The
+    path is walked from the operator's cache root down with lstat, each such
+    entry replaced by a fresh directory, so neither the next run's environment
+    nor its sandbox rules follow it.
+    """
+    if not _sandboxed(config):
+        # No sandbox, no PR-writable cache to distrust: the operator's layout as
+        # it is (a cache directory symlinked to preinstalled browsers stays).
+        root = cache_root(config, config_dir)
+        for name in ("home", "npm-cache", "ms-playwright"):
+            (root / name).mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(str(root / name), 0o700)
+            except OSError:
+                pass
+        return root
+    root = Path(os.path.realpath(str(cache_root(config, config_dir))))
+    root.mkdir(parents=True, exist_ok=True)
+    target = repository_cache_root(config, config_dir, repo)
+    current = root
+    for part in Path(os.path.abspath(str(target))).relative_to(Path(os.path.abspath(str(cache_root(config, config_dir))))).parts:
+        current = current / part
+        _plain_dir(current, repair=True)
+    for name in ("home", "npm-cache", "ms-playwright"):
+        _plain_dir(current / name, repair=True)
+    return current
+
+
+def checked_run_dir(run_dir: Path) -> Path:
+    """This review's run directory as the sandbox may grant it: a real directory, resolved by its parent."""
+    run_dir = Path(os.path.abspath(str(run_dir)))
+    _plain_dir(run_dir, repair=False)
+    return Path(os.path.realpath(str(run_dir.parent))) / run_dir.name
+
+
+#: Ways out of an allow-default profile that are not file operations: launchd
+#: jobs, LaunchServices opens, AppleEvents (and the tools that send them), the
+#: keychain. AppleEvents sent by a program of the PR's own still depend on
+#: macOS Automation consent, which a headless review daemon does not hold.
+_ESCAPE_RULES = [
+    "(deny job-creation)",
+    "(deny lsopen)",
+    "(deny appleevent-send)",
+    '(deny mach-lookup (global-name "com.apple.SecurityServer"))',
+    # No proc_info looks into other processes (their open files, paths). This
+    # does not hide their arguments and environment: macOS hands those to any
+    # process of the same user (sysctl KERN_PROCARGS2) and the sandbox has no
+    # rule for it, so secrets in other processes' environments stay readable.
+    "(deny process-info* (target others))",
+    '(deny process-exec (literal "/usr/bin/osascript"))',
+    '(deny process-exec (literal "/usr/bin/automator"))',
+    '(deny process-exec (literal "/usr/bin/shortcuts"))',
+    '(deny process-exec (literal "/usr/bin/open"))',
+]
+
+
+def _secret_paths(config: Dict[str, Any], config_dir: Path, block: Dict[str, Any]) -> List[Any]:
+    """What no ui-diff step may read or write: the configured ``deny`` paths, the
+    GitHub App key's directory (resolved), the dashboard database, the review
+    ledger, and the review work directory (other reviews' clones)."""
+    service_root = Path(config_dir).resolve().parent
+    work = Path(os.path.expanduser(str(config.get("work_dir") or "data/work")))
+    work = work if work.is_absolute() else service_root / work
+    deny: List[Any] = list(block.get("deny") or [])
+    app = config.get("github_app")
+    if isinstance(app, dict) and app.get("private_key_path"):
+        # Resolved first (``~`` expanded before that): a symlinked key is
+        # protected where it really lives.
+        deny.append(Path(os.path.realpath(os.path.expanduser(str(app["private_key_path"])))).parent)
+    deny.append(service_root / "data" / "dashboard")
+    state = Path(os.path.expanduser(str(config.get("state_path") or "data/state.json")))
+    deny.append(state if state.is_absolute() else service_root / state)
+    deny.append(work)
+    return deny
+
+
+def publish_profile(config: Dict[str, Any], config_dir: Path, workspace_root: Optional[Path] = None) -> Optional[str]:
+    """The sandbox for ``ui-diff publish`` (it holds the token): it may not read
+    or write the secret paths, so a report the PR's code tampered with cannot
+    make it upload the App key. Its own copy under ``workspace_root`` stays
+    readable and writable even when that sits under a denied path."""
+    block = ui_diff_block(config).get("sandbox")
+    if not isinstance(block, dict):
+        return None
+    lines = ["(version 1)", "(allow default)"] + _ESCAPE_RULES
+    lines += [f"(deny file-read* file-write* (subpath {_sbpl(path)}))"
+              for path in dict.fromkeys(map(str, _secret_paths(config, config_dir, block)))]
+    if workspace_root is not None:
+        lines.append(f"(allow file-read* file-write* (subpath {_sbpl(workspace_root)}))")
+        lines += [f"(allow file-read-metadata (literal {_quote(str(parent))}))"
+                  for parent in Path(os.path.realpath(str(workspace_root))).parents if str(parent) != os.sep]
+    return "\n".join(lines) + "\n"
+
+
+def sandbox_profile(
+    config: Dict[str, Any],
+    config_dir: Path,
+    source: Optional[Path] = None,
+    scratch: Optional[Path] = None,
+    repo: str = "",
+    cache: Optional[Path] = None,
+) -> Optional[str]:
+    """The sandbox profile for ``ui-diff run``, or None when no sandbox is configured.
+
+    Everything is allowed except: reading or writing the ``deny`` paths, the
+    GitHub App key's directory, the dashboard database, the review ledger, the
+    review work directory and the ui-diff caches (other reviews, other
+    repositories); writing the service tree, every directory on PATH, the
+    install of every program publish starts afterwards outside the sandbox and
+    the ``deny_write`` paths. Then, last (later rules win), reading and writing
+    this review's clone (``source``), this run's own temp directory
+    (``scratch``) and this repository's caches. The rest of the review's run
+    directory (the service's artifacts, the reviewers' prompts and answers)
+    stays out of reach.
+
+    Every entry the kernel looks up on the way to each denied or protected
+    path, each program publish runs, each PATH entry and the App key is pinned
+    as it is (no rename, no replacement): see ``_traversed``.
+
+    ValueError when a protected program, or an entry on the way to anything
+    pinned, sits inside one of those two writable places: the run step could
+    replace it before publish runs it.
+    """
+    settings = ui_diff_block(config)
+    block = settings.get("sandbox")
+    if not isinstance(block, dict):
+        return None
+    service_root = Path(config_dir).resolve().parent
+    # Other runs' caches and temp directories; this run's own are granted below.
+    deny = _secret_paths(config, config_dir, block) + [cache_root(config, config_dir)]
+    if scratch is not None:
+        deny.append(Path(str(scratch)).parent)
+    deny_write: List[Any] = [service_root] + list(block.get("deny_write") or [])
+    # Everything the unsandboxed publish step executes must be out of the run
+    # step's reach: the directories on PATH, and every program it starts.
+    run_path = _run_path(settings, os.environ)
+    tools = _protected_tool_dirs(settings, run_path)
+    deny_write += tools
+    # Reached by name at publish time: each program and each PATH entry.
+    reached: List[Any] = _publish_programs(settings, run_path) + [
+        entry for entry in run_path.split(os.pathsep) if os.path.isabs(entry)
+    ]
+    app = config.get("github_app")
+    if isinstance(app, dict) and app.get("private_key_path"):
+        # The key as the daemon names it, symlinks and all.
+        reached.append(str(app["private_key_path"]))
+    # Granted as checked (checked_run_dir, prepare_cache), never re-resolved:
+    # these are writable by the PR's code, which could have swapped them for a
+    # symlink to something denied above.
+    allow = [Path(str(path)) for path in (source, scratch, cache) if path]
+    if cache is None:
+        allow.append(Path(os.path.realpath(str(repository_cache_root(config, config_dir, repo)))))
+    exposed = [tool for tool in tools if _inside(tool, allow)]
+    if exposed:
+        raise ValueError(f"{exposed[0]} (run by publish) is inside a directory the run step may write")
+    lines = ["(version 1)", "(allow default)"] + _ESCAPE_RULES
+    lines += [f"(deny file-read* file-write* (subpath {_sbpl(path)}))" for path in dict.fromkeys(map(str, deny))]
+    lines += [f"(deny file-write* (subpath {_sbpl(path)}))" for path in dict.fromkeys(map(str, deny_write))]
+    # A protected or denied path could still be redirected without touching it:
+    # an ancestor renamed away (and reached at its new name), a symlink on the
+    # way replaced. Every entry the kernel looks up to reach each of them, and
+    # each program publish runs and each PATH entry, is pinned (_traversed).
+    pinned: List[str] = []
+    for path in dict.fromkeys(map(str, list(deny_write) + list(deny) + reached)):
+        for name in _traversed(path):
+            if name != os.sep and name not in pinned:
+                pinned.append(name)
+    # Strictly inside: a granted root itself is pinned below as well.
+    inside = [name for name in pinned if any(Path(name) != root and Path(name).is_relative_to(root) for root in allow)]
+    if inside:
+        raise ValueError(f"{inside[0]} (on the way to a protected path) is inside a directory the run step may write")
+    lines += [f"(deny file-write* (literal {_quote(path)}))" for path in pinned]
+    lines += [f"(allow file-read* file-write* (subpath {_quote(str(path))}))" for path in dict.fromkeys(map(str, allow))]
+    # The granted roots themselves stay where they are: the PR's code may
+    # change what is inside, not swap them.
+    lines += [f"(deny file-write* (literal {_quote(str(path))}))" for path in dict.fromkeys(allow)]
+    # Their parent directories may be stat()ed (realpath, mkdir -p walk up the
+    # tree), never listed or read.
+    ancestors = dict.fromkeys(str(parent) for path in allow for parent in Path(path).parents if str(parent) != os.sep)
+    lines += [f"(allow file-read-metadata (literal {_quote(path)}))" for path in ancestors]
+    return "\n".join(lines) + "\n"
+
+
+def run_environ(
+    config: Dict[str, Any],
+    config_dir: Path,
+    base: Optional[Dict[str, str]] = None,
+    repo: str = "",
+    cache: Optional[Path] = None,
+) -> Dict[str, str]:
     """The environment ``ui-diff run`` gets: no credential, a private HOME and caches.
 
     The PR's install scripts and dev server run under it, so nothing from the
@@ -377,23 +761,9 @@ def run_environ(config: Dict[str, Any], config_dir: Path, base: Optional[Dict[st
     """
     source = os.environ if base is None else base
     settings = ui_diff_block(config)
-    root = cache_root(config, config_dir)
-    for name in ("home", "npm-cache", "ms-playwright"):
-        (root / name).mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(str(root / name), 0o700)
-        except OSError:
-            pass
-    command = settings.get("command") or []
-    path_entries: List[str] = []
-    first = str(command[0]) if command else ""
-    if os.path.isabs(first):
-        path_entries.append(os.path.dirname(first))
-    for entry in str(source.get("PATH") or "").split(os.pathsep) + ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]:
-        if entry and entry not in path_entries:
-            path_entries.append(entry)
+    root = cache if cache is not None else prepare_cache(config, config_dir, repo)
     env = {
-        "PATH": os.pathsep.join(path_entries),
+        "PATH": _run_path(settings, source),
         "HOME": str(root / "home"),
         "npm_config_cache": str(root / "npm-cache"),
         "PLAYWRIGHT_BROWSERS_PATH": str(root / "ms-playwright"),
@@ -698,7 +1068,15 @@ def _publish_base(env: Dict[str, str], workspace: Path) -> Dict[str, str]:
     return base
 
 
-def publish_workspace(out_dir: Path, settings: Dict[str, Any], env: Dict[str, str]) -> Path:
+def _publish_parent(config: Dict[str, Any], config_dir: Path) -> Path:
+    parent = Path(os.path.realpath(str(cache_root(config, config_dir)))) / "publish"
+    _plain_dir(parent, repair=True)
+    return parent
+
+
+def publish_workspace(
+    out_dir: Path, settings: Dict[str, Any], env: Dict[str, str], parent: Optional[Path] = None
+) -> Path:
     """A fresh repository for ``ui-diff publish``, outside the clone the PR's code ran in.
 
     The PR's install scripts could write the clone's ``.git`` (hooks, config)
@@ -709,7 +1087,7 @@ def publish_workspace(out_dir: Path, settings: Dict[str, Any], env: Dict[str, st
     passes remote, branch and link base itself; a repository cannot allow a
     public upload).
     """
-    workspace = Path(tempfile.mkdtemp(prefix="rol-ui-diff-publish-"))
+    workspace = Path(tempfile.mkdtemp(prefix="rol-ui-diff-publish-", dir=str(parent) if parent else None))
     try:
         init = subprocess.run(
             ["git", "init", "-q", str(workspace)], env=env, capture_output=True, text=True, timeout=60, check=False
@@ -812,14 +1190,42 @@ def run_stage(
         )
     command = [str(arg) for arg in settings.get("command") or []]
     out_dir = Path(source_dir) / ".ui-diff"
-    env = run_environ(config, config_dir)
-    # A private temp directory per run: ui-diff's worktrees land in it, so every
-    # install and dev server this run started works under it and can be found.
-    # mkdtemp + rmtree(ignore_errors), not TemporaryDirectory: on Python 3.9 its
-    # cleanup raises on a file an install left read-only, which would turn a
-    # finished UI diff into a failure.
-    run_tmp = tempfile.mkdtemp(prefix="rol-ui-diff-run-")
     try:
+        cache = prepare_cache(config, config_dir, repo)
+        run_dir = checked_run_dir(Path(source_dir).parent)
+        source = run_dir / Path(source_dir).name
+        _plain_dir(source, repair=False)
+        env = run_environ(config, config_dir, repo=repo, cache=cache)
+    except (OSError, ValueError) as exc:
+        reason = _one_line(f"the sandbox would not protect what publish runs: {exc}")
+        return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
+    # A private temp directory per run (mode 0700): ui-diff's worktrees land in
+    # it, so every install and dev server this run started works under it and
+    # can be found. mkdtemp + rmtree(ignore_errors), not TemporaryDirectory: on
+    # Python 3.9 its cleanup raises on a file an install left read-only, which
+    # would turn a finished UI diff into a failure. The sandbox grants this
+    # directory and the clone, nothing of the review's run directory.
+    # Under a short root, whatever the work directory's depth: browsers put Unix
+    # sockets under TMPDIR (a 104-byte path limit on macOS, 108 on Linux).
+    try:
+        scratch_parent = scratch_root()
+        run_tmp = tempfile.mkdtemp(prefix="ud-", dir=str(scratch_parent))
+    except OSError as exc:
+        reason = _one_line(f"could not make the UI diff's temp directory: {exc}")
+        return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
+    try:
+        try:
+            profile = sandbox_profile(config, config_dir, source=source, scratch=Path(run_tmp), repo=repo, cache=cache)
+        except (OSError, ValueError) as exc:
+            reason = _one_line(f"the sandbox would not protect what publish runs: {exc}")
+            return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
+        if profile is not None and not os.access(SANDBOX_EXEC, os.X_OK):
+            # Fail closed: a deployment that asked for the sandbox never runs the PR's code without it.
+            reason = f"visual_outline.ui_diff.sandbox is set but {SANDBOX_EXEC} is not available on this host"
+            return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
+        run_prefix = [SANDBOX_EXEC, "-p", profile] if profile is not None else []
+        published_profile = publish_profile(config, config_dir, _publish_parent(config, config_dir) if profile else None)
+        publish_prefix = [SANDBOX_EXEC, "-p", published_profile] if published_profile is not None else []
         env["TMPDIR"] = run_tmp
         timeout = int(settings.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS)
         publish_timeout = int(settings.get("publish_timeout_seconds") or DEFAULT_PUBLISH_TIMEOUT_SECONDS)
@@ -832,7 +1238,7 @@ def run_stage(
             return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
         try:
             log(f"{repo} pr #{number}: ui-diff capturing base {base_sha[:12]} and head {head_sha[:12]}")
-            run_args = command + [
+            run_args = run_prefix + command + [
                 "run", "--config", str(config_path), "--base", base_sha, "--head", head_sha, "--out", str(out_dir),
             ]
             code, stdout, stderr = _run_group(
@@ -848,7 +1254,9 @@ def run_stage(
             notes: List[str] = []
             branch = str(settings.get("assets_branch") or DEFAULT_ASSETS_BRANCH)
             try:
-                workspace = publish_workspace(out_dir, config_settings, env)
+                # Outside every place the run step may write (the sandbox denies the
+                # cache root except this repository's own caches).
+                workspace = publish_workspace(out_dir, config_settings, env, parent=_publish_parent(config, config_dir))
             except (OSError, ValueError) as exc:
                 reason = _one_line(f"could not prepare the publish step: {exc}")
                 return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
@@ -868,7 +1276,8 @@ def run_stage(
                     notes.append("Dry run: screenshots were not uploaded.")
                 elif settings.get("upload", True):
                     code, stdout, stderr = _run_group(
-                        publish_args, workspace, _harden_git(publish_env(_publish_base(env, workspace))),
+                        publish_prefix + publish_args, workspace,
+                        _harden_git(publish_env(_publish_base(env, workspace))),
                         publish_timeout, cancel, sweep=[str(workspace)],
                     )
                     write_text(artifact_dir / "ui-diff.publish.stdout.txt", stdout)
@@ -887,7 +1296,8 @@ def run_stage(
                     notes.append("Screenshots are not uploaded on this deployment (visual_outline.ui_diff.upload is off).")
                 if status == "text-only":
                     code, stdout, stderr = _run_group(
-                        publish_args + ["--no-upload"], workspace, _harden_git(_publish_base(env, workspace)),
+                        publish_prefix + publish_args + ["--no-upload"], workspace,
+                        _harden_git(_publish_base(env, workspace)),
                         publish_timeout, cancel, sweep=[str(workspace)],
                     )
                     write_text(artifact_dir / "ui-diff.render.stderr.txt", stderr)
@@ -916,6 +1326,25 @@ def run_stage(
         shutil.rmtree(run_tmp, ignore_errors=True)
         if os.path.exists(run_tmp):
             log(f"{repo} pr #{number}: ui-diff left {run_tmp} behind (could not remove it); remove it by hand")
+
+
+#: The common parent of every run's temp directory, directly under /tmp so the
+#: paths stay short; the sandbox denies it and grants each run its own child.
+SCRATCH_PARENT = "rol-ud"
+
+
+def scratch_root() -> Path:
+    """``/tmp/rol-ud`` (``/private/tmp/rol-ud`` on macOS) as a checked plain
+    directory of mode 0700, short enough for any socket a browser puts under a
+    run's TMPDIR; the configured temp directory when /tmp cannot take it."""
+    for base in ("/tmp", tempfile.gettempdir()):
+        root = Path(os.path.realpath(base)) / SCRATCH_PARENT
+        try:
+            _plain_dir(root, repair=True)
+            return root
+        except (OSError, ValueError):
+            continue
+    raise OSError("no writable temp directory for the UI diff")
 
 
 #: How long a cancelled stage may take to stop: a poll, ui-diff's SIGTERM grace, the SIGKILL wait.
