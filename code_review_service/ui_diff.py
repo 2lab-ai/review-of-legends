@@ -23,6 +23,7 @@ stock Python 3.9):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -1194,10 +1195,14 @@ def _docker_environ() -> Dict[str, str]:
 
 
 def container_volume(repo: str) -> str:
-    """The Docker volume holding one repository's caches (npm, HOME): never shared across repositories."""
-    owner, _, name = _repo_key(repo).partition("/")
-    clean = [re.sub(r"[^a-z0-9_.-]", "_", part) for part in (owner, name)]
-    return "rol-ui-diff-" + "-".join(clean)
+    """The Docker volume holding one repository's caches (npm, HOME): never shared
+    across repositories. Readable name, plus a digest of ``owner/name`` so two
+    repositories whose cleaned names coincide never share one."""
+    key = _repo_key(repo)
+    owner, _, name = key.partition("/")
+    clean = [re.sub(r"[^a-z0-9_.]", "_", part)[:40] for part in (owner, name)]
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+    return "rol-ui-diff-" + "-".join(clean) + "-" + digest
 
 
 _COPY_NAME = re.compile(r"[A-Za-z0-9._-]+")
@@ -1285,6 +1290,48 @@ def extract_output(archive: Path, dest: Path) -> int:
     return count
 
 
+#: Tar headers and padding on top of the publish caps, for the output stream.
+MAX_ARCHIVE_SLACK_BYTES = 64 * 1024 * 1024
+
+
+def _copy_out(args: List[str], env: Dict[str, str], archive: Path, limit: int, timeout: int) -> Tuple[int, str]:
+    """Run ``args`` (``docker cp … -``) into ``archive``, never more than ``limit``
+    bytes on the host: past it, or past ``timeout``, the copy is killed.
+    ``(exit, stderr tail)``."""
+    deadline = time.monotonic() + timeout
+    with tempfile.TemporaryFile() as err_file, archive.open("wb") as handle:
+        proc = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err_file)
+        written = 0
+        reason = ""
+        try:
+            assert proc.stdout is not None
+            while True:
+                if time.monotonic() > deadline:
+                    reason = f"timed out after {timeout} seconds"
+                    break
+                chunk = proc.stdout.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > limit:
+                    reason = f"the output is larger than {limit // (1024 * 1024)} MiB"
+                    break
+                handle.write(chunk)
+        finally:
+            if reason:
+                proc.kill()
+            proc.stdout.close() if proc.stdout else None
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+        err = _tail(err_file)
+    if reason:
+        return 1, reason
+    return proc.returncode, err[-2000:]
+
+
 def run_in_container(
     config: Dict[str, Any],
     repo: str,
@@ -1317,7 +1364,8 @@ def run_in_container(
         # The clone directory itself (its owner kept, so the run may write it),
         # symlinks copied as links (never followed on the host).
         code, stdout, stderr = _run_group(
-            [docker, "cp", str(source), f"{name}:{CONTAINER_WORK}/"], scratch, env,
+            # -a: keep the clone's uid/gid, which the run's --user matches.
+            [docker, "cp", "-a", str(source), f"{name}:{CONTAINER_WORK}/"], scratch, env,
             CONTAINER_COPY_TIMEOUT_SECONDS, cancel,
         )
         if code != 0:
@@ -1326,14 +1374,12 @@ def run_in_container(
         if code != 0:
             return code, stdout, stderr, out_dir
         archive = scratch / "out.tar"
-        with archive.open("wb") as handle:
-            copied = subprocess.run(
-                [docker, "cp", f"{name}:{CONTAINER_WORK}/{source.name}/.ui-diff", "-"],
-                env=env, stdout=handle, stderr=subprocess.PIPE, timeout=CONTAINER_COPY_TIMEOUT_SECONDS, check=False,
-            )
-        if copied.returncode != 0:
-            detail = copied.stderr.decode("utf-8", "replace")[-2000:]
-            return copied.returncode, stdout, stderr + "\ncopying the result out of the container failed: " + detail, out_dir
+        returncode, detail = _copy_out(
+            [docker, "cp", f"{name}:{CONTAINER_WORK}/{source.name}/.ui-diff", "-"], env, archive,
+            MAX_PUBLISH_TOTAL_BYTES + MAX_ARCHIVE_SLACK_BYTES, CONTAINER_COPY_TIMEOUT_SECONDS,
+        )
+        if returncode != 0:
+            return returncode, stdout, stderr + "\ncopying the result out of the container failed: " + detail, out_dir
         extract_output(archive, out_dir)
         archive.unlink()
         return code, stdout, stderr, out_dir

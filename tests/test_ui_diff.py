@@ -163,9 +163,12 @@ FAKE_DOCKER = textwrap.dedent(
         (root / "spec.json").write_text(json.dumps({"env": env, "command": command, "workdir": workdir}))
         sys.exit(0)
     if args[0] == "cp":
-        src, dst = args[1], args[2]
+        src, dst = [arg for arg in args[1:] if arg != "-a"][:2]
         if dst == "-":
             name, path = src.split(":", 1)
+            if behaviour.get("huge_tar"):
+                sys.stdout.buffer.write(b"\\0" * behaviour["huge_tar"])
+                sys.exit(0)
             local = state / name / path.lstrip("/")
             out = io.BytesIO()
             with tarfile.open(fileobj=out, mode="w") as archive:
@@ -532,8 +535,10 @@ class SandboxTest(unittest.TestCase):
         real_plain = ui_diff._plain_dir
         tmp_root = os.path.realpath("/tmp")
         with tempfile.TemporaryDirectory() as tmp:
+            primary = Path(tmp_root) / root.name
+
             def read_only_tmp(path, repair):
-                if str(path).startswith(tmp_root + os.sep):
+                if Path(path) == primary:
                     raise OSError("read-only")
                 return real_plain(path, repair)
 
@@ -1197,14 +1202,16 @@ class ContainerTest(unittest.TestCase):
             index = create.index(flag[0])
             self.assertEqual(create[index:index + 2], flag)
         volumes = [create[i + 1] for i, arg in enumerate(create) if arg == "-v"]
-        self.assertEqual(volumes, ["rol-ui-diff-acme-corp-web:/cache"], "no host path is mounted")
+        self.assertEqual(volumes, [f"{ui_diff.container_volume(REPO)}:/cache"], "no host path is mounted")
+        self.assertTrue(ui_diff.container_volume(REPO).startswith("rol-ui-diff-acme_corp-web-"))
+        self.assertNotEqual(ui_diff.container_volume("a-b/c"), ui_diff.container_volume("a/b-c"))
         self.assertNotIn("docker.sock", " ".join(create))
         env = [create[i + 1] for i, arg in enumerate(create) if arg == "-e"]
         self.assertFalse([item for item in env if item.startswith(("GH_TOKEN", "GITHUB_TOKEN"))])
         tail = create[create.index(self.IMAGE) + 1:]
         self.assertEqual(tail[tail.index("--out") + 1], "/work/source/.ui-diff")
         self.assertEqual(tail[tail.index("--config") + 1], "/work/source/ui-diff.config.json")
-        self.assertEqual(calls[1][1:], [str(self.source), f"{create[create.index('--name') + 1]}:/work/"])
+        self.assertEqual(calls[1][1:], ["-a", str(self.source), f"{create[create.index('--name') + 1]}:/work/"])
         run, publish = self.records()
         self.assertEqual(run["args"][0], "run")
         self.assertNotIn("GITHUB_TOKEN", run["env"])
@@ -1244,6 +1251,16 @@ class ContainerTest(unittest.TestCase):
         found = sorted(str(path.relative_to(dest)) for path in dest.rglob("*") if path.is_file())
         self.assertEqual(found, ["run/home.png"])
         self.assertFalse((self.tmp / "escaped.txt").exists())
+
+    def test_an_output_past_the_cap_is_cut_off_and_fails_the_stage(self) -> None:
+        self.behaviour()
+        (self.docker / "docker-behaviour.json").write_text(json.dumps({"huge_tar": 3 * 1024 * 1024}))
+        with mock.patch.object(ui_diff, "MAX_PUBLISH_TOTAL_BYTES", 1024 * 1024), \
+                mock.patch.object(ui_diff, "MAX_ARCHIVE_SLACK_BYTES", 0):
+            outcome = self.run_stage()
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("larger than 1 MiB", outcome.section)
+        self.assertEqual(self.docker_calls()[-1][:2], ["rm", "-f"])
 
     def test_a_run_past_its_timeout_removes_the_container(self) -> None:
         self.behaviour(run_sleep=30)
