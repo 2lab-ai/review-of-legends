@@ -392,6 +392,62 @@ def _sbpl(path: Any) -> str:
     return '"' + real.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _run_path(settings: Dict[str, Any], source: Any) -> str:
+    """The PATH the ui-diff steps get: the configured node's directory first, then the usual ones."""
+    command = settings.get("command") or []
+    entries: List[str] = []
+    first = str(command[0]) if command else ""
+    if os.path.isabs(first):
+        entries.append(os.path.dirname(first))
+    for entry in str(source.get("PATH") or "").split(os.pathsep) + [
+        "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+    ]:
+        if entry and entry not in entries:
+            entries.append(entry)
+    return os.pathsep.join(entries)
+
+
+def _protected_tool_dirs(settings: Dict[str, Any], path: str) -> List[Path]:
+    """Directories the run step must not write so publish runs only what was installed.
+
+    Every PATH entry, and for each program publish starts (each command
+    argument that names a file, plus git and gh) its resolved directory and,
+    for a ``bin/`` layout, the install prefix above it (ui-diff's skill
+    directory); a program inside a Homebrew ``Cellar`` protects the whole
+    Homebrew prefix, whose kegs load each other's libraries. Symlinks are
+    resolved first.
+    """
+    dirs: List[Path] = [Path(os.path.realpath(entry)) for entry in path.split(os.pathsep) if os.path.isabs(entry)]
+    programs: List[str] = []
+    for arg in settings.get("command") or []:
+        text = str(arg)
+        if os.path.isabs(text):
+            programs.append(text)
+        else:
+            found = shutil.which(text, path=path)
+            if found:
+                programs.append(found)
+    for tool in ("git", "gh"):
+        found = shutil.which(tool, path=path)
+        if found:
+            programs.append(found)
+    for program in programs:
+        real = Path(os.path.realpath(program))
+        if not real.is_file():
+            continue
+        dirs.append(real.parent)
+        if real.parent.name == "bin" and len(real.parents) > 2:
+            dirs.append(real.parents[1])
+        if "Cellar" in real.parts:
+            # A Homebrew keg loads libraries from its sibling kegs: the whole prefix.
+            dirs.append(Path(*real.parts[: real.parts.index("Cellar")]))
+    unique: List[Path] = []
+    for item in dirs:
+        if item not in unique and str(item) != os.sep:
+            unique.append(item)
+    return unique
+
+
 def sandbox_profile(config: Dict[str, Any], config_dir: Path) -> Optional[str]:
     """The sandbox profile for ``ui-diff run``, or None when no sandbox is configured.
 
@@ -414,10 +470,10 @@ def sandbox_profile(config: Dict[str, Any], config_dir: Path) -> Optional[str]:
     state = Path(os.path.expanduser(str(config.get("state_path") or "data/state.json")))
     deny.append(state if state.is_absolute() else service_root / state)
     deny_write: List[Any] = [service_root] + list(block.get("deny_write") or [])
-    for arg in settings.get("command") or []:
-        script = Path(str(arg))
-        if script.suffix in (".mjs", ".js") and script.is_absolute() and len(script.parents) > 2:
-            deny_write.append(script.parents[1])  # the skill directory: bin/ and dist/ beside it
+    # Everything the unsandboxed publish step executes must be out of the run
+    # step's reach: the directories on PATH, and the real install of every
+    # program it starts (the command's interpreter and script, git, gh).
+    deny_write += _protected_tool_dirs(settings, _run_path(settings, os.environ))
     work = Path(os.path.expanduser(str(config.get("work_dir") or "data/work")))
     allow_write = [work if work.is_absolute() else service_root / work, cache_root(config, config_dir)]
     lines = ["(version 1)", "(allow default)"]
@@ -444,16 +500,8 @@ def run_environ(config: Dict[str, Any], config_dir: Path, base: Optional[Dict[st
             os.chmod(str(root / name), 0o700)
         except OSError:
             pass
-    command = settings.get("command") or []
-    path_entries: List[str] = []
-    first = str(command[0]) if command else ""
-    if os.path.isabs(first):
-        path_entries.append(os.path.dirname(first))
-    for entry in str(source.get("PATH") or "").split(os.pathsep) + ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]:
-        if entry and entry not in path_entries:
-            path_entries.append(entry)
     env = {
-        "PATH": os.pathsep.join(path_entries),
+        "PATH": _run_path(settings, source),
         "HOME": str(root / "home"),
         "npm_config_cache": str(root / "npm-cache"),
         "PLAYWRIGHT_BROWSERS_PATH": str(root / "ms-playwright"),

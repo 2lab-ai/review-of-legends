@@ -740,11 +740,14 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   `/usr/bin/sandbox-exec` with a profile that allows everything except: reading or writing the
   `deny` paths (e.g. the daemon user's home and other tenants' trees), the GitHub App key's
   directory, `data/dashboard` and the review ledger; writing the service tree (its review work
-  directory and the ui-diff caches excepted), the ui-diff install and the `deny_write` paths. Set
+  directory and the ui-diff caches excepted), every directory on the run's `PATH`, the real install
+  of every program publish starts afterwards outside the sandbox (the command's interpreter and
+  script, `git`, `gh`; a program inside a Homebrew `Cellar` protects the whole Homebrew prefix),
+  and the `deny_write` paths. Set
   it on any host where a PR author must not reach other credentials. A configured sandbox fails
   closed: without `sandbox-exec` the PR's code is not run and the section says why. The work
   directory and `cache_dir` must not sit under a `deny` path. Publish runs ui-diff's own code
-  outside the sandbox (the install is write-protected from the run step).
+  outside the sandbox; everything it executes is write-protected from the run step.
 - **Pushing needs Contents: write.** The default App has Contents: read; without write, the push is
   refused (ui-diff exits 3) and the section is posted text-only (changed captures, percentages,
   summary) with a note saying why. `upload: false` posts text-only on purpose.

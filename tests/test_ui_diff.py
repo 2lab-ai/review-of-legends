@@ -59,6 +59,14 @@ FAKE_UI_DIFF = textwrap.dedent(
             config_file.write_text(behaviour["replace_config_with"])
         if behaviour.get("run_sleep"):
             time.sleep(behaviour["run_sleep"])
+        if behaviour.get("write_into"):
+            try:
+                Path(behaviour["write_into"]).write_text("tampered")
+                outcome = "written"
+            except OSError as exc:
+                outcome = type(exc).__name__
+            with record.open("a") as handle:
+                handle.write(json.dumps({"args": ["write"], "write": outcome, "env": {}, "cwd": "", "config": None}) + "\\n")
         if behaviour.get("read_secret"):
             try:
                 Path(behaviour["read_secret"]).read_text()
@@ -270,12 +278,34 @@ class SandboxTest(unittest.TestCase):
         self.assertEqual(lines[:2], ["(version 1)", "(allow default)"])
         for path in ("/home/bot", "/srv/keys", "/srv/rol/data/dashboard", "/srv/rol/data/state.json"):
             self.assertIn(f'(deny file-read* file-write* (subpath "{os.path.realpath(path)}"))', lines)
-        for path in ("/srv/rol", "/srv/other", "/opt/ui-diff/skills/ui-diff"):
+        for path in ("/srv/rol", "/srv/other"):
             self.assertIn(f'(deny file-write* (subpath "{os.path.realpath(path)}"))', lines)
         self.assertEqual(lines[-2:], [
             f'(allow file-write* (subpath "{os.path.realpath("/srv/rol/data/work")}"))',
             f'(allow file-write* (subpath "{os.path.realpath("/srv/rol/data/ui-diff")}"))',
         ])
+
+    def test_every_program_publish_runs_is_write_protected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(os.path.realpath(tmp))
+            keg = root / "brew" / "Cellar" / "node" / "26.0" / "bin"
+            keg.mkdir(parents=True)
+            (keg / "node").write_text("#!/bin/sh\n")
+            (keg / "node").chmod(0o755)
+            linked = root / "brew" / "bin"
+            linked.mkdir()
+            os.symlink(str(keg / "node"), str(linked / "node"))
+            skill = root / "ui" / "skills" / "ui-diff" / "bin"
+            skill.mkdir(parents=True)
+            (skill / "ui-diff.mjs").write_text("")
+            os.symlink(str(skill / "ui-diff.mjs"), str(root / "ui-diff-link.mjs"))
+            config = self.config()
+            config["visual_outline"]["ui_diff"]["command"] = [str(linked / "node"), str(root / "ui-diff-link.mjs")]
+            with mock.patch.dict(os.environ, {"PATH": f"{linked}:relative/bin"}):
+                profile = ui_diff.sandbox_profile(config, Path("/srv/rol/config"))
+        for path in (linked, keg.parent, root / "brew", root / "ui" / "skills" / "ui-diff"):
+            self.assertIn(f'(deny file-write* (subpath "{path}"))', profile)
+        self.assertNotIn("relative/bin", profile)
 
     def test_paths_are_quoted(self) -> None:
         profile = ui_diff.sandbox_profile(self.config(deny=['/tmp/a "b"\\c']), Path("/srv/rol/config"))
@@ -617,9 +647,20 @@ class RunStageTest(unittest.TestCase):
             import shutil
             shutil.rmtree(str(workspace), ignore_errors=True)
 
-    def sandboxed_config(self, secret_dir: Path) -> tuple:
+    def sandboxed_config(self, secret_dir: Path, **behaviour) -> tuple:
+        """The fake ui-diff in its own directory, like an install (the sandbox write-protects it),
+        recording through FAKE_RECORD into the test's directory."""
         config = _config(self.tmp)
-        config["visual_outline"]["ui_diff"]["sandbox"] = {"deny": [str(secret_dir)]}
+        tool_dir = self.tmp / "tool"
+        tool_dir.mkdir(exist_ok=True)
+        script = Path(config["visual_outline"]["ui_diff"]["command"][1])
+        moved = tool_dir / script.name
+        script.rename(moved)
+        (tool_dir / "behaviour.json").write_text(json.dumps(behaviour))
+        settings = config["visual_outline"]["ui_diff"]
+        settings["command"][1] = str(moved)
+        settings["sandbox"] = {"deny": [str(secret_dir)]}
+        settings["env"] = {"FAKE_RECORD": str(self.tmp / "record.jsonl")}
         service = self.tmp / "svc" / "config"
         service.mkdir(parents=True)
         return config, service
@@ -634,15 +675,22 @@ class RunStageTest(unittest.TestCase):
             calls.append(list(args))
             return real(args, *rest, **kw)
 
-        with mock.patch.object(ui_diff, "_run_group", spy), mock.patch.object(ui_diff.os, "access", lambda *a: True), \
-                mock.patch.object(ui_diff, "SANDBOX_EXEC", "/usr/bin/env"):
-            # /usr/bin/env stands in for sandbox-exec: "-p PROFILE" would be read as a program, so
-            # only the argv shape is checked here; the real sandbox is exercised below on macOS.
-            ui_diff.run_stage(config, service, self.source, self.artifacts, REPO, _pr(),
-                              lambda env: env, self.logs.append, lambda p, t: p.write_text(t))
-        self.assertEqual(calls[0][:2], ["/usr/bin/env", "-p"])
+        fake_sandbox = self.tmp / "tools" / "sandbox-exec"
+        fake_sandbox.parent.mkdir()
+        # Drops "-p PROFILE" and runs the rest: the argv shape is checked here end to
+        # end (the stage reaches publish); the real sandbox is exercised below on macOS.
+        fake_sandbox.write_text('#!/bin/sh\nshift 2\nexec "$@"\n')
+        fake_sandbox.chmod(0o755)
+        with mock.patch.object(ui_diff, "_run_group", spy), mock.patch.object(ui_diff, "SANDBOX_EXEC", str(fake_sandbox)):
+            outcome = ui_diff.run_stage(config, service, self.source, self.artifacts, REPO, _pr(),
+                                        lambda env: env, self.logs.append, lambda p, t: p.write_text(t))
+        self.assertEqual(outcome.status, "ok", outcome.detail)
+        self.assertEqual(calls[0][:2], [str(fake_sandbox), "-p"])
         self.assertIn("(deny file-read* file-write*", calls[0][2])
         self.assertEqual(calls[0][3], sys.executable, "the ui-diff command follows the profile")
+        publish = [args for args in calls if "publish" in args]
+        self.assertTrue(publish, "the stage reached publish")
+        self.assertTrue(all(args[0] == sys.executable for args in publish), "publish is never wrapped")
 
     def test_a_missing_sandbox_tool_fails_closed(self) -> None:
         self.behaviour()
@@ -659,13 +707,24 @@ class RunStageTest(unittest.TestCase):
         secret_dir = self.tmp / "secret"
         secret_dir.mkdir()
         (secret_dir / "app.pem").write_text("PRIVATE KEY")
-        self.behaviour(read_secret=str(secret_dir / "app.pem"))
-        config, service = self.sandboxed_config(secret_dir)
+        config, service = self.sandboxed_config(secret_dir, read_secret=str(secret_dir / "app.pem"))
         outcome = ui_diff.run_stage(config, service, self.source, self.artifacts, REPO, _pr(),
                                     lambda env: env, self.logs.append, lambda p, t: p.write_text(t))
         self.assertEqual(outcome.status, "ok", outcome.detail)
         secret = next(record for record in self.records() if record["args"] == ["secret"])
         self.assertEqual(secret["secret"], "PermissionError")
+
+    @unittest.skipUnless(sys.platform == "darwin" and os.access(ui_diff.SANDBOX_EXEC, os.X_OK), "macOS sandbox-exec")
+    def test_the_sandbox_keeps_the_prs_code_from_rewriting_what_publish_runs(self) -> None:
+        # The run step must not be able to replace the ui-diff install before
+        # publish, which runs outside the sandbox, runs it again.
+        moved = self.tmp / "tool" / "fake-ui-diff.py"
+        config, service = self.sandboxed_config(self.tmp / "secret", write_into=str(moved))
+        ui_diff.run_stage(config, service, self.source, self.artifacts, REPO, _pr(),
+                          lambda env: env, self.logs.append, lambda p, t: p.write_text(t))
+        write = next(record for record in self.records() if record["args"] == ["write"])
+        self.assertEqual(write["write"], "PermissionError")
+        self.assertNotEqual(moved.read_text(), "tampered")
 
     def test_a_dry_run_never_hands_out_the_credential(self) -> None:
         self.behaviour()
