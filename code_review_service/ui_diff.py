@@ -1200,15 +1200,15 @@ def run_stage(
     except (OSError, ValueError) as exc:
         reason = _one_line(f"the sandbox would not protect what publish runs: {exc}")
         return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
-    # A private temp directory per run: ui-diff's worktrees land in it, so every
-    # install and dev server this run started works under it and can be found.
-    # mkdtemp + rmtree(ignore_errors), not TemporaryDirectory: on Python 3.9 its
-    # cleanup raises on a file an install left read-only, which would turn a
-    # finished UI diff into a failure. Beside the clone, in this review's run
-    # directory; the sandbox grants this directory and the clone, nothing else
-    # of the run directory.
-    # A short name: browsers put Unix sockets under TMPDIR (104-byte limit on macOS).
-    run_tmp = tempfile.mkdtemp(prefix="ud-", dir=str(run_dir))
+    # A private temp directory per run (mode 0700): ui-diff's worktrees land in
+    # it, so every install and dev server this run started works under it and
+    # can be found. mkdtemp + rmtree(ignore_errors), not TemporaryDirectory: on
+    # Python 3.9 its cleanup raises on a file an install left read-only, which
+    # would turn a finished UI diff into a failure. The sandbox grants this
+    # directory and the clone, nothing of the review's run directory.
+    # Under a short root, whatever the work directory's depth: browsers put Unix
+    # sockets under TMPDIR (a 104-byte path limit on macOS, 108 on Linux).
+    run_tmp = tempfile.mkdtemp(prefix="ud-", dir=_scratch_root())
     try:
         try:
             profile = sandbox_profile(config, config_dir, source=source, scratch=Path(run_tmp), repo=repo, cache=cache)
@@ -1322,6 +1322,12 @@ def run_stage(
         shutil.rmtree(run_tmp, ignore_errors=True)
         if os.path.exists(run_tmp):
             log(f"{repo} pr #{number}: ui-diff left {run_tmp} behind (could not remove it); remove it by hand")
+
+
+def _scratch_root() -> str:
+    """Where a run's temp directory goes: ``/tmp`` (``/private/tmp`` on macOS),
+    short enough for any socket a browser puts under it."""
+    return os.path.realpath("/tmp") if os.path.isdir("/tmp") else os.path.realpath(tempfile.gettempdir())
 
 
 #: How long a cancelled stage may take to stop: a poll, ui-diff's SIGTERM grace, the SIGKILL wait.
