@@ -59,6 +59,14 @@ FAKE_UI_DIFF = textwrap.dedent(
             config_file.write_text(behaviour["replace_config_with"])
         if behaviour.get("run_sleep"):
             time.sleep(behaviour["run_sleep"])
+        if behaviour.get("read_secret"):
+            try:
+                Path(behaviour["read_secret"]).read_text()
+                outcome = "read"
+            except OSError as exc:
+                outcome = type(exc).__name__
+            with record.open("a") as handle:
+                handle.write(json.dumps({"args": ["secret"], "secret": outcome, "env": {}, "cwd": "", "config": None}) + "\\n")
         if behaviour.get("exit_right_away"):
             sys.exit(0 if (out / "report.json").write_text("{}") else 0)
         if behaviour.get("run_exit"):
@@ -240,6 +248,46 @@ class RepositorySettingsTest(unittest.TestCase):
         policy = {"model": "m", "source": "config"}
         self.assertFalse(svc.policy_applies_everywhere(config, policy, outline_enabled=True))
         self.assertTrue(svc.policy_applies_everywhere(config, policy, outline_enabled=False))
+
+
+class SandboxTest(unittest.TestCase):
+    def config(self, **sandbox) -> dict:
+        return {
+            "repositories": [REPO],
+            "github_app": {"private_key_path": "/srv/keys/app.pem"},
+            "visual_outline": {"ui_diff": {
+                "command": ["/usr/local/bin/node", "/opt/ui-diff/skills/ui-diff/bin/ui-diff.mjs"],
+                "sandbox": sandbox,
+            }},
+        }
+
+    def test_no_block_no_profile(self) -> None:
+        self.assertIsNone(ui_diff.sandbox_profile({"visual_outline": {"ui_diff": {"command": ["x"]}}}, Path("/srv/rol/config")))
+
+    def test_the_profile_denies_secrets_and_the_tree_and_allows_the_work_dirs_last(self) -> None:
+        profile = ui_diff.sandbox_profile(self.config(deny=["/home/bot"], deny_write=["/srv/other"]), Path("/srv/rol/config"))
+        lines = profile.splitlines()
+        self.assertEqual(lines[:2], ["(version 1)", "(allow default)"])
+        for path in ("/home/bot", "/srv/keys", "/srv/rol/data/dashboard", "/srv/rol/data/state.json"):
+            self.assertIn(f'(deny file-read* file-write* (subpath "{os.path.realpath(path)}"))', lines)
+        for path in ("/srv/rol", "/srv/other", "/opt/ui-diff/skills/ui-diff"):
+            self.assertIn(f'(deny file-write* (subpath "{os.path.realpath(path)}"))', lines)
+        self.assertEqual(lines[-2:], [
+            f'(allow file-write* (subpath "{os.path.realpath("/srv/rol/data/work")}"))',
+            f'(allow file-write* (subpath "{os.path.realpath("/srv/rol/data/ui-diff")}"))',
+        ])
+
+    def test_paths_are_quoted(self) -> None:
+        profile = ui_diff.sandbox_profile(self.config(deny=['/tmp/a "b"\\c']), Path("/srv/rol/config"))
+        self.assertIn('"b\\"', profile)
+        self.assertIn('\\\\c', profile)
+
+    def test_validation(self) -> None:
+        base = {"repositories": [REPO]}
+        for bad in ([], {"deny": "/x"}, {"deny": ["relative"]}, {"allow": ["/x"]}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                ui_diff.validate({**base, "visual_outline": {"ui_diff": {"sandbox": bad}}})
+        ui_diff.validate({**base, "visual_outline": {"ui_diff": {"sandbox": {"deny": ["~/x"], "deny_write": []}}}})
 
 
 class SectionTest(unittest.TestCase):
@@ -568,6 +616,56 @@ class RunStageTest(unittest.TestCase):
         finally:
             import shutil
             shutil.rmtree(str(workspace), ignore_errors=True)
+
+    def sandboxed_config(self, secret_dir: Path) -> tuple:
+        config = _config(self.tmp)
+        config["visual_outline"]["ui_diff"]["sandbox"] = {"deny": [str(secret_dir)]}
+        service = self.tmp / "svc" / "config"
+        service.mkdir(parents=True)
+        return config, service
+
+    def test_only_the_run_step_is_sandboxed(self) -> None:
+        self.behaviour()
+        config, service = self.sandboxed_config(self.tmp / "secret")
+        calls = []
+        real = ui_diff._run_group
+
+        def spy(args, *rest, **kw):
+            calls.append(list(args))
+            return real(args, *rest, **kw)
+
+        with mock.patch.object(ui_diff, "_run_group", spy), mock.patch.object(ui_diff.os, "access", lambda *a: True), \
+                mock.patch.object(ui_diff, "SANDBOX_EXEC", "/usr/bin/env"):
+            # /usr/bin/env stands in for sandbox-exec: "-p PROFILE" would be read as a program, so
+            # only the argv shape is checked here; the real sandbox is exercised below on macOS.
+            ui_diff.run_stage(config, service, self.source, self.artifacts, REPO, _pr(),
+                              lambda env: env, self.logs.append, lambda p, t: p.write_text(t))
+        self.assertEqual(calls[0][:2], ["/usr/bin/env", "-p"])
+        self.assertIn("(deny file-read* file-write*", calls[0][2])
+        self.assertEqual(calls[0][3], sys.executable, "the ui-diff command follows the profile")
+
+    def test_a_missing_sandbox_tool_fails_closed(self) -> None:
+        self.behaviour()
+        config, service = self.sandboxed_config(self.tmp / "secret")
+        with mock.patch.object(ui_diff, "SANDBOX_EXEC", str(self.tmp / "no-sandbox-exec")):
+            outcome = ui_diff.run_stage(config, service, self.source, self.artifacts, REPO, _pr(),
+                                        lambda env: env, self.logs.append, lambda p, t: p.write_text(t))
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("sandbox", outcome.section)
+        self.assertEqual(self.records(), [], "the PR's code never ran unsandboxed")
+
+    @unittest.skipUnless(sys.platform == "darwin" and os.access(ui_diff.SANDBOX_EXEC, os.X_OK), "macOS sandbox-exec")
+    def test_the_sandbox_keeps_the_prs_code_out_of_denied_paths(self) -> None:
+        secret_dir = self.tmp / "secret"
+        secret_dir.mkdir()
+        (secret_dir / "app.pem").write_text("PRIVATE KEY")
+        self.behaviour(read_secret=str(secret_dir / "app.pem"))
+        config, service = self.sandboxed_config(secret_dir)
+        outcome = ui_diff.run_stage(config, service, self.source, self.artifacts, REPO, _pr(),
+                                    lambda env: env, self.logs.append, lambda p, t: p.write_text(t))
+        self.assertEqual(outcome.status, "ok", outcome.detail)
+        secret = next(record for record in self.records() if record["args"] == ["secret"])
+        self.assertEqual(secret["secret"], "PermissionError")
 
     def test_a_dry_run_never_hands_out_the_credential(self) -> None:
         self.behaviour()

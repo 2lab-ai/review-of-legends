@@ -736,6 +736,15 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   self-hosted CI runner). Only a head that GitHub places in the repository itself runs (by
   repository id when GitHub sends both): a fork's PR, or one whose fork was deleted, never does.
   `once --dry-run` renders the section text-only and pushes nothing.
+- **Sandbox (macOS).** With `visual_outline.ui_diff.sandbox` set, the run step runs under
+  `/usr/bin/sandbox-exec` with a profile that allows everything except: reading or writing the
+  `deny` paths (e.g. the daemon user's home and other tenants' trees), the GitHub App key's
+  directory, `data/dashboard` and the review ledger; writing the service tree (its review work
+  directory and the ui-diff caches excepted), the ui-diff install and the `deny_write` paths. Set
+  it on any host where a PR author must not reach other credentials. A configured sandbox fails
+  closed: without `sandbox-exec` the PR's code is not run and the section says why. The work
+  directory and `cache_dir` must not sit under a `deny` path. Publish runs ui-diff's own code
+  outside the sandbox (the install is write-protected from the run step).
 - **Pushing needs Contents: write.** The default App has Contents: read; without write, the push is
   refused (ui-diff exits 3) and the section is posted text-only (changed captures, percentages,
   summary) with a note saying why. `upload: false` posts text-only on purpose.
@@ -759,7 +768,8 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   config), `timeout_seconds` (run, default 1500), `publish_timeout_seconds` (default 300),
   `max_concurrent` (ui-diff runs at once across reviews, default 1; a change takes effect after a
   restart), `assets_branch` (default
-  `ui-diff-assets`), `upload` (default `true`).
+  `ui-diff-assets`), `upload` (default `true`), `sandbox` (`{"deny": [...], "deny_write": [...]}`,
+  absolute paths; see above).
 - **Install** ui-diff once on the host, at a pinned commit, outside the deployed tree:
   `git clone https://github.com/imuratalpay/ui-diff.git /opt/ui-diff && git -C /opt/ui-diff checkout
   --detach <commit>`, then with the same `HOME`/`npm_config_cache`/`PLAYWRIGHT_BROWSERS_PATH` as

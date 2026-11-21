@@ -225,6 +225,20 @@ def validate(config: Dict[str, Any]) -> None:
                 raise ValueError(f"config.visual_outline.ui_diff.env[{name}] must be a NAME -> string pair")
             if name in _RESERVED_ENV or name.startswith(_RESERVED_ENV_PREFIXES):
                 raise ValueError(f"config.visual_outline.ui_diff.env may not set {name}")
+    sandbox = settings.get("sandbox")
+    if sandbox is not None:
+        if not isinstance(sandbox, dict):
+            raise ValueError("config.visual_outline.ui_diff.sandbox must be an object")
+        for key in sandbox:
+            if key.startswith("_"):
+                continue
+            if key not in ("deny", "deny_write"):
+                raise ValueError(f"config.visual_outline.ui_diff.sandbox has an unknown key: {key}")
+            paths = sandbox[key]
+            if not isinstance(paths, list) or not all(
+                isinstance(path, str) and os.path.isabs(os.path.expanduser(path)) for path in paths
+            ):
+                raise ValueError(f"config.visual_outline.ui_diff.sandbox.{key} must be a list of absolute paths")
     configs = settings.get("configs")
     if configs is not None:
         if not isinstance(configs, dict):
@@ -365,6 +379,52 @@ def cache_root(config: Dict[str, Any], config_dir: Path) -> Path:
     raw = str(ui_diff_block(config).get("cache_dir") or DEFAULT_CACHE_DIR)
     path = Path(os.path.expanduser(raw))
     return path if path.is_absolute() else (Path(config_dir) / path).resolve()
+
+
+#: macOS's sandbox: the run step (the PR's code) runs under a profile built from
+#: visual_outline.ui_diff.sandbox when that block is set.
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
+
+def _sbpl(path: Any) -> str:
+    """A path as an SBPL string literal, resolved the way the kernel sees it (/tmp is /private/tmp)."""
+    real = os.path.realpath(os.path.expanduser(str(path)))
+    return '"' + real.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def sandbox_profile(config: Dict[str, Any], config_dir: Path) -> Optional[str]:
+    """The sandbox profile for ``ui-diff run``, or None when no sandbox is configured.
+
+    Everything is allowed except: reading or writing the ``deny`` paths, the
+    GitHub App key's directory, the dashboard database and the review ledger;
+    writing the service tree (the review work directory and the ui-diff caches
+    excepted), the ui-diff install and the ``deny_write`` paths. Later rules
+    win in a profile, so the two write exceptions come last.
+    """
+    settings = ui_diff_block(config)
+    block = settings.get("sandbox")
+    if not isinstance(block, dict):
+        return None
+    service_root = Path(config_dir).resolve().parent
+    deny: List[Any] = list(block.get("deny") or [])
+    app = config.get("github_app")
+    if isinstance(app, dict) and app.get("private_key_path"):
+        deny.append(Path(str(app["private_key_path"])).parent)
+    deny.append(service_root / "data" / "dashboard")
+    state = Path(os.path.expanduser(str(config.get("state_path") or "data/state.json")))
+    deny.append(state if state.is_absolute() else service_root / state)
+    deny_write: List[Any] = [service_root] + list(block.get("deny_write") or [])
+    for arg in settings.get("command") or []:
+        script = Path(str(arg))
+        if script.suffix in (".mjs", ".js") and script.is_absolute() and len(script.parents) > 2:
+            deny_write.append(script.parents[1])  # the skill directory: bin/ and dist/ beside it
+    work = Path(os.path.expanduser(str(config.get("work_dir") or "data/work")))
+    allow_write = [work if work.is_absolute() else service_root / work, cache_root(config, config_dir)]
+    lines = ["(version 1)", "(allow default)"]
+    lines += [f"(deny file-read* file-write* (subpath {_sbpl(path)}))" for path in deny]
+    lines += [f"(deny file-write* (subpath {_sbpl(path)}))" for path in deny_write]
+    lines += [f"(allow file-write* (subpath {_sbpl(path)}))" for path in allow_write]
+    return "\n".join(lines) + "\n"
 
 
 def run_environ(config: Dict[str, Any], config_dir: Path, base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -813,6 +873,12 @@ def run_stage(
     command = [str(arg) for arg in settings.get("command") or []]
     out_dir = Path(source_dir) / ".ui-diff"
     env = run_environ(config, config_dir)
+    profile = sandbox_profile(config, config_dir)
+    if profile is not None and not os.access(SANDBOX_EXEC, os.X_OK):
+        # Fail closed: a deployment that asked for the sandbox never runs the PR's code without it.
+        reason = f"visual_outline.ui_diff.sandbox is set but {SANDBOX_EXEC} is not available on this host"
+        return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
+    run_prefix = [SANDBOX_EXEC, "-p", profile] if profile is not None else []
     # A private temp directory per run: ui-diff's worktrees land in it, so every
     # install and dev server this run started works under it and can be found.
     # mkdtemp + rmtree(ignore_errors), not TemporaryDirectory: on Python 3.9 its
@@ -832,7 +898,7 @@ def run_stage(
             return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
         try:
             log(f"{repo} pr #{number}: ui-diff capturing base {base_sha[:12]} and head {head_sha[:12]}")
-            run_args = command + [
+            run_args = run_prefix + command + [
                 "run", "--config", str(config_path), "--base", base_sha, "--head", head_sha, "--out", str(out_dir),
             ]
             code, stdout, stderr = _run_group(

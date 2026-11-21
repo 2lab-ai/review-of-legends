@@ -164,7 +164,7 @@
     "timeout_seconds": 2300
   },
   "visual_outline": {
-    "_comment": "Runs once per PR before the reviewer agents (skipped when a comment with visual_marker already exists), same runner and model ladder as the reviewers. Per repository: repositories {owner/name: {enabled, ui_diff}} (the dashboard's Settings switches win). ui_diff {command, configs, env, cache_dir, timeout_seconds, publish_timeout_seconds, max_concurrent, assets_branch, upload} adds ui-diff screenshots to the outline; see docs/operations.md \"UI diff\".",
+    "_comment": "Runs once per PR before the reviewer agents (skipped when a comment with visual_marker already exists), same runner and model ladder as the reviewers. Per repository: repositories {owner/name: {enabled, ui_diff}} (the dashboard's Settings switches win). ui_diff {command, configs, env, cache_dir, timeout_seconds, publish_timeout_seconds, max_concurrent, assets_branch, upload, sandbox} adds ui-diff screenshots to the outline; see docs/operations.md \"UI diff\".",
     "enabled": true,
     "prompt_path": "../agents/visual-outline.md",
     "timeout_seconds": 2300
