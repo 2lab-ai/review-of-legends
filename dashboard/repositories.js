@@ -38,7 +38,60 @@ export function projectRepositoryRow(row) {
     added_at: text(row.added_at, 64),
     // Why the service skips it (too few agents for the quorum), if it does.
     problem: text(row.problem, 300),
+    visual_outline: projectVisualOutline(row.visual_outline),
   };
+}
+
+const OUTLINE_SOURCES = new Set(['dashboard', 'config', 'default']);
+
+/** The repository's visual outline and UI diff switches, as the service reads them. */
+export function projectVisualOutline(raw) {
+  const source = raw && typeof raw === 'object' ? raw : {};
+  const origin = (value) => (OUTLINE_SOURCES.has(value) ? value : 'default');
+  return {
+    enabled: source.enabled === true,
+    enabled_source: origin(source.enabled_source),
+    ui_diff: source.ui_diff === true,
+    ui_diff_source: origin(source.ui_diff_source),
+    ui_diff_effective: source.ui_diff_effective === true,
+    ui_diff_available: source.ui_diff_available === true,
+    ui_diff_config: source.ui_diff_config === true,
+  };
+}
+
+export function describeOutlineSource(source) {
+  if (source === 'dashboard') return 'set here';
+  if (source === 'config') return 'config/reviewer.json';
+  return 'config default';
+}
+
+/** One line for read-only accounts and the admin's own record of what runs. */
+export function describeVisualOutline(row) {
+  const outline = row && row.visual_outline ? row.visual_outline : projectVisualOutline(null);
+  const parts = [
+    `Visual outline: ${outline.enabled ? 'on' : 'off'} (${describeOutlineSource(outline.enabled_source)})`,
+    `UI diff: ${outline.ui_diff_effective ? 'on' : 'off'} (${describeOutlineSource(outline.ui_diff_source)})`,
+  ];
+  return parts.join(' · ');
+}
+
+/** Why a UI diff switched on does not run, or null when it runs (or is off). */
+export function describeUiDiffBlocker(row) {
+  const outline = row && row.visual_outline ? row.visual_outline : projectVisualOutline(null);
+  if (!outline.ui_diff) return null;
+  if (!outline.ui_diff_available) return 'UI diff is on but ui-diff is not installed here (visual_outline.ui_diff.command), so it does not run.';
+  if (!outline.enabled) return 'UI diff is on but runs only with the visual outline: turn the outline on.';
+  return null;
+}
+
+export function hasOutlineOverride(row) {
+  const outline = row && row.visual_outline;
+  return Boolean(outline && (outline.enabled_source === 'dashboard' || outline.ui_diff_source === 'dashboard'));
+}
+
+export function outlineNotice(repo, payloadRow) {
+  if (!payloadRow) return `Saved the visual outline setting for ${repo}. The next review uses it.`;
+  return `Saved for ${repo}: ${describeVisualOutline(payloadRow)}. The next review uses it.`;
 }
 
 export function describeRepositoryProblem(row) {
@@ -129,7 +182,8 @@ export function repositoryActionError(described, action) {
   if (described.status === 0 || described.status === 401 || described.status === 403) return described;
   return {
     ...described,
-    title: action === 'remove' ? 'The repository was not removed' : 'The repository was not added',
+    title: action === 'remove' ? 'The repository was not removed'
+      : action === 'outline' ? 'The visual outline setting was not changed' : 'The repository was not added',
     recovery: described.status >= 500 && !described.detail ? 'Reload the list to see what is in effect, then try again.' : '',
   };
 }

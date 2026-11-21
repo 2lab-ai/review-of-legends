@@ -1215,6 +1215,33 @@ code {
   overflow-wrap: anywhere;
 }
 
+.repo__outline {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.repo__toggles {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-4);
+}
+
+.repo__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--tap);
+  cursor: pointer;
+}
+
+.repo__toggle input {
+  width: 1.125rem;
+  height: 1.125rem;
+  margin: 0;
+}
+
 .repo-add {
   display: flex;
   flex-direction: column;
