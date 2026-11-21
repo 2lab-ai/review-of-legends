@@ -59,6 +59,7 @@ import {
   addedNotice,
   initialRepositoryDraft,
   nextRepositoryDraft,
+  outlineNotice,
   projectRepositorySettings,
   removedNotice,
   repositoryActionError,
@@ -598,6 +599,16 @@ function removeRepository(repo) {
     (payload) => removedNotice(typeof payload.removed === 'string' ? payload.removed : repo));
 }
 
+/** A visual outline switch on one repository row: `flags` is {enabled} or
+ *  {ui_diff} (true/false), or both null to hand the row back to the config. */
+function setVisualOutline(repo, flags) {
+  mutateRepositories(`outline:${repo}`, 'outline', () => api.setRepositoryVisualOutline(repo, flags), (payload) => {
+    const projected = projectRepositorySettings(payload);
+    const row = projected.repositories.find((item) => item.repo.toLowerCase() === String(repo).toLowerCase());
+    return outlineNotice(row ? row.repo : repo, row);
+  });
+}
+
 /** Typing an address: state plus the controls that depend on it, like the
  *  repository input; a render() per keystroke would rebuild the focused input. */
 function editAdminDraft(value) {
@@ -1036,6 +1047,7 @@ function renderMain() {
         onDraft: editRepositoryDraft,
         onAdd: addRepository,
         onRemove: removeRepository,
+        onOutline: setVisualOutline,
         onReload: () => loadRepositorySettings(),
       },
       admins: {

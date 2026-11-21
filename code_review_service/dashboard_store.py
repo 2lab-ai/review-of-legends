@@ -241,7 +241,11 @@ MAX_ADDED_REPOSITORIES = 50
 #: The web tier validates each entry (dashboard_auth.normalize_admin_email); the store bounds the list.
 ADMINS_SETTING = "admins"
 MAX_ADDED_ADMINS = 50
-SETTING_KEYS = (MODEL_POLICY_SETTING, REPOSITORIES_SETTING, ADMINS_SETTING)
+#: Per-repository visual outline and UI diff choices (ui_diff.SETTING):
+#: ``{"repositories": {owner/name: {"enabled": bool, "ui_diff": bool}}}``; the web
+#: tier validates it (ui_diff.validate_stored), the store bounds its size.
+VISUAL_OUTLINE_REPOSITORIES_SETTING = "visual_outline_repositories"
+SETTING_KEYS = (MODEL_POLICY_SETTING, REPOSITORIES_SETTING, ADMINS_SETTING, VISUAL_OUTLINE_REPOSITORIES_SETTING)
 #: Per-agent overrides (prompt text, required flag) live under ``agent:<agent id>``.
 AGENT_SETTING_PREFIX = "agent:"
 #: The server-managed agent fields live beside it under ``agent_meta:<agent id>``
@@ -651,6 +655,10 @@ class DashboardStore:
                 raise ValueError("setting %s must carry an 'added' list" % key)
             if len(added) > MAX_ADDED_REPOSITORIES:
                 raise ValueError("setting %s holds %d repositories, limit %d" % (key, len(added), MAX_ADDED_REPOSITORIES))
+            limit = self.max_repositories_setting_chars
+        elif key == VISUAL_OUTLINE_REPOSITORIES_SETTING:
+            if not isinstance(value.get("repositories"), dict):
+                raise ValueError("setting %s must carry a 'repositories' object" % key)
             limit = self.max_repositories_setting_chars
         elif key == ADMINS_SETTING:
             added = value.get("added")

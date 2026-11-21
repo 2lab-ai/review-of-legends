@@ -4045,6 +4045,12 @@ class RepositorySettingsTest(AppTestCase):
         response = client.get("/api/settings/repositories")
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
+        outlines = [row.pop("visual_outline") for row in payload["repositories"]]
+        self.assertEqual(outlines[0], {
+            "enabled": False, "enabled_source": "default", "ui_diff": False, "ui_diff_source": "default",
+            "ui_diff_available": False, "ui_diff_config": False, "ui_diff_effective": False,
+        })
+        self.assertFalse(payload["ui_diff_available"])
         self.assertEqual(payload["repositories"], [
             {"repo": "acme-corp/Gamma", "source": "config", "agents": ["a", "b", "c", "arch"], "added_by": None, "added_at": None, "problem": None},
             {"repo": "acme-corp/review-of-legends", "source": "config", "agents": ["a", "b", "c"], "added_by": None, "added_at": None, "problem": None},
@@ -4358,6 +4364,132 @@ class RepositorySettingsTest(AppTestCase):
         event = json.loads(block.split("data: ", 1)[1])
         self.assertEqual(event["payload"], {"key": "repositories"})
         self.assertNotIn(ADMIN_EMAIL, block)
+
+
+class RepositoryVisualOutlineTest(AppTestCase):
+    """The per-repository visual outline and UI diff switches (store key visual_outline_repositories)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write_config(ui_diff_command=True)
+
+    def write_config(self, ui_diff_command: bool) -> None:
+        outline: dict[str, Any] = {
+            "enabled": True,
+            "repositories": {"acme-corp/review-of-legends": {"enabled": False}},
+        }
+        if ui_diff_command:
+            outline["ui_diff"] = {
+                "command": ["node", "/opt/ui-diff/skills/ui-diff/bin/ui-diff.mjs"],
+                "configs": {"acme-corp/Gamma": {"startCommand": "npm run dev -- --port {port}"}},
+            }
+        self.config_path.write_text(json.dumps({
+            "repositories": ["acme-corp/Gamma", "acme-corp/review-of-legends"],
+            "agents": [
+                {"id": "a", "prompt_path": "../agents/a.md"},
+                {"id": "b", "prompt_path": "../agents/b.md"},
+                {"id": "c", "prompt_path": "../agents/c.md"},
+            ],
+            "gh_bin": "gh",
+            "visual_outline": outline,
+        }), encoding="utf-8")
+
+    def put(self, client: TestClient, identity: dict[str, Any], repo: str, body: Any):
+        return client.put(
+            f"/api/settings/repositories/{repo}/visual-outline", content=json.dumps(body), headers=self.auth_headers(identity)
+        )
+
+    def rows(self, payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        return {row["repo"]: row["visual_outline"] for row in payload["repositories"]}
+
+    def test_the_list_carries_each_repositorys_switches_and_their_sources(self) -> None:
+        client = self.make_client()
+        self.login(client)
+        payload = client.get("/api/settings/repositories").json()
+        self.assertTrue(payload["ui_diff_available"])
+        rows = self.rows(payload)
+        self.assertEqual((rows["acme-corp/Gamma"]["enabled"], rows["acme-corp/Gamma"]["enabled_source"]), (True, "default"))
+        self.assertTrue(rows["acme-corp/Gamma"]["ui_diff_config"])
+        self.assertEqual(
+            (rows["acme-corp/review-of-legends"]["enabled"], rows["acme-corp/review-of-legends"]["enabled_source"]),
+            (False, "config"),
+        )
+        self.assertFalse(rows["acme-corp/review-of-legends"]["ui_diff_config"])
+
+    def test_admin_switches_the_ui_diff_on_and_back_to_the_config(self) -> None:
+        client = self.make_client()
+        identity = self.login(client)
+        response = self.put(client, identity, "acme-corp/gamma", {"ui_diff": True})
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["updated"], "acme-corp/Gamma")
+        row = self.rows(payload)["acme-corp/Gamma"]
+        self.assertEqual((row["ui_diff"], row["ui_diff_source"], row["ui_diff_effective"]), (True, "dashboard", True))
+        key, value, updated_by = self.store.calls_named("set_setting")[-1][1]
+        self.assertEqual((key, updated_by), ("visual_outline_repositories", ADMIN_EMAIL))
+        self.assertEqual(value, {"repositories": {"acme-corp/Gamma": {"ui_diff": True}}})
+        # The GET reads the saved choice back.
+        listed = self.rows(client.get("/api/settings/repositories").json())
+        self.assertEqual(listed["acme-corp/Gamma"]["ui_diff_source"], "dashboard")
+
+        # The outline off for the same repository keeps the UI diff choice but stops it running.
+        response = self.put(client, identity, "acme-corp/Gamma", {"enabled": False})
+        row = self.rows(response.json())["acme-corp/Gamma"]
+        self.assertEqual((row["enabled"], row["ui_diff"], row["ui_diff_effective"]), (False, True, False))
+        self.assertEqual(self.store.calls_named("set_setting")[-1][1][1],
+                         {"repositories": {"acme-corp/Gamma": {"ui_diff": True, "enabled": False}}})
+
+        # null hands both flags back to the config; nothing left, so the setting goes.
+        response = self.put(client, identity, "acme-corp/Gamma", {"enabled": None, "ui_diff": None})
+        self.assertEqual(response.status_code, 200, response.text)
+        row = self.rows(response.json())["acme-corp/Gamma"]
+        self.assertEqual((row["enabled_source"], row["ui_diff_source"], row["ui_diff"]), ("default", "default", False))
+        self.assertEqual(self.store.calls_named("delete_setting")[-1][1][0], "visual_outline_repositories")
+
+    def test_the_ui_diff_cannot_be_switched_on_without_an_install(self) -> None:
+        self.write_config(ui_diff_command=False)
+        client = self.make_client()
+        identity = self.login(client)
+        response = self.put(client, identity, "acme-corp/Gamma", {"ui_diff": True})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("visual_outline.ui_diff.command", response.json()["error"])
+        # The outline itself can still be switched.
+        self.assertEqual(self.put(client, identity, "acme-corp/Gamma", {"enabled": False}).status_code, 200)
+
+    def test_bad_requests_change_nothing(self) -> None:
+        client = self.make_client()
+        identity = self.login(client)
+        for body, status in (
+            ({}, 400),
+            ({"ui_diff": "yes"}, 400),
+            ({"enabled": True, "model": "x"}, 400),
+            ([True], 400),
+        ):
+            response = self.put(client, identity, "acme-corp/Gamma", body)
+            self.assertEqual(response.status_code, status, (body, response.text))
+        self.assertEqual(self.put(client, identity, "acme-corp/Unknown", {"enabled": True}).status_code, 404)
+        self.assertEqual(self.store.calls_named("set_setting"), [])
+
+    def test_only_an_admin_with_the_mutation_guards_may_switch(self) -> None:
+        anonymous = self.make_client()
+        response = anonymous.put(
+            "/api/settings/repositories/acme-corp/Gamma/visual-outline", content="{}",
+            headers={"Content-Type": "application/json", "Origin": PUBLIC_URL},
+        )
+        self.assertEqual(response.status_code, 401)
+        client = self.make_client()
+        self.oauth.token = {"access_token": "at", "userinfo": dict(VIEWER_USERINFO)}
+        viewer = self.login(client)
+        response = self.put(client, viewer, "acme-corp/Gamma", {"enabled": False})
+        self.assertEqual((response.status_code, response.json()["error"]), (403, "admin role required"))
+        admin_client = self.make_client()
+        admin = self.login(admin_client)
+        no_csrf = {"Origin": PUBLIC_URL, "Content-Type": "application/json"}
+        response = admin_client.put("/api/settings/repositories/acme-corp/Gamma/visual-outline",
+                                    content=json.dumps({"enabled": False}), headers=no_csrf)
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(admin)
+        self.assertEqual(self.store.calls_named("set_setting"), [])
 
 
 # ---------------------------------------------------------------------------

@@ -35,6 +35,7 @@ from . import dashboard_execution
 from . import gate
 from . import mentions
 from . import review_scope
+from . import ui_diff
 
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config" / "reviewer.json"
@@ -352,6 +353,7 @@ def load_config(path: Path) -> dict[str, Any]:
     try:
         contributors.gate_settings(config)
         review_scope.validate(config)
+        ui_diff.validate(config)
     except ValueError as exc:
         raise ServiceError(str(exc)) from None
     dashboard = config.get("dashboard")
@@ -1137,7 +1139,9 @@ def runner_commands(config: dict[str, Any], agents: list[dict[str, Any]] | None 
     summary = config.get("executive_summary") or {}
     if summary.get("enabled", False):
         commands.append((summary.get("runner") or default).get("command"))
-    if visual_outline_enabled(config):
+    # The outline may be on for one repository only (visual_outline.repositories):
+    # its runner then decides publication everywhere, on the safe side.
+    if ui_diff.any_repository_enabled(config):
         outline = config.get("visual_outline") or {}
         commands.append((outline.get("runner") or default).get("command"))
     return commands or [default.get("command")]
@@ -3679,7 +3683,10 @@ def visual_outline_exists(client: GitHubClient, number: int, marker: str) -> boo
     duplicate what a reviewer can read.
     """
     for comment in client.list_issue_comments(int(number)):
-        if marker in str(comment.get("body", "")):
+        body = str(comment.get("body", ""))
+        # A comment that carries only a UI diff (the outline agent produced
+        # nothing then) still wants its outline.
+        if marker in body and not ui_diff.outline_is_pending(body):
             return True
     return False
 
@@ -3792,7 +3799,10 @@ def run_visual_outline_agent(
 ) -> str | None:
     """The outline Markdown, or None when the run produced nothing usable."""
     outline_config = config.get("visual_outline") or {}
-    if not visual_outline_enabled(config):
+    # Whether this repository gets an outline is the caller's decision
+    # (ui_diff.repository_settings: the dashboard, the config's repositories,
+    # then visual_outline.enabled); without a block there is nothing to run.
+    if not isinstance(config.get("visual_outline"), dict):
         return None
 
     prompt_path = expand_path(outline_config.get("prompt_path", "../agents/visual-outline.md"), config_dir)
@@ -3877,6 +3887,87 @@ def build_visual_outline_body(
         f"PR head: `{head_sha[:7]}`"
     )
     return "\n".join([marker, "", outline.strip(), "", footer])
+
+
+# --------------------------------------------------------------- UI diff
+# ui-diff (ui_diff.py) captures the PR's base and head, diffs them and pushes
+# the images to the repository's assets branch; its markdown becomes the UI diff
+# section of the outline comment, replaced on every reviewed head.
+
+
+def ui_diff_publish_environ(config: dict[str, Any]) -> Callable[[dict[str, str]], dict[str, str]]:
+    """How the publish step gets its GitHub credential (never the run step).
+
+    With the App configured: its installation token, for gh (visibility check)
+    and for git (the push), the same way a review clone authenticates. Without
+    one: the host's own gh login and git credential helper, so the real HOME.
+    """
+    app = config.get("github_app")
+
+    def environ(env: dict[str, str]) -> dict[str, str]:
+        if app:
+            return app_git_auth_env(github_app_token(app), base=env)
+        merged = dict(env)
+        for name in ("HOME", "GH_CONFIG_DIR", "GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK"):
+            if os.environ.get(name):
+                merged[name] = os.environ[name]
+        merged.pop("GIT_CONFIG_GLOBAL", None)
+        merged.pop("GIT_CONFIG_NOSYSTEM", None)
+        return merged
+
+    return environ
+
+
+def start_ui_diff_job(
+    config: dict[str, Any],
+    config_dir: Path,
+    source_dir: Path,
+    run_dir: Path,
+    repo: str,
+    pr: dict[str, Any],
+) -> ui_diff.Job:
+    """Start the UI diff of one PR head on a thread; ``finish_ui_diff`` joins it."""
+    artifact_dir = prepare_review_artifact_dir(source_dir, run_dir)
+    try:
+        os.chmod(str(artifact_dir), 0o700)
+    except OSError:
+        pass
+
+    def target() -> ui_diff.Outcome:
+        return ui_diff.run_stage(
+            config,
+            Path(config_dir),
+            Path(source_dir),
+            artifact_dir,
+            repo,
+            pr,
+            publish_env=ui_diff_publish_environ(config),
+            log=log,
+            write_text=write_private_text,
+        )
+
+    return ui_diff.Job(target, str((pr.get("head") or {}).get("sha") or "")).start()
+
+
+def post_ui_diff_section(client: Any, config: dict[str, Any], number: int, section: str) -> Any:
+    """Put ``section`` on the service's own outline comment, replacing the last one.
+
+    Only the bot's own marker comment is edited (as upsert_issue_comment). With
+    none — the outline agent produced nothing — a marker comment carrying only
+    the UI diff is posted, marked pending so the next review still drafts the
+    outline (visual_outline_exists).
+    """
+    marker = config.get("visual_marker", VISUAL_MARKER)
+    bot_login = client.bot_login()
+    for comment in client.list_issue_comments(int(number)):
+        body = str(comment.get("body", ""))
+        if marker not in body:
+            continue
+        author = str((comment.get("user") or {}).get("login", "") or "")
+        if not bot_login or author != bot_login:
+            continue
+        return client.update_issue_comment(int(comment["id"]), ui_diff.merge_section(body, section))
+    return client.create_issue_comment(int(number), ui_diff.merge_section(ui_diff.pending_outline_body(marker), section))
 
 
 def run_agent(
@@ -6611,6 +6702,13 @@ def review_pr(
         title=str(pr.get("title", "") or ""),
         url=str(pr.get("html_url", "") or ""),
     )
+    # Whether this repository gets the visual outline and its UI diff: the
+    # dashboard's per-repository choice, else visual_outline.repositories, else
+    # visual_outline.enabled (ui_diff.repository_settings). Read once.
+    outline_settings = ui_diff.repository_settings(config, client.repo, recorder.setting(ui_diff.SETTING))
+    if "dashboard" in (outline_settings["enabled_source"], outline_settings["ui_diff_source"]):
+        log(f"{client.repo} pr #{number}: visual outline {'on' if outline_settings['enabled'] else 'off'}, "
+            f"ui diff {'on' if outline_settings['ui_diff_effective'] else 'off'} (dashboard)")
     # Which models review this attempt: an operator's retry choice, else the
     # dashboard-set policy, else the config. Resolved once, recorded on the
     # attempt, and shown on the PR before any agent starts.
@@ -6816,6 +6914,34 @@ def review_pr(
         # From here on the clone exists on disk. Whatever happens next — a posted
         # review, a quorum failure, an exception in any stage — the clone is removed
         # on the way out; only the small review artifacts stay behind.
+        ui_diff_job: ui_diff.Job | None = None
+
+        def finish_ui_diff() -> None:
+            """Join the UI diff (if one runs) and put its section on the outline comment.
+
+            Called before every removal of the clone: ui-diff's worktrees live in it.
+            Best effort: nothing here may raise into the review.
+            """
+            nonlocal ui_diff_job
+            job, ui_diff_job = ui_diff_job, None
+            if job is None:
+                return
+            try:
+                outcome = job.result(ui_diff.join_timeout(config))
+                if outcome is None:
+                    log(f"{repo} pr #{number}: ui-diff still running after the wait; not posting it")
+                    return
+                log(f"{repo} pr #{number}: ui-diff {outcome.status}" + (f": {outcome.detail}" if outcome.detail else ""))
+                if outcome.section is None:
+                    return
+                if dry_run:
+                    print(format_ascii_banner("UI Diff", [f"Repo: {repo}", f"PR: #{number}", f"Head: {str(head_sha)[:12]}"]))
+                    print(outcome.section)
+                    return
+                post_ui_diff_section(client, config, number, outcome.section)
+            except Exception as exc:  # noqa: BLE001 - the UI diff never costs the review
+                log(f"{repo} pr #{number}: posting the ui-diff section failed: {exc}")
+
         try:
             repository_rules = load_repository_rules(source_dir, trusted_ref=base_sha)
             progress_started_at = dt.datetime.now(dt.timezone.utc)
@@ -6855,7 +6981,7 @@ def review_pr(
             # The visual outline runs before the reviewers so whoever opens the PR sees
             # the shape of the change first. Everything here is best effort: no failure
             # of it may cost the review.
-            if visual_outline_enabled(config):
+            if outline_settings["enabled"]:
                 # One boundary for the whole stage: a missing prompt file, an artifact
                 # write, a runner argv that will not render or launch, undecodable
                 # runner output — none of it may abort a review that has not started.
@@ -6927,6 +7053,15 @@ def review_pr(
                         except Exception:
                             # Even the courtesy note is best effort here.
                             pass
+
+            # The UI diff runs beside the reviewers (it starts two dev servers and a
+            # browser, minutes of work) and is joined before the clone is removed.
+            if outline_settings["ui_diff_effective"]:
+                try:
+                    ui_diff_job = start_ui_diff_job(config, config_path.parent, source_dir, run_dir, repo, pr)
+                    log(f"{repo} pr #{number}: ui-diff started beside the reviewers")
+                except Exception as exc:  # noqa: BLE001 - the UI diff never costs the review
+                    log(f"{repo} pr #{number}: ui-diff could not start; continuing without it: {exc}")
 
             recorder.agents(progress_entries, stage="dispatching")
             progress("Dispatching reviewer agents")
@@ -7069,6 +7204,7 @@ def review_pr(
                 # response files) so the operator can inspect why agents failed,
                 # but remove the full cloned source to avoid filling service-local
                 # disk on repeated failures.
+                finish_ui_diff()
                 cleanup_review_run_dir(run_dir, config)
                 if run_dir.exists():
                     log(f"{repo} pr #{number}: preserving run dir for inspection: {run_dir}")
@@ -7249,6 +7385,7 @@ def review_pr(
                     print("\nLine comments:")
                     for comment in comments:
                         print(f"- {comment['path']}:{comment['line']} {comment['body'].splitlines()[0]}")
+                finish_ui_diff()
                 cleanup_review_run_dir(run_dir, config)
                 return True
 
@@ -7319,6 +7456,7 @@ def review_pr(
                         f"posting the review failed: {exc}",
                         stage=dashboard_execution.POSTING_REJECTED_STAGE,
                     )
+                finish_ui_diff()
                 cleanup_review_run_dir(run_dir, config)
                 raise
             # P1 idempotency: the GitHub review POST is irreversible. Record the
@@ -7388,14 +7526,17 @@ def review_pr(
                     log(f"{repo} pr #{number}: executive summary failed: {exc}")
                     progress("Review posted; executive summary failed", note=" ".join(filter(None, [str(exc), posted_notes])),
                     )
+                    finish_ui_diff()
                     cleanup_review_run_dir(run_dir, config)
                     return True
             progress("Complete", note=" ".join(filter(None, [
                 f"{review_event} review posted with {len(comments)} inline comments.", posted_notes,
             ])))
+            finish_ui_diff()
             cleanup_review_run_dir(run_dir, config)
             return True
         finally:
+            finish_ui_diff()
             cleanup_review_run_dir(run_dir, config)
     finally:
         if status_open:

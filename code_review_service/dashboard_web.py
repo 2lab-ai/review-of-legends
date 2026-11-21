@@ -63,6 +63,7 @@ from . import contributors
 from . import dashboard_auth
 from . import mentions
 from . import service as svc
+from . import ui_diff
 from .dashboard_store import (
     ADMINS_SETTING,
     AGENT_ID_PATTERN,
@@ -2242,7 +2243,7 @@ def create_app(
     # tabs cannot drop each other's change.
     repositories_lock = anyio.Lock()
 
-    def _repository_payload(config: Dict[str, Any], stored: Any) -> Dict[str, Any]:
+    def _repository_payload(config: Dict[str, Any], stored: Any, outline_stored: Any = None) -> Dict[str, Any]:
         rows = [
             {
                 # Validated owner/name, never passed through sanitize_text: its
@@ -2254,6 +2255,9 @@ def create_app(
                 "added_at": sanitize_text(row["added_at"], 64) or None,
                 # Why the daemon skips it (too few agents for the quorum), if it does.
                 "problem": sanitize_text(row["problem"], 300) or None,
+                # The visual outline and its UI diff for this repository, with the
+                # source of each answer (ui_diff.repository_settings, as the daemon reads it).
+                "visual_outline": ui_diff.repository_settings(config, row["repo"], outline_stored),
             }
             for row in svc.merge_repositories(config, stored)
         ]
@@ -2262,7 +2266,25 @@ def create_app(
             "allowed_owners": svc.repository_owners(config),
             "max_added": MAX_ADDED_REPOSITORIES,
             "note": BASELINE_OFF_NOTE if config.get("review_existing_open_prs_on_first_run") else BASELINE_NOTE,
+            "ui_diff_available": ui_diff.ui_diff_available(config),
         }
+
+    def _outline_value(row: Any) -> Any:
+        """The saved per-repository outline choices of a settings row, or None."""
+        value = row.get("value") if isinstance(row, dict) else None
+        return value if isinstance(value, dict) else None
+
+    def _read_outline_setting(active_store: Any) -> Any:
+        """Best effort, for display: a store that cannot be read shows the config's answers."""
+        if active_store is None:
+            return None
+        try:
+            return _outline_value(active_store.get_setting(ui_diff.SETTING))
+        except Exception:  # noqa: BLE001 - shown from the config instead
+            return None
+
+    def _payload_with_outline(config: Dict[str, Any], stored: Any) -> Dict[str, Any]:
+        return _repository_payload(config, stored, _read_outline_setting(store))
 
     def _stored_added_entries(active_store: Any) -> List[Any]:
         """The stored ``added`` list exactly as saved, [] when there is no setting.
@@ -2376,7 +2398,7 @@ def create_app(
                 if not isinstance(stored, dict) or not isinstance(stored.get("added"), list):
                     error = "The saved repository list cannot be read; only config/reviewer.json repositories are shown and reviewed."
                     stored = None
-        payload = await run_in_threadpool(_repository_payload, config, stored)
+        payload = await run_in_threadpool(_payload_with_outline, config, stored)
         if error:
             payload["error"] = error
         return _json(payload)
@@ -2416,7 +2438,7 @@ def create_app(
                 await run_in_threadpool(active_store.set_setting, REPOSITORIES_SETTING, value, session["email"])
             except ValueError as exc:
                 raise _bad_request(sanitize_text(f"the repository list was rejected by the store: {exc}", 300)) from None
-        payload = await run_in_threadpool(_repository_payload, config, value)
+        payload = await run_in_threadpool(_payload_with_outline, config, value)
         payload["added"] = canonical
         return _json(payload)
 
@@ -2442,8 +2464,73 @@ def create_app(
                 await run_in_threadpool(active_store.set_setting, REPOSITORIES_SETTING, value, session["email"])
             else:
                 await run_in_threadpool(active_store.delete_setting, REPOSITORIES_SETTING, session["email"])
-        payload = await run_in_threadpool(_repository_payload, config, value)
+        payload = await run_in_threadpool(_payload_with_outline, config, value)
         payload["removed"] = match["repo"]
+        return _json(payload)
+
+    # Per-repository visual outline choices (store key ui_diff.SETTING): the
+    # admin switches the outline and its UI diff for one repository; null hands
+    # that flag back to config/reviewer.json. The daemon reads it at the start
+    # of every review attempt.
+    async def put_repository_visual_outline(request: Request) -> Response:
+        session = await require_admin(request)
+        require_mutation_guards(request, session)
+        active_store = require_store()
+        config = await _repository_config()
+        body = await _read_json_object(request)
+        unknown = sorted(str(key) for key in body if key not in ui_diff.FLAGS)
+        if unknown:
+            raise _bad_request("unknown fields: " + ", ".join(unknown))
+        if not body:
+            raise _bad_request("send enabled and/or ui_diff: true, false, or null to use the config")
+        for key, flag in body.items():
+            if flag is not None and not isinstance(flag, bool):
+                raise _bad_request(f"{key} must be true, false, or null")
+        if body.get("ui_diff") is True and not ui_diff.ui_diff_available(config):
+            raise _bad_request(
+                "ui-diff is not installed on this deployment: set visual_outline.ui_diff.command in config/reviewer.json first."
+            )
+        target = f"{request.path_params['owner']}/{request.path_params['name']}"
+        async with repositories_lock:
+            entries = await run_in_threadpool(_stored_added_entries, active_store)
+            stored_repositories = {"added": entries}
+            rows = svc.merge_repositories(config, stored_repositories)
+            match = next((row for row in rows if row["repo"].lower() == target.lower()), None)
+            if match is None:
+                raise HTTPException(status_code=404, detail=sanitize_text(f"{target} is not on the review list", 300))
+            try:
+                current = await run_in_threadpool(active_store.get_setting, ui_diff.SETTING)
+            except Exception:  # noqa: BLE001 - a change needs the saved choices it edits
+                raise HTTPException(status_code=503, detail=STORE_READ_FAILED) from None
+            saved = ui_diff.stored_repositories(_outline_value(current))
+            # Keep only repositories still on the list, under their listed names.
+            names = {row["repo"].lower(): row["repo"] for row in rows}
+            repositories = {
+                names[name.lower()]: dict(flags) for name, flags in saved.items() if name.lower() in names
+            }
+            flags = dict(repositories.get(match["repo"]) or {})
+            for key, flag in body.items():
+                if flag is None:
+                    flags.pop(key, None)
+                else:
+                    flags[key] = flag
+            if flags:
+                repositories[match["repo"]] = flags
+            else:
+                repositories.pop(match["repo"], None)
+            try:
+                value = ui_diff.validate_stored({"repositories": repositories}, [row["repo"] for row in rows])
+            except ValueError as exc:
+                raise _bad_request(sanitize_text(str(exc), 300)) from None
+            try:
+                if value["repositories"]:
+                    await run_in_threadpool(active_store.set_setting, ui_diff.SETTING, value, session["email"])
+                else:
+                    await run_in_threadpool(active_store.delete_setting, ui_diff.SETTING, session["email"])
+            except ValueError as exc:
+                raise _bad_request(sanitize_text(f"the choice was rejected by the store: {exc}", 300)) from None
+        payload = await run_in_threadpool(_repository_payload, config, stored_repositories, value)
+        payload["updated"] = match["repo"]
         return _json(payload)
 
     # ------------------------------------------------------------ admin grants
@@ -3034,6 +3121,7 @@ def create_app(
         Route("/api/settings/repositories", get_repository_settings, methods=["GET"]),
         Route("/api/settings/repositories", add_repository, methods=["POST"]),
         Route("/api/settings/repositories/{owner}/{name}", remove_repository, methods=["DELETE"]),
+        Route("/api/settings/repositories/{owner}/{name}/visual-outline", put_repository_visual_outline, methods=["PUT"]),
         Route("/api/settings/admins", get_admin_settings, methods=["GET"]),
         Route("/api/settings/admins", add_admin, methods=["POST"]),
         # ``path``: the server decodes %2F before routing, and an address's local

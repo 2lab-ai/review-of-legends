@@ -1,0 +1,495 @@
+"""The visual outline's UI diff (ui_diff.py) and its per-repository switches.
+
+ui-diff itself is replaced by a small script that records what it was run
+with: the stage must give ``run`` (which starts the PR's own code) no
+credential, pin where ``publish`` uploads, fall back to a text-only section
+when the push is refused, and never let a failure reach the review.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from code_review_service import service as svc
+from code_review_service import ui_diff
+
+REPO = "acme-corp/web"
+HEAD = "b" * 40
+BASE = "a" * 40
+
+FAKE_UI_DIFF = textwrap.dedent(
+    """
+    import json, os, sys, time
+    from pathlib import Path
+    args = sys.argv[1:]
+    command = args[0]
+    record = Path(os.environ.get("FAKE_RECORD") or Path(__file__).with_name("record.jsonl"))
+    behaviour = json.loads(Path(__file__).with_name("behaviour.json").read_text())
+    with record.open("a") as handle:
+        handle.write(json.dumps({"args": args, "env": dict(os.environ)}) + "\\n")
+    out = Path(args[args.index("--out") + 1])
+    out.mkdir(parents=True, exist_ok=True)
+    if command == "run":
+        if behaviour.get("run_sleep"):
+            time.sleep(behaviour["run_sleep"])
+        if behaviour.get("run_exit"):
+            print(json.dumps({"error": "Server never became ready", "hint": "check startCommand"}))
+            sys.exit(behaviour["run_exit"])
+        (out / "report.json").write_text(json.dumps({"stats": {"changed": 1}}))
+        print(json.dumps({"stats": {"changed": 1}}))
+        sys.exit(0)
+    if command == "publish":
+        upload = "--no-upload" not in args
+        if upload and behaviour.get("publish_exit"):
+            print(json.dumps({"error": "git could not access the remote"}))
+            sys.exit(behaviour["publish_exit"])
+        link = args[args.index("--link-base") + 1] if upload else ""
+        image = f"![after]({link}/pr-7/default/run/compare/home.png)" if upload else "(images not uploaded)"
+        (out / "comment.md").write_text(
+            "<!-- ui-diff:sticky id=default -->\\n### UI diff — 1 changed, 3 unchanged\\n\\n" + image + "\\n"
+        )
+        print(json.dumps({"pushed": upload, "posted": False}))
+        sys.exit(0)
+    sys.exit(9)
+    """
+)
+
+
+def _config(tmp: Path, **ui_diff_settings) -> dict:
+    script = tmp / "fake-ui-diff.py"
+    script.write_text(FAKE_UI_DIFF, encoding="utf-8")
+    settings = {
+        "command": [sys.executable, str(script)],
+        "cache_dir": str(tmp / "cache"),
+        "configs": {REPO: {"startCommand": "npm run dev -- --port {port}", "routes": ["/"]}},
+    }
+    settings.update(ui_diff_settings)
+    return {
+        "repositories": [REPO],
+        "visual_outline": {"enabled": True, "ui_diff": settings},
+    }
+
+
+def _pr(head_repo: str = REPO) -> dict:
+    return {
+        "number": 7,
+        "head": {"sha": HEAD, "repo": {"full_name": head_repo}},
+        "base": {"sha": BASE, "repo": {"full_name": REPO}},
+    }
+
+
+class RepositorySettingsTest(unittest.TestCase):
+    def test_the_dashboard_beats_the_config_repositories_beat_the_default(self) -> None:
+        config = {
+            "repositories": ["acme-corp/web", "acme-corp/api"],
+            "visual_outline": {
+                "enabled": True,
+                "repositories": {"acme-corp/api": {"enabled": False, "ui_diff": True}},
+                "ui_diff": {"command": ["node", "ui-diff.mjs"]},
+            },
+        }
+        web = ui_diff.repository_settings(config, "acme-corp/web")
+        self.assertEqual((web["enabled"], web["enabled_source"], web["ui_diff"], web["ui_diff_source"]),
+                         (True, "default", False, "default"))
+        api = ui_diff.repository_settings(config, "ACME-CORP/API")
+        self.assertEqual((api["enabled"], api["enabled_source"], api["ui_diff"], api["ui_diff_effective"]),
+                         (False, "config", True, False), "the UI diff runs only with the outline")
+        stored = {"repositories": {"acme-corp/Api": {"enabled": True}, "acme-corp/web": {"ui_diff": True, "x": 1}}}
+        api = ui_diff.repository_settings(config, "acme-corp/api", stored)
+        self.assertEqual((api["enabled"], api["enabled_source"], api["ui_diff_source"], api["ui_diff_effective"]),
+                         (True, "dashboard", "config", True))
+        web = ui_diff.repository_settings(config, "acme-corp/web", stored)
+        self.assertEqual((web["ui_diff"], web["ui_diff_source"], web["ui_diff_effective"]), (True, "dashboard", True))
+
+    def test_without_a_command_the_ui_diff_never_runs(self) -> None:
+        config = {"repositories": [REPO], "visual_outline": {"enabled": True}}
+        settings = ui_diff.repository_settings(config, REPO, {"repositories": {REPO: {"ui_diff": True}}})
+        self.assertEqual((settings["ui_diff"], settings["ui_diff_available"], settings["ui_diff_effective"]),
+                         (True, False, False))
+
+    def test_an_absent_block_keeps_the_outline_off(self) -> None:
+        settings = ui_diff.repository_settings({}, REPO)
+        self.assertEqual((settings["enabled"], settings["ui_diff"]), (False, False))
+        self.assertFalse(ui_diff.any_repository_enabled({}))
+        self.assertTrue(ui_diff.any_repository_enabled(
+            {"visual_outline": {"enabled": False, "repositories": {REPO: {"enabled": True}}}}
+        ))
+
+    def test_validation_refuses_malformed_blocks(self) -> None:
+        base = {"repositories": [REPO]}
+        bad = [
+            {"visual_outline": []},
+            {"visual_outline": {"repositories": {"acme-corp/other": {"enabled": True}}}},
+            {"visual_outline": {"repositories": {REPO: {"enabled": "yes"}}}},
+            {"visual_outline": {"repositories": {REPO: {"ui": True}}}},
+            {"visual_outline": {"ui_diff": {"command": "node ui-diff.mjs"}}},
+            {"visual_outline": {"ui_diff": {"command": []}}},
+            {"visual_outline": {"ui_diff": {"timeout_seconds": 0}}},
+            {"visual_outline": {"ui_diff": {"max_concurrent": True}}},
+            {"visual_outline": {"ui_diff": {"assets_branch": "../main"}}},
+            {"visual_outline": {"ui_diff": {"env": {"HOME": "/tmp"}}}},
+            {"visual_outline": {"ui_diff": {"env": {"GIT_CONFIG_COUNT": "1"}}}},
+            {"visual_outline": {"ui_diff": {"env": {"VITE_MODE": 1}}}},
+            {"visual_outline": {"ui_diff": {"configs": {REPO: []}}}},
+            {"visual_outline": {"ui_diff": {"upload": "no"}}},
+        ]
+        for block in bad:
+            with self.subTest(block=block), self.assertRaises(ValueError):
+                ui_diff.validate({**base, **block})
+        ui_diff.validate({**base, "visual_outline": {
+            "enabled": True,
+            "repositories": {"_comment": "x", REPO.upper(): {"enabled": False, "ui_diff": True}},
+            "ui_diff": {"command": ["node", "x.mjs"], "env": {"VITE_MODE": "dev"}, "assets_branch": "ui-diff-assets",
+                        "configs": {REPO: {"routes": ["/"]}}, "timeout_seconds": 60, "upload": False},
+        }})
+
+    def test_the_stored_setting_is_validated_against_the_review_list(self) -> None:
+        value = ui_diff.validate_stored({"repositories": {"ACME-corp/WEB": {"ui_diff": True}}}, [REPO])
+        self.assertEqual(value, {"repositories": {REPO: {"ui_diff": True}}})
+        for bad in (
+            {"repositories": {"acme-corp/other": {"enabled": True}}},
+            {"repositories": {REPO: {}}},
+            {"repositories": {REPO: {"enabled": 1}}},
+            {"repositories": {REPO: {"model": True}}},
+            {"repositories": [], "extra": 1},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                ui_diff.validate_stored(bad, [REPO])
+
+    def test_load_config_refuses_a_bad_ui_diff_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = json.loads((ROOT / "config" / "reviewer.json").read_text(encoding="utf-8"))
+            raw.pop("github_app", None)
+            raw["visual_outline"] = {"enabled": True, "ui_diff": {"command": "not-a-list"}}
+            path = Path(tmp) / "reviewer.json"
+            path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaises(svc.ServiceError) as caught:
+                svc.load_config(path)
+            self.assertIn("visual_outline.ui_diff.command", str(caught.exception))
+
+    def test_the_outline_runner_decides_publication_when_one_repository_has_it(self) -> None:
+        config = {
+            "agents": [{"id": "a"}],
+            "agent_runner": {"command": ["runner", "{model_policy_args}"]},
+            "visual_outline": {"enabled": False, "repositories": {REPO: {"enabled": True}},
+                               "runner": {"command": ["codex", "exec"]}},
+        }
+        self.assertIn(["codex", "exec"], svc.runner_commands(config))
+
+
+class SectionTest(unittest.TestCase):
+    def test_a_new_section_replaces_the_old_and_keeps_the_outline(self) -> None:
+        outline = "<!-- marker -->\n\n## 왜 이 변경인가\n한 문장.\n\n— footer"
+        first = ui_diff.build_section("<!-- ui-diff:sticky id=default -->\n### UI diff — 1 changed", [], HEAD, 65)
+        self.assertNotIn("ui-diff:sticky", first)
+        self.assertIn("PR head `bbbbbbb` · 1m05s", first)
+        body = ui_diff.merge_section(outline, first)
+        self.assertTrue(body.startswith(outline))
+        second = ui_diff.build_section("### UI diff — 0 changed", ["Screenshots were not uploaded: x."], "c" * 40, 3)
+        body = ui_diff.merge_section(body, second)
+        self.assertEqual(body.count(ui_diff.SECTION_START), 1)
+        self.assertIn("0 changed", body)
+        self.assertNotIn("1 changed", body)
+        self.assertIn("> Screenshots were not uploaded: x.", body)
+        self.assertIn("## 왜 이 변경인가", body)
+        self.assertEqual(ui_diff.merge_section(body, None).strip(), outline)
+
+    def test_an_oversized_section_is_cut_to_fit_one_comment(self) -> None:
+        section = ui_diff.build_section("x" * 80000, [], HEAD, 1)
+        body = ui_diff.merge_section("outline", section)
+        self.assertLessEqual(len(body), ui_diff.MAX_COMMENT_CHARS)
+        self.assertTrue(body.rstrip().endswith(ui_diff.SECTION_END))
+        self.assertIn("truncated", body)
+
+    def test_a_pending_comment_does_not_count_as_an_outline(self) -> None:
+        pending = ui_diff.merge_section(ui_diff.pending_outline_body(svc.VISUAL_MARKER), "section")
+        client = mock.Mock()
+        client.list_issue_comments.return_value = [{"body": pending}]
+        self.assertFalse(svc.visual_outline_exists(client, 7, svc.VISUAL_MARKER))
+        client.list_issue_comments.return_value = [{"body": svc.VISUAL_MARKER + "\n\n## outline"}]
+        self.assertTrue(svc.visual_outline_exists(client, 7, svc.VISUAL_MARKER))
+
+
+class RunStageTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.source = self.tmp / "source"
+        self.source.mkdir()
+        self.artifacts = self.tmp / "artifacts"
+        self.artifacts.mkdir()
+        self.logs: list[str] = []
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def behaviour(self, **values) -> None:
+        (self.tmp / "behaviour.json").write_text(json.dumps(values), encoding="utf-8")
+
+    def records(self) -> list[dict]:
+        path = self.tmp / "record.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def run_stage(self, config: dict, pr: dict | None = None) -> ui_diff.Outcome:
+        def publish_env(env: dict) -> dict:
+            return {**env, "GH_TOKEN": "token-for-publish"}
+
+        def write(path: Path, text: str) -> None:
+            path.write_text(text, encoding="utf-8")
+
+        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "host-token", "AWS_SECRET_ACCESS_KEY": "nope"}):
+            return ui_diff.run_stage(
+                config, self.tmp, self.source, self.artifacts, REPO, pr or _pr(), publish_env, self.logs.append, write,
+            )
+
+    def test_run_gets_no_credential_and_publish_is_pinned_to_the_repository(self) -> None:
+        self.behaviour()
+        outcome = self.run_stage(_config(self.tmp))
+        self.assertEqual(outcome.status, "ok", outcome.detail)
+        run, publish = self.records()
+        self.assertEqual(run["args"][:2], ["run", "--config"])
+        self.assertEqual(run["args"][run["args"].index("--base") + 1], BASE)
+        self.assertEqual(run["args"][run["args"].index("--head") + 1], HEAD)
+        for name in ("GH_TOKEN", "GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY"):
+            self.assertNotIn(name, run["env"], f"run must not see {name}")
+        self.assertEqual(run["env"]["HOME"], str(self.tmp / "cache" / "home"))
+        self.assertEqual(run["env"]["PLAYWRIGHT_BROWSERS_PATH"], str(self.tmp / "cache" / "ms-playwright"))
+        self.assertEqual(run["env"]["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(publish["env"]["GH_TOKEN"], "token-for-publish")
+        args = publish["args"]
+        self.assertIn("--no-comment", args)
+        self.assertEqual(args[args.index("--remote") + 1], f"https://github.com/{REPO}.git")
+        self.assertEqual(args[args.index("--link-base") + 1], f"https://github.com/{REPO}/raw/ui-diff-assets")
+        self.assertEqual(args[args.index("--repo") + 1], REPO)
+        self.assertEqual(args[args.index("--pr") + 1], "7")
+        # The config came from visual_outline.ui_diff.configs, written to the clone root.
+        written = json.loads((self.source / "ui-diff.config.json").read_text(encoding="utf-8"))
+        self.assertEqual(written["routes"], ["/"])
+        self.assertIn(f"https://github.com/{REPO}/raw/ui-diff-assets/", outcome.section)
+        self.assertTrue(outcome.section.startswith(ui_diff.SECTION_START))
+        self.assertTrue((self.artifacts / "ui-diff.comment.md").exists())
+        self.assertTrue((self.artifacts / "ui-diff.report.json").exists())
+
+    def test_the_repositorys_own_config_wins(self) -> None:
+        self.behaviour()
+        (self.source / "ui-diff.config.json").write_text('{"routes": ["/own"]}', encoding="utf-8")
+        self.run_stage(_config(self.tmp))
+        self.assertEqual(json.loads((self.source / "ui-diff.config.json").read_text())["routes"], ["/own"])
+
+    def test_a_refused_push_falls_back_to_a_text_only_section(self) -> None:
+        self.behaviour(publish_exit=3)
+        outcome = self.run_stage(_config(self.tmp))
+        self.assertEqual(outcome.status, "text-only")
+        self.assertIn("Contents: write", outcome.section)
+        self.assertIn("(images not uploaded)", outcome.section)
+        commands = [record["args"] for record in self.records()]
+        self.assertEqual([args[0] for args in commands], ["run", "publish", "publish"])
+        self.assertIn("--no-upload", commands[2])
+        self.assertNotIn("GH_TOKEN", self.records()[2]["env"], "the text-only render needs no credential")
+
+    def test_upload_off_never_hands_out_the_credential(self) -> None:
+        self.behaviour()
+        outcome = self.run_stage(_config(self.tmp, upload=False))
+        self.assertEqual(outcome.status, "text-only")
+        self.assertTrue(all("GH_TOKEN" not in record["env"] for record in self.records()))
+
+    def test_a_failed_run_says_why_and_publishes_nothing(self) -> None:
+        self.behaviour(run_exit=1)
+        outcome = self.run_stage(_config(self.tmp))
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("Server never became ready (check startCommand)", outcome.section)
+        self.assertEqual([record["args"][0] for record in self.records()], ["run"])
+
+    def test_a_run_past_its_timeout_is_stopped(self) -> None:
+        self.behaviour(run_sleep=30)
+        outcome = self.run_stage(_config(self.tmp, timeout_seconds=1))
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("timed out after 1 seconds", outcome.section)
+
+    def test_a_fork_is_never_run(self) -> None:
+        self.behaviour()
+        outcome = self.run_stage(_config(self.tmp), _pr(head_repo="someone/web"))
+        self.assertEqual((outcome.status, outcome.section), ("skipped", None))
+        self.assertEqual(self.records(), [])
+
+    def test_no_config_anywhere_is_explained(self) -> None:
+        self.behaviour()
+        config = _config(self.tmp)
+        config["visual_outline"]["ui_diff"]["configs"] = {}
+        outcome = self.run_stage(config)
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("no ui-diff config", outcome.section)
+        self.assertEqual(self.records(), [])
+
+    def test_a_job_turns_an_escaping_error_into_a_failure_section(self) -> None:
+        def boom() -> ui_diff.Outcome:
+            raise RuntimeError("worker died")
+
+        outcome = ui_diff.Job(boom, HEAD).start().result(5)
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("RuntimeError: worker died", outcome.section)
+
+
+class _Client:
+    """GitHub client fake: the bot's marker comment and every write in order."""
+
+    def __init__(self, comments: list[dict] | None = None) -> None:
+        self.repo = REPO
+        self.comments = comments if comments is not None else []
+        self.calls: list[tuple] = []
+
+    def bot_login(self) -> str:
+        return "rol[bot]"
+
+    def list_files(self, number):
+        return [{"filename": "src/Home.tsx", "status": "modified", "additions": 1, "deletions": 0,
+                 "changes": 1, "patch": "@@ -1,1 +1,2 @@\n context\n+added\n"}]
+
+    def list_issue_comments(self, number):
+        self.calls.append(("list",))
+        return list(self.comments)
+
+    def upsert_issue_comment(self, number, marker, body):
+        self.calls.append(("upsert", body))
+        self.comments = [c for c in self.comments if marker not in c["body"]]
+        self.comments.append({"id": 55, "body": body, "user": {"login": "rol[bot]"}})
+        return {"id": 55}
+
+    def update_issue_comment(self, comment_id, body):
+        self.calls.append(("update", comment_id, body))
+        return {"id": comment_id}
+
+    def create_issue_comment(self, number, body):
+        self.calls.append(("create", body))
+        return {"id": 66}
+
+    def create_review(self, number, commit_id, body, comments, event="COMMENT"):
+        self.calls.append(("review",))
+        return {"id": 999}
+
+
+class ReviewIntegrationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def config(self, outline_enabled: bool = True, ui_diff_on: bool = True) -> dict:
+        return {
+            "repositories": [REPO],
+            "agents": [{"id": "fake", "enabled": True, "prompt_path": "../agents/correctness.md"}],
+            "agent_runner": {"command": ["true"]},
+            "min_successful_agents": 0,
+            "max_review_comments": 30,
+            "max_diff_chars": 180000,
+            "work_dir": str(self.tmp / "work"),
+            "marker": svc.MARKER,
+            "summary_marker": svc.SUMMARY_MARKER,
+            "visual_marker": svc.VISUAL_MARKER,
+            "progress_comment": {"enabled": False},
+            "executive_summary": {"enabled": False},
+            "visual_outline": {
+                "enabled": outline_enabled,
+                "repositories": {REPO: {"ui_diff": ui_diff_on}},
+                "ui_diff": {"command": ["ui-diff"]},
+            },
+        }
+
+    def review(self, client: _Client, config: dict, outline: str | None = "## outline", stage=None, dry_run=False):
+        stages: list[tuple] = []
+
+        def fake_stage(config, config_dir, source_dir, artifact_dir, repo, pr, publish_env, log, write_text, **kw):
+            stages.append((repo, pr["head"]["sha"], source_dir.exists()))
+            if stage is not None:
+                return stage
+            return ui_diff.Outcome(ui_diff.build_section("### UI diff — 1 changed", [], HEAD, 2), "ok")
+
+        def run_agent(*args, **kwargs):
+            client.calls.append(("agent",))
+            return {"agent": "fake", "summary": "ok", "findings": []}
+
+        with mock.patch.object(svc, "run_agent", run_agent), \
+                mock.patch.object(svc, "run_visual_outline_agent", lambda *a, **k: outline), \
+                mock.patch.object(svc.ui_diff, "run_stage", fake_stage), \
+                mock.patch.object(svc, "load_repository_rules", lambda *a, **k: ""), \
+                mock.patch.object(svc, "clone_pr_source",
+                                  lambda repo, n, sha, run_dir, **kw: run_dir.mkdir(parents=True, exist_ok=True)):
+            posted = svc.review_pr(client, config, ROOT / "config" / "reviewer.json", _pr(), {}, dry_run=dry_run)
+        return posted, stages
+
+    def test_the_section_lands_on_the_outline_comment_after_the_review(self) -> None:
+        client = _Client()
+        posted, stages = self.review(client, self.config())
+        self.assertTrue(posted)
+        self.assertEqual(stages, [(REPO, HEAD, True)], "ui-diff ran on the clone while it existed")
+        kinds = [call[0] for call in client.calls]
+        self.assertLess(kinds.index("upsert"), kinds.index("agent"), "the outline still leads")
+        self.assertLess(kinds.index("review"), kinds.index("update"), "the review is not held for the UI diff")
+        update = next(call for call in client.calls if call[0] == "update")
+        self.assertEqual(update[1], 55)
+        self.assertIn("## outline", update[2])
+        self.assertIn("### UI diff — 1 changed", update[2])
+
+    def test_a_new_head_replaces_the_section_of_the_existing_outline(self) -> None:
+        old = ui_diff.merge_section(svc.VISUAL_MARKER + "\n\n## outline",
+                                    ui_diff.build_section("### UI diff — 9 changed", [], "c" * 40, 1))
+        client = _Client([{"id": 41, "body": old, "user": {"login": "rol[bot]"}}])
+        self.review(client, self.config())
+        self.assertNotIn("upsert", [call[0] for call in client.calls], "the outline is not drafted again")
+        update = next(call for call in client.calls if call[0] == "update")
+        self.assertEqual(update[1], 41)
+        self.assertIn("1 changed", update[2])
+        self.assertNotIn("9 changed", update[2])
+
+    def test_without_an_outline_the_section_is_posted_as_pending(self) -> None:
+        client = _Client()
+        self.review(client, self.config(), outline=None)
+        create = next(call for call in client.calls if call[0] == "create")
+        self.assertIn(ui_diff.OUTLINE_PENDING, create[1])
+        self.assertIn(svc.VISUAL_MARKER, create[1])
+        self.assertIn("1 changed", create[1])
+
+    def test_a_skipped_stage_posts_nothing(self) -> None:
+        client = _Client()
+        self.review(client, self.config(), stage=ui_diff.Outcome(None, "skipped", "fork"))
+        self.assertEqual([call for call in client.calls if call[0] in ("update", "create")], [])
+
+    def test_switched_off_repositories_never_start_ui_diff(self) -> None:
+        for config in (self.config(ui_diff_on=False), self.config(outline_enabled=False)):
+            client = _Client()
+            _, stages = self.review(client, config)
+            self.assertEqual(stages, [])
+
+    def test_the_dashboard_switch_is_read_per_attempt(self) -> None:
+        client = _Client()
+        stored = {"repositories": {REPO: {"ui_diff": False}}}
+        with mock.patch.object(svc.dashboard_execution.DashboardRecorder, "setting",
+                               lambda self, key: stored if key == ui_diff.SETTING else None):
+            _, stages = self.review(client, self.config())
+        self.assertEqual(stages, [])
+
+    def test_a_dry_run_prints_the_section_and_posts_nothing(self) -> None:
+        client = _Client()
+        with mock.patch("builtins.print") as printed:
+            self.review(client, self.config(), dry_run=True)
+        self.assertEqual([call for call in client.calls if call[0] in ("update", "create")], [])
+        self.assertTrue(any("### UI diff — 1 changed" in str(call) for call in printed.call_args_list))
+
+
+if __name__ == "__main__":
+    unittest.main()

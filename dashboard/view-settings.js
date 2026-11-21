@@ -16,9 +16,13 @@ import {
   describeAdminRow,
 } from './admins.js';
 import {
+  describeOutlineSource,
   describeRepositoryAgents,
   describeRepositoryProblem,
   describeRepositorySource,
+  describeUiDiffBlocker,
+  describeVisualOutline,
+  hasOutlineOverride,
   repositoryFormState,
 } from './repositories.js';
 import {
@@ -112,7 +116,58 @@ function inEffect(settings, now) {
   ].filter(Boolean));
 }
 
-function repositoryItem(row, index, { readOnly, saving, now, onRemove }) {
+/** The visual outline and UI diff switches of one repository (admin), or one
+ *  line saying what runs (read-only). Position-based ids, like the remove button. */
+function outlineControls(row, index, { readOnly, saving, onOutline }) {
+  const outline = row.visual_outline;
+  const blocker = describeUiDiffBlocker(row);
+  if (readOnly || !onOutline) {
+    return el('div', { class: 'repo__outline' }, [
+      el('span', { class: 'repo__meta quiet', text: describeVisualOutline(row) }),
+      blocker ? el('span', { class: 'repo__meta quiet', text: blocker }) : null,
+    ]);
+  }
+  const busy = saving !== null;
+  const changing = saving === `outline:${row.repo}`;
+  const toggle = (key, label, checked, source, disabled, title) => el('label', {
+    class: 'repo__toggle', for: `repo-${key}-${index}`, title,
+  }, [
+    el('input', {
+      type: 'checkbox',
+      id: `repo-${key}-${index}`,
+      checked,
+      disabled: busy || disabled,
+      'aria-busy': changing ? 'true' : null,
+      on: { change: (event) => onOutline(row.repo, { [key === 'outline' ? 'enabled' : 'ui_diff']: event.target.checked }) },
+    }),
+    el('span', { text: label }),
+    el('span', { class: 'quiet', text: `(${describeOutlineSource(source)})` }),
+  ]);
+  return el('div', { class: 'repo__outline' }, [
+    el('div', { class: 'repo__toggles' }, [
+      toggle('outline', 'Visual outline', outline.enabled, outline.enabled_source, false, null),
+      toggle('uidiff', 'UI diff', outline.ui_diff, outline.ui_diff_source,
+        !outline.ui_diff_available && !outline.ui_diff,
+        outline.ui_diff_available ? 'Before/after screenshots of the changed screens, added to the outline (ui-diff)'
+          : 'ui-diff is not installed on this deployment (visual_outline.ui_diff.command)'),
+      hasOutlineOverride(row) ? el('button', {
+        class: 'button button--quiet',
+        type: 'button',
+        id: `repo-outline-reset-${index}`,
+        disabled: busy,
+        text: 'Use config',
+        'aria-label': `Use config/reviewer.json for the visual outline of ${row.repo}`,
+        on: { click: () => onOutline(row.repo, { enabled: null, ui_diff: null }) },
+      }) : null,
+    ]),
+    blocker ? el('span', { class: 'repo__meta quiet', text: blocker }) : null,
+    outline.ui_diff && outline.ui_diff_available && !outline.ui_diff_config
+      ? el('span', { class: 'repo__meta quiet', text: 'ui-diff needs a ui-diff.config.json in the repository, or one in visual_outline.ui_diff.configs.' })
+      : null,
+  ]);
+}
+
+function repositoryItem(row, index, { readOnly, saving, now, onRemove, onOutline }) {
   const removing = saving === row.repo;
   return el('li', { class: 'repo' }, [
     el('div', { class: 'repo__head' }, [
@@ -139,6 +194,7 @@ function repositoryItem(row, index, { readOnly, saving, now, onRemove }) {
       title: row.added_at ? formatTimestamp(row.added_at) : null,
     }),
     el('span', { class: 'repo__meta quiet', text: describeRepositoryAgents(row) }),
+    outlineControls(row, index, { readOnly, saving, onOutline }),
     row.problem ? el('p', { class: 'notice', role: 'status', text: describeRepositoryProblem(row) }) : null,
   ]);
 }
@@ -210,6 +266,7 @@ export function renderRepositorySettings({
   onDraft,
   onAdd,
   onRemove,
+  onOutline,
   onReload,
 }) {
   const body = [
@@ -227,6 +284,7 @@ export function renderRepositorySettings({
       saving: model.saving,
       now,
       onRemove,
+      onOutline,
     }))));
   } else if (model.loaded) {
     body.push(el('p', { class: 'empty', text: 'The service reported no repositories.' }));

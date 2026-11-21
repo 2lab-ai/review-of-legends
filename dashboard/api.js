@@ -211,6 +211,15 @@ export class ApiClient {
     );
   }
 
+  /** `flags` holds `enabled` and/or `ui_diff`: true, false, or null (back to the config). */
+  setRepositoryVisualOutline(repo, flags) {
+    const [owner = '', name = ''] = String(repo).split('/');
+    return this.request(
+      `/api/settings/repositories/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/visual-outline`,
+      { method: 'PUT', body: flags, csrf: true },
+    );
+  }
+
   adminSettings() {
     return this.get('/api/settings/admins');
   }

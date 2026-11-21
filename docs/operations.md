@@ -690,6 +690,63 @@ reader; it never carries findings or a verdict, which is the reviewers' job.
 - **Artifacts** land next to the agents' own, in the run's `.review-of-legends` artifact directory
   (mode `0600`): `visual-outline.prompt.md`, `.response.md`, `.meta.json`, `.stdout.txt`,
   `.stderr.txt`.
+- **Per repository.** Which repositories get the outline: the admin's choice on the dashboard
+  (Settings → Repositories, below), else `visual_outline.repositories` in the config
+  (`{"owner/name": {"enabled": false, "ui_diff": true}}`, names must be in `repositories`), else
+  `visual_outline.enabled`. The daemon reads the answer at the start of every review attempt.
+
+#### UI diff (ui-diff)
+
+For a web frontend the outline can carry a **UI diff**: before/after screenshots of the screens the
+PR changed, with the changed pixels highlighted, made by
+[ui-diff](https://github.com/imuratalpay/ui-diff). It is off everywhere until a repository turns
+it on (`ui_diff: true` per repository, as above) and the deployment says how to start ui-diff.
+
+- **What runs.** Beside the reviewer agents, on the review's clone: `ui-diff run --config <file>
+  --base <PR base> --head <PR head>` (git worktrees of both sides, dependencies installed, both dev
+  servers started, Playwright captures, pixelmatch), then `ui-diff publish --no-comment`, which
+  pushes the images to the repository's own orphan branch `ui-diff-assets` and writes the comment
+  markdown. The markdown becomes the **UI diff section** of the outline comment, between
+  `<!-- review-of-legends:ui-diff:start -->` and `…:end -->`. Each reviewed head replaces the
+  section and leaves the outline text alone; the review itself is posted first and never waits
+  for it. Images link as `https://github.com/<owner>/<repo>/raw/ui-diff-assets/…`, which renders
+  only for people who can read the repository; ui-diff refuses to upload to a public repository.
+- **The ui-diff config.** The repository's own `ui-diff.config.json` at its root wins. Otherwise
+  `visual_outline.ui_diff.configs["owner/name"]` (the same JSON) is written to the clone root, so
+  its relative paths mean what they would in the repository. With neither, the section says so.
+  ui-diff only finds the routes a change affects through `routes[].files`, `globalFiles` and
+  file-system routing conventions; a react-router app needs `routes[].files`.
+- **Credentials.** `ui-diff run` starts the PR's own code (install scripts, the dev server), so it
+  gets an allowlisted environment and **no credential**: `PATH` (the configured node's directory
+  first), `LANG`, `TMPDIR`, `CI=1`, a private `HOME`, `npm_config_cache` and
+  `PLAYWRIGHT_BROWSERS_PATH` under `cache_dir`, the host's git config left out, plus
+  `visual_outline.ui_diff.env`. Only `publish` — ui-diff's own code — gets the App's installation
+  token (for `gh` and the push), and its remote, branch, repository and image link base are passed
+  on the command line, so a repository's config cannot point the upload anywhere else.
+- **Trust.** This is still the PR's code running on the review host as the daemon's user, without
+  a sandbox: turn the UI diff on only for private repositories whose PR authors you already trust
+  with that host (as with a self-hosted CI runner). A PR from a fork is never run.
+- **Pushing needs Contents: write.** The default App has Contents: read; without write, the push is
+  refused (ui-diff exits 3) and the section is posted text-only (changed captures, percentages,
+  summary) with a note saying why. `upload: false` posts text-only on purpose.
+- **Failures** — no config, a dev server that never answers, a timeout (the run is stopped with
+  SIGTERM, then its process group with SIGKILL) — post a one-line ⚠️ section instead; nothing here
+  touches the review, quorum or approval. When the outline agent produced nothing, the UI diff is
+  posted on a marker comment marked `<!-- review-of-legends:outline-pending -->`, which does not
+  count as an outline, so the next review still drafts one.
+- **Config** (`visual_outline.ui_diff`): `command` (argv that starts ui-diff, e.g.
+  `["/opt/homebrew/bin/node", "/opt/ui-diff/skills/ui-diff/bin/ui-diff.mjs"]`; without it the UI
+  diff never runs), `configs`, `env`, `cache_dir` (default `../data/ui-diff`, relative to the
+  config), `timeout_seconds` (run, default 1500), `publish_timeout_seconds` (default 300),
+  `max_concurrent` (ui-diff runs at once across reviews, default 1), `assets_branch` (default
+  `ui-diff-assets`), `upload` (default `true`).
+- **Install** ui-diff once on the host, at a pinned commit, outside the deployed tree:
+  `git clone https://github.com/imuratalpay/ui-diff.git /opt/ui-diff && git -C /opt/ui-diff checkout
+  --detach <commit>`, then with the same `HOME`/`npm_config_cache`/`PLAYWRIGHT_BROWSERS_PATH` as
+  above: `npm --prefix /opt/ui-diff/skills/ui-diff install`, `npm --prefix … run build`,
+  `npx --prefix /opt/ui-diff/skills/ui-diff playwright install chromium`. Node 20.10+.
+- **Artifacts:** `ui-diff.run.stdout.txt` / `.stderr.txt`, `ui-diff.publish.*`, `ui-diff.comment.md`
+  and `ui-diff.report.json` next to the outline's.
 
 ### Agent isolation
 
@@ -1262,6 +1319,14 @@ the ones added on the dashboard — with the agents that review each (`GET
   so a repository added back under another spelling (GitHub changed its case) resumes too; one
   renamed to a different name on GitHub is a new repository and takes a new baseline. `once
   --repo` matches case-insensitively as well.
+- **Visual outline switches.** Every row shows whether the repository gets the visual outline and
+  its UI diff, and where each answer comes from (set here, `config/reviewer.json`, or the config
+  default). An admin flips either with a checkbox (`PUT /api/settings/repositories/{owner}/{name}/
+  visual-outline`, body `{"enabled": true|false|null, "ui_diff": true|false|null}`; `null` hands the
+  flag back to the config, and **Use config** sends both). Switching the UI diff on is refused
+  (400) while `visual_outline.ui_diff.command` is not set; a UI diff that is on but cannot run (the
+  outline is off, no ui-diff config) says why under the row. The choices are stored under the key
+  `visual_outline_repositories` and read by the daemon at the start of each review attempt.
 - **Remove** (`DELETE /api/settings/repositories/{owner}/{name}`) takes a dashboard-added
   repository off the list from the next watch; a review already running finishes, and a retry
   queued for it afterwards is refused as not configured. A repository from `config/reviewer.json`
