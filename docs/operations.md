@@ -750,13 +750,14 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   re-resolved: a cache directory a PR's code swapped for a symlink is replaced by a fresh
   directory, a run directory that is not a plain directory fails the stage. The publish copy is
   made under `cache_dir/publish`, which the run step can neither read nor write. Every ancestor of
-  a protected directory, the two granted roots and the clone directory are pinned (no rename,
-  no replacement by a symlink). Beyond files, the profile refuses launchd job creation,
-  LaunchServices opens, AppleEvents, the keychain service and `osascript`/`automator`/
+  a protected or denied directory, every symlink on the way to one (or to a program publish
+  runs), the two granted roots and the clone directory are pinned (no rename, no replacement by
+  a symlink). Beyond files, the profile refuses launchd job creation, LaunchServices opens,
+  AppleEvents, the keychain service, looking into other processes, and `osascript`/`automator`/
   `shortcuts`/`open`; a program the PR's own code builds to send AppleEvents still needs macOS
   Automation consent, which a headless review daemon does not hold. Publish also runs sandboxed,
-  with the secret paths unreadable, so a report the PR's code tampered with cannot make it upload
-  the App key: under a sandbox the caches are kept per
+  with the secret paths unreadable (its own copy under `cache_dir/publish` excepted), so a report
+  the PR's code tampered with cannot make it upload the App key: under a sandbox the caches are kept per
   repository (`cache_dir/repositories/<owner>/<name>`), so one repository's PR code cannot plant
   a package or a browser build another repository's run picks up. A protected program inside one
   of those two writable places fails the stage instead of running unprotected. Publish holds the
