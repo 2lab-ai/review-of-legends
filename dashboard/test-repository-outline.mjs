@@ -29,7 +29,6 @@ const PAYLOAD = {
   ],
   allowed_owners: ['acme-corp'],
   max_added: 50,
-  ui_diff_available: true,
 };
 
 function withShim(fn) {
@@ -57,7 +56,6 @@ function render({ readOnly = false, saving = null, onOutline = () => {} } = {}) 
 describe('repository visual outline projection', () => {
   it('keeps the switches and falls back to off for anything malformed', () => {
     const projected = projectRepositorySettings(PAYLOAD);
-    assert.equal(projected.ui_diff_available, true);
     assert.deepEqual(projected.repositories[0].visual_outline, OUTLINE);
     assert.deepEqual(projectVisualOutline({ enabled: 'yes', enabled_source: 'elsewhere' }), {
       enabled: false, enabled_source: 'default', ui_diff: false, ui_diff_source: 'default',

@@ -4050,7 +4050,6 @@ class RepositorySettingsTest(AppTestCase):
             "enabled": False, "enabled_source": "default", "ui_diff": False, "ui_diff_source": "default",
             "ui_diff_available": False, "ui_diff_config": False, "ui_diff_effective": False,
         })
-        self.assertFalse(payload["ui_diff_available"])
         self.assertEqual(payload["repositories"], [
             {"repo": "acme-corp/Gamma", "source": "config", "agents": ["a", "b", "c", "arch"], "added_by": None, "added_at": None, "problem": None},
             {"repo": "acme-corp/review-of-legends", "source": "config", "agents": ["a", "b", "c"], "added_by": None, "added_at": None, "problem": None},
@@ -4406,8 +4405,9 @@ class RepositoryVisualOutlineTest(AppTestCase):
         client = self.make_client()
         self.login(client)
         payload = client.get("/api/settings/repositories").json()
-        self.assertTrue(payload["ui_diff_available"])
+        self.assertNotIn("ui_diff_available", payload, "each row carries it")
         rows = self.rows(payload)
+        self.assertTrue(rows["acme-corp/Gamma"]["ui_diff_available"])
         self.assertEqual((rows["acme-corp/Gamma"]["enabled"], rows["acme-corp/Gamma"]["enabled_source"]), (True, "default"))
         self.assertTrue(rows["acme-corp/Gamma"]["ui_diff_config"])
         self.assertEqual(

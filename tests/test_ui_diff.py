@@ -36,8 +36,9 @@ FAKE_UI_DIFF = textwrap.dedent(
     command = args[0]
     record = Path(os.environ.get("FAKE_RECORD") or Path(__file__).with_name("record.jsonl"))
     behaviour = json.loads(Path(__file__).with_name("behaviour.json").read_text())
+    config_read = json.loads(Path(args[args.index("--config") + 1]).read_text()) if "--config" in args else None
     with record.open("a") as handle:
-        handle.write(json.dumps({"args": args, "env": dict(os.environ), "cwd": os.getcwd()}) + "\\n")
+        handle.write(json.dumps({"args": args, "env": dict(os.environ), "cwd": os.getcwd(), "config": config_read}) + "\\n")
     out = Path(args[args.index("--out") + 1])
     out.mkdir(parents=True, exist_ok=True)
     if command == "run":
@@ -48,6 +49,10 @@ FAKE_UI_DIFF = textwrap.dedent(
         if behaviour.get("plant_symlink"):
             (out / "compare").mkdir(parents=True, exist_ok=True)
             os.symlink(behaviour["plant_symlink"], out / "compare" / "secret.png")
+        if behaviour.get("replace_config_with"):
+            config_file = Path(args[args.index("--config") + 1])
+            config_file.unlink()
+            config_file.write_text(behaviour["replace_config_with"])
         if behaviour.get("run_sleep"):
             time.sleep(behaviour["run_sleep"])
         if behaviour.get("run_exit"):
@@ -71,6 +76,26 @@ FAKE_UI_DIFF = textwrap.dedent(
     sys.exit(9)
     """
 )
+
+
+def _gone(pid: int, wait: float = 5.0) -> bool:
+    """True once ``pid`` is dead (a zombie counts: init has not reaped it yet); kills it otherwise."""
+    import time as _time
+    deadline = _time.monotonic() + wait
+    while _time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        state = os.popen(f"ps -o stat= -p {pid}").read().strip()
+        if not state or state.startswith("Z"):
+            return True
+        _time.sleep(0.1)
+    try:
+        os.kill(pid, 9)
+    except OSError:
+        pass
+    return False
 
 
 def _config(tmp: Path, **ui_diff_settings) -> dict:
@@ -300,8 +325,60 @@ class RunStageTest(unittest.TestCase):
     def test_the_repositorys_own_config_wins(self) -> None:
         self.behaviour()
         (self.source / "ui-diff.config.json").write_text('{"routes": ["/own"]}', encoding="utf-8")
-        self.run_stage(_config(self.tmp))
-        self.assertEqual(json.loads((self.source / "ui-diff.config.json").read_text())["routes"], ["/own"])
+        outcome = self.run_stage(_config(self.tmp))
+        self.assertEqual(outcome.status, "ok", outcome.detail)
+        run, publish = self.records()
+        self.assertEqual(run["config"], {"routes": ["/own"]}, "run reads the repository's config")
+        self.assertEqual(publish["config"], {"routes": ["/own"]}, "publish gets the same choice")
+
+    def test_publish_gets_the_config_as_read_before_the_prs_code_ran(self) -> None:
+        self.behaviour(replace_config_with='{"routes": ["/changed"], "publish": {"allowPublicRepo": true}}')
+        outcome = self.run_stage(_config(self.tmp))
+        self.assertEqual(outcome.status, "ok", outcome.detail)
+        _, publish = self.records()
+        self.assertEqual(publish["config"]["routes"], ["/"])
+        self.assertNotIn("publish", publish["config"])
+
+    def test_a_repository_config_that_is_not_a_regular_file_is_refused(self) -> None:
+        self.behaviour()
+        os.mkfifo(str(self.source / "ui-diff.config.json"))
+        outcome = self.run_stage(_config(self.tmp))
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("not a regular file", outcome.section)
+        self.assertEqual(self.records(), [])
+
+    def test_a_detached_child_left_behind_by_a_finished_run_is_swept(self) -> None:
+        pid_file = self.tmp / "child.pid"
+        self.behaviour(run_sleep=ui_diff.POLL_SECONDS * 2, spawn_child=str(pid_file))
+        outcome = self.run_stage(_config(self.tmp))
+        self.assertEqual(outcome.status, "ok", outcome.detail)
+        self.assertTrue(_gone(int(pid_file.read_text())), "the leftover dev server was killed")
+
+    def test_a_cancelled_stage_stops_its_processes(self) -> None:
+        import threading
+        pid_file = self.tmp / "child.pid"
+        self.behaviour(run_sleep=60, spawn_child=str(pid_file))
+        cancel = threading.Event()
+
+        def write(path: Path, text: str) -> None:
+            path.write_text(text, encoding="utf-8")
+
+        job = ui_diff.Job(lambda event: ui_diff.run_stage(
+            _config(self.tmp), self.tmp, self.source, self.artifacts, REPO, _pr(),
+            lambda env: env, self.logs.append, write, cancel=event,
+        ), HEAD).start()
+        for _ in range(100):
+            if pid_file.exists():
+                break
+            import time as _time
+            _time.sleep(0.1)
+        self.assertIsNone(job.result(0.1))
+        self.assertTrue(job.cancel(30))
+        outcome = job.result(0)
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("could not wait for it any longer", outcome.section)
+        self.assertTrue(_gone(int(pid_file.read_text())))
+        del cancel
 
     def test_a_refused_push_falls_back_to_a_text_only_section(self) -> None:
         self.behaviour(publish_exit=3)
@@ -374,14 +451,15 @@ class RunStageTest(unittest.TestCase):
         secret.write_text("PRIVATE KEY", encoding="utf-8")
         os.symlink(str(secret), str(out / "compare" / "secret.png"))
         os.symlink(str(self.tmp), str(out / "linked-dir"))
-        config_path = self.source / "ui-diff.config.json"
-        config_path.write_text(json.dumps({"routes": ["/"], "publish": {"allowPublicRepo": True}}), encoding="utf-8")
-        workspace = ui_diff.publish_workspace(out, config_path, {"PATH": os.environ.get("PATH", "")})
+        os.mkfifo(str(out / "compare" / "blocking.png"))
+        settings = {"routes": ["/"], "publish": {"allowPublicRepo": True}}
+        workspace = ui_diff.publish_workspace(out, settings, {"PATH": os.environ.get("PATH", "")})
         try:
             self.assertTrue((workspace / ".git").is_dir())
             self.assertEqual((workspace / ".ui-diff" / "compare" / "home.png").read_bytes(), b"png")
             self.assertFalse((workspace / ".ui-diff" / "compare" / "secret.png").exists())
             self.assertFalse((workspace / ".ui-diff" / "linked-dir").exists())
+            self.assertFalse((workspace / ".ui-diff" / "compare" / "blocking.png").exists())
             copied = json.loads((workspace / "ui-diff.config.json").read_text(encoding="utf-8"))
             self.assertEqual(copied, {"routes": ["/"]})
         finally:
@@ -409,21 +487,7 @@ class RunStageTest(unittest.TestCase):
         self.behaviour(run_sleep=30, spawn_child=str(pid_file))
         outcome = self.run_stage(_config(self.tmp, timeout_seconds=2))
         self.assertEqual(outcome.status, "failed")
-        child = int(pid_file.read_text())
-        import time as _time
-        for _ in range(50):
-            try:
-                os.kill(child, 0)
-            except ProcessLookupError:
-                break
-            # A killed child stays a zombie until reaped by init; ps shows it as Z.
-            state = os.popen(f"ps -o stat= -p {child}").read().strip()
-            if not state or state.startswith("Z"):
-                break
-            _time.sleep(0.1)
-        else:
-            os.kill(child, 9)
-            self.fail("the detached child outlived the timeout")
+        self.assertTrue(_gone(int(pid_file.read_text())), "the detached child outlived the timeout")
 
     def test_no_config_anywhere_is_explained(self) -> None:
         self.behaviour()
@@ -435,7 +499,7 @@ class RunStageTest(unittest.TestCase):
         self.assertEqual(self.records(), [])
 
     def test_a_job_turns_an_escaping_error_into_a_failure_section(self) -> None:
-        def boom() -> ui_diff.Outcome:
+        def boom(cancel) -> ui_diff.Outcome:
             raise RuntimeError("worker died")
 
         outcome = ui_diff.Job(boom, HEAD).start().result(5)
@@ -487,6 +551,7 @@ class ReviewIntegrationTest(unittest.TestCase):
         self.tmp = Path(self._tmp.name)
         self.uploads: list[bool] = []
         self.stage_delay = 0.0
+        self.stage_hook = None
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -518,6 +583,8 @@ class ReviewIntegrationTest(unittest.TestCase):
         def fake_stage(config, config_dir, source_dir, artifact_dir, repo, pr, publish_env, log, write_text, **kw):
             stages.append((repo, pr["head"]["sha"], source_dir.exists()))
             self.uploads.append(kw.get("upload", True))
+            if self.stage_hook is not None:
+                self.stage_hook(**kw)
             if self.stage_delay:
                 import time as _time
                 _time.sleep(self.stage_delay)
@@ -539,8 +606,27 @@ class ReviewIntegrationTest(unittest.TestCase):
         return posted, stages
 
     def test_the_section_lands_on_the_outline_comment_after_the_review(self) -> None:
+        import threading
         client = _Client()
+        released = threading.Event()
+        reviewed = threading.Event()
+        original = client.create_review
+
+        def create_review(*args, **kwargs):
+            reviewed.set()
+            return original(*args, **kwargs)
+
+        client.create_review = create_review
+
+        def hold(**kw):
+            # The worker stays busy until the review is posted: a review that
+            # waited for it would never get there, and the bounded wait fails.
+            self.assertTrue(reviewed.wait(10), "the review waited for the UI diff")
+            released.set()
+
+        self.stage_hook = hold
         posted, stages = self.review(client, self.config())
+        self.assertTrue(released.is_set())
         self.assertTrue(posted)
         self.assertEqual(stages, [(REPO, HEAD, True)], "ui-diff ran on the clone while it existed")
         kinds = [call[0] for call in client.calls]
@@ -597,14 +683,86 @@ class ReviewIntegrationTest(unittest.TestCase):
         self.assertTrue(any("### UI diff — 1 changed" in str(call) for call in printed.call_args_list))
         self.assertEqual(self.uploads, [False], "a dry run never uploads")
 
-    def test_a_ui_diff_still_running_after_the_wait_is_not_posted(self) -> None:
+    def test_a_ui_diff_still_running_after_the_wait_is_stopped_before_the_clone_goes(self) -> None:
+        import threading
         client = _Client()
-        self.stage_delay = 1.0
-        with mock.patch.object(svc.ui_diff, "join_timeout", lambda config: 0.05):
+        stopped = threading.Event()
+
+        def hold(**kw):
+            self.assertTrue(kw["cancel"].wait(10), "the review never stopped the UI diff")
+            stopped.set()
+
+        self.stage_hook = hold
+        removed: list[bool] = []
+        real_cleanup = svc.cleanup_review_run_dir
+
+        def cleanup(run_dir, config):
+            removed.append(stopped.is_set())
+            return real_cleanup(run_dir, config)
+
+        with mock.patch.object(svc.ui_diff, "join_timeout", lambda config: 0.05), \
+                mock.patch.object(svc, "cleanup_review_run_dir", cleanup):
             posted, stages = self.review(client, self.config())
         self.assertTrue(posted)
         self.assertEqual(len(stages), 1)
-        self.assertEqual([call for call in client.calls if call[0] in ("update", "create")], [])
+        self.assertTrue(removed and all(removed), "the clone was removed only after the UI diff stopped")
+
+    def test_a_failed_review_post_still_joins_the_ui_diff_before_removing_the_clone(self) -> None:
+        import threading
+        client = _Client()
+        finished = threading.Event()
+
+        def boom(*args, **kwargs):
+            raise svc.ServiceError("GitHub said no")
+
+        client.create_review = boom
+
+        def hold(**kw):
+            import time as _time
+            _time.sleep(0.3)
+            finished.set()
+
+        self.stage_hook = hold
+        removed: list[bool] = []
+        real_cleanup = svc.cleanup_review_run_dir
+
+        def cleanup(run_dir, config):
+            removed.append(finished.is_set())
+            return real_cleanup(run_dir, config)
+
+        with mock.patch.object(svc, "cleanup_review_run_dir", cleanup), self.assertRaises(svc.ServiceError):
+            self.review(client, self.config())
+        self.assertTrue(removed and all(removed), "the clone outlived the running UI diff")
+        self.assertIn("update", [call[0] for call in client.calls], "the section still lands")
+
+    def test_a_dashboard_switch_runs_the_outline_without_a_config_block(self) -> None:
+        client = _Client()
+        config = self.config()
+        del config["visual_outline"]
+        calls = []
+        stored = {"repositories": {REPO: {"enabled": True}}}
+
+        def runner(args, timeout, cwd=None, env=None):
+            calls.append(args)
+            import subprocess as _subprocess
+            for arg in args:
+                if str(arg).endswith("visual-outline.response.md"):
+                    Path(arg).write_text("## outline")
+            return _subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        config["agent_runner"] = {"command": ["runner", "{response_file}"]}
+        with mock.patch.object(svc.dashboard_execution.DashboardRecorder, "setting",
+                               lambda self, key: stored if key == ui_diff.SETTING else None), \
+                mock.patch.object(svc, "run_command", runner), \
+                mock.patch.object(svc, "run_agent", lambda *a, **k: {"agent": "fake", "summary": "ok", "findings": []}), \
+                mock.patch.object(svc, "load_repository_rules", lambda *a, **k: ""), \
+                mock.patch.object(svc, "clone_pr_source",
+                                  lambda repo, n, sha, run_dir, **kw: run_dir.mkdir(parents=True, exist_ok=True)):
+            svc.review_pr(client, config, ROOT / "config" / "reviewer.json", _pr(), {})
+        self.assertTrue(any(any(str(a).endswith("visual-outline.response.md") for a in args) for args in calls),
+                        "the outline runner ran")
+        upsert = next(call for call in client.calls if call[0] == "upsert")
+        self.assertIn("## outline", upsert[1])
 
 
 if __name__ == "__main__":

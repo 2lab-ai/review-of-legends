@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -313,10 +314,6 @@ def pending_outline_body(marker: str) -> str:
     ])
 
 
-def outline_is_pending(body: str) -> bool:
-    return OUTLINE_PENDING in str(body or "")
-
-
 # --------------------------------------------------------------- running ui-diff
 
 
@@ -328,12 +325,20 @@ class Outcome(object):
         self.status = status  # posted-ready kinds: "ok", "text-only", "failed"; "skipped" posts nothing
         self.detail = detail
 
-    def __repr__(self) -> str:  # pragma: no cover - log helper
-        return f"Outcome({self.status!r}, {self.detail!r})"
-
 
 _SLOTS_LOCK = threading.Lock()
 _SLOTS: Dict[int, threading.BoundedSemaphore] = {}
+
+
+def _acquire(slots: threading.BoundedSemaphore, wait: float, cancel: Optional[threading.Event]) -> bool:
+    """Take a slot within ``wait`` seconds, giving up early on ``cancel``."""
+    deadline = time.monotonic() + wait
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or (cancel is not None and cancel.is_set()):
+            return False
+        if slots.acquire(timeout=min(POLL_SECONDS, remaining)):
+            return True
 
 
 def _slots(limit: int) -> threading.BoundedSemaphore:
@@ -437,41 +442,68 @@ def _kill_groups(groups: List[int], sig: int) -> None:
             pass
 
 
-def _run_group(args: List[str], cwd: Path, env: Dict[str, str], timeout: int) -> Tuple[Optional[int], str, str]:
-    """Run ``args`` in its own session; on timeout SIGTERM it (ui-diff stops the
-    dev servers it started), then SIGKILL its group and every group its
-    descendants made. ``(exit, stdout, stderr)``, exit None on timeout."""
-    proc = subprocess.Popen(
-        args,
-        cwd=str(cwd),
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-    try:
-        out, err = proc.communicate(timeout=timeout)
-        return proc.returncode, out or "", err or ""
-    except subprocess.TimeoutExpired:
-        # Read the tree while ui-diff is still its root: once it dies its
-        # detached children are reparented and can no longer be told apart.
-        groups = [proc.pid] + [group for group in _descendant_groups(proc.pid) if group != proc.pid]
-        _kill_groups([proc.pid], signal.SIGTERM)
-        try:
-            # wait, not communicate: a child still holding the pipes would keep
-            # communicate from returning for the whole grace.
-            proc.wait(timeout=20)
-        except subprocess.TimeoutExpired:
+#: How often a running ui-diff is checked: its descendants recorded, a cancel noticed.
+POLL_SECONDS = 2.0
+
+
+def _run_group(
+    args: List[str],
+    cwd: Path,
+    env: Dict[str, str],
+    timeout: int,
+    cancel: Optional[threading.Event] = None,
+) -> Tuple[Optional[int], str, str]:
+    """Run ``args`` in its own session and leave nothing of it running.
+
+    ui-diff starts installs and dev servers detached, each in its own process
+    group, and once ui-diff exits they are reparented and can no longer be told
+    apart. So while it runs, every descendant's group is recorded; when it ends —
+    normally, past ``timeout`` or on ``cancel`` — those groups get SIGKILL. A run
+    that has to be stopped first gets SIGTERM (ui-diff then stops its own
+    servers). Output goes to files, not pipes, so a child that inherits them
+    cannot hold the call open. ``(exit, stdout, stderr)``, exit None when stopped.
+    """
+    with tempfile.TemporaryFile() as out_file, tempfile.TemporaryFile() as err_file:
+        proc = subprocess.Popen(
+            args,
+            cwd=str(cwd),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=out_file,
+            stderr=err_file,
+            start_new_session=True,
+        )
+        groups: List[int] = []
+        deadline = time.monotonic() + timeout
+        stopped = False
+        while True:
+            try:
+                proc.wait(timeout=POLL_SECONDS)
+                break
+            except subprocess.TimeoutExpired:
+                groups += [group for group in _descendant_groups(proc.pid) if group not in groups]
+                if time.monotonic() >= deadline or (cancel is not None and cancel.is_set()):
+                    stopped = True
+                    break
+        if stopped:
             groups += [group for group in _descendant_groups(proc.pid) if group not in groups]
-        _kill_groups(groups, signal.SIGKILL)
-        out, err = "", ""
-        try:
-            out, err = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            pass
-        return None, out or "", err or ""
+            _kill_groups([proc.pid], signal.SIGTERM)
+            try:
+                proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                groups += [group for group in _descendant_groups(proc.pid) if group not in groups]
+                _kill_groups([proc.pid], signal.SIGKILL)
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+        # The sweep: anything ui-diff left behind (a dev server it did not stop).
+        _kill_groups([group for group in groups if group != os.getpgid(0)], signal.SIGKILL)
+        out_file.seek(0)
+        err_file.seek(0)
+        out = out_file.read().decode("utf-8", "replace")
+        err = err_file.read().decode("utf-8", "replace")
+    return (None if stopped else proc.returncode), out, err
 
 
 def _last_json(text: str) -> Dict[str, Any]:
@@ -500,8 +532,12 @@ def _one_line(text: str, limit: int = 300) -> str:
     return line if len(line) <= limit else line[: limit - 1] + "…"
 
 
-def _failure_reason(code: Optional[int], stdout: str, stderr: str, timeout: int) -> str:
+def _failure_reason(
+    code: Optional[int], stdout: str, stderr: str, timeout: int, cancel: Optional[threading.Event] = None
+) -> str:
     if code is None:
+        if cancel is not None and cancel.is_set():
+            return "stopped: the review could not wait for it any longer"
         return f"timed out after {timeout} seconds"
     parsed = _last_json(stdout)
     message = parsed.get("error") or parsed.get("message")
@@ -515,22 +551,38 @@ def _failure_reason(code: Optional[int], stdout: str, stderr: str, timeout: int)
     return _one_line((errors or lines or [f"exit {code}"])[-1])
 
 
-def config_file_for(config: Dict[str, Any], source_dir: Path, repo: str) -> Tuple[Optional[Path], str]:
-    """The ui-diff config this run uses and where it came from.
+#: The largest repository ui-diff.config.json read.
+MAX_CONFIG_BYTES = 256 * 1024
+
+
+def config_file_for(
+    config: Dict[str, Any], source_dir: Path, repo: str
+) -> Tuple[Optional[Path], str, Dict[str, Any]]:
+    """The ui-diff config this run uses, where it came from, and its contents.
 
     The repository's own ``ui-diff.config.json`` wins; otherwise the one in
     ``visual_outline.ui_diff.configs`` is written to the clone root (untracked),
-    so its relative paths mean what they would in the repository.
+    so its relative paths mean what they would in the repository. The contents
+    are read here, before the PR's code runs, and are what publish gets later.
     """
     own = Path(source_dir) / CONFIG_FILENAME
-    if own.is_file():
-        return own, "repository"
+    try:
+        info = os.lstat(str(own))
+    except OSError:
+        info = None
+    if info is not None:
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_CONFIG_BYTES:
+            raise ValueError(f"the repository's {CONFIG_FILENAME} is not a regular file under {MAX_CONFIG_BYTES} bytes")
+        settings = json.loads(own.read_text(encoding="utf-8"))
+        if not isinstance(settings, dict):
+            raise ValueError(f"the repository's {CONFIG_FILENAME} is not a JSON object")
+        return own, "repository", settings
     supplied = _lookup(ui_diff_block(config).get("configs"), repo)
     if supplied is None:
-        return None, ""
+        return None, "", {}
     payload = {key: value for key, value in supplied.items() if not str(key).startswith("_")}
     own.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    return own, "config"
+    return own, "config", payload
 
 
 def _harden_git(env: Dict[str, str]) -> Dict[str, str]:
@@ -546,13 +598,18 @@ def _harden_git(env: Dict[str, str]) -> Dict[str, str]:
     return hardened
 
 
-def publish_workspace(out_dir: Path, config_path: Path, env: Dict[str, str]) -> Path:
+#: A file in .ui-diff larger than this is not copied for publishing (a screenshot never is).
+MAX_PUBLISH_FILE_BYTES = 64 * 1024 * 1024
+
+
+def publish_workspace(out_dir: Path, settings: Dict[str, Any], env: Dict[str, str]) -> Path:
     """A fresh repository for ``ui-diff publish``, outside the clone the PR's code ran in.
 
     The PR's install scripts could write the clone's ``.git`` (hooks, config)
     and ``.ui-diff`` (symlinks); publish holds the token. So it runs in a new
-    ``git init`` with a copy of ``.ui-diff`` that keeps regular files only, and
-    a copy of the ui-diff config without its ``publish`` block (the daemon
+    ``git init`` with a copy of ``.ui-diff`` that keeps regular files only (no
+    symlink, FIFO or oversized file), and ``settings`` — the ui-diff config as
+    read before the PR's code ran — without its ``publish`` block (the daemon
     passes remote, branch and link base itself; a repository cannot allow a
     public upload).
     """
@@ -571,14 +628,15 @@ def publish_workspace(out_dir: Path, config_path: Path, env: Dict[str, str]) -> 
             subdirs[:] = [name for name in subdirs if not os.path.islink(os.path.join(directory, name))]
             for name in files:
                 path = os.path.join(directory, name)
-                if os.path.islink(path) or not os.path.isfile(path):
+                try:
+                    info = os.lstat(path)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_PUBLISH_FILE_BYTES:
                     continue
                 shutil.copyfile(path, str(target / relative / name), follow_symlinks=False)
-        settings = json.loads(Path(config_path).read_text(encoding="utf-8"))
-        if not isinstance(settings, dict):
-            raise ValueError("the ui-diff config is not a JSON object")
-        settings.pop("publish", None)
-        (workspace / CONFIG_FILENAME).write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+        copied = {key: value for key, value in settings.items() if key != "publish"}
+        (workspace / CONFIG_FILENAME).write_text(json.dumps(copied, indent=2) + "\n", encoding="utf-8")
     except BaseException:
         shutil.rmtree(str(workspace), ignore_errors=True)
         raise
@@ -597,12 +655,14 @@ def run_stage(
     write_text: Callable[[Path, str], None],
     clock: Callable[[], float] = time.monotonic,
     upload: bool = True,
+    cancel: Optional[threading.Event] = None,
 ) -> Outcome:
     """Capture, diff and publish one PR head; never raises for an expected failure.
 
     ``publish_env`` adds the GitHub credential to an environment (only the
     publish step gets it). ``write_text`` writes a private artifact file.
     ``upload=False`` (a dry run) renders text-only and pushes nothing.
+    ``cancel`` (set by ``Job.cancel``) stops whatever runs and ends the stage.
     """
     started = clock()
     settings = ui_diff_block(config)
@@ -618,7 +678,11 @@ def run_stage(
         )
     if not head_sha or not base_sha:
         return Outcome(None, "skipped", "the PR carries no base or head commit")
-    config_path, config_source = config_file_for(config, source_dir, repo)
+    try:
+        config_path, config_source, config_settings = config_file_for(config, source_dir, repo)
+    except (OSError, ValueError) as exc:
+        reason = _one_line(f"could not read the ui-diff config: {exc}")
+        return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
     if config_path is None:
         return Outcome(
             failure_section(
@@ -639,7 +703,7 @@ def run_stage(
     log(f"{repo} pr #{number}: ui-diff waiting for a slot ({config_source} config)")
     # Bounded, so join_timeout always covers the wait plus this run: a review
     # never removes its clone under a UI diff that started late.
-    if not slots.acquire(timeout=_run_budget(settings)):
+    if not _acquire(slots, _run_budget(settings), cancel):
         reason = "other UI diffs kept every slot busy for the whole wait; the next head tries again"
         return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
     try:
@@ -647,16 +711,16 @@ def run_stage(
         run_args = command + [
             "run", "--config", str(config_path), "--base", base_sha, "--head", head_sha, "--out", str(out_dir),
         ]
-        code, stdout, stderr = _run_group(run_args, Path(source_dir), env, timeout)
+        code, stdout, stderr = _run_group(run_args, Path(source_dir), env, timeout, cancel)
         write_text(artifact_dir / "ui-diff.run.stdout.txt", stdout)
         write_text(artifact_dir / "ui-diff.run.stderr.txt", stderr)
         if code != 0:
-            reason = _failure_reason(code, stdout, stderr, timeout)
+            reason = _failure_reason(code, stdout, stderr, timeout, cancel)
             return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
         notes: List[str] = []
         branch = str(settings.get("assets_branch") or DEFAULT_ASSETS_BRANCH)
         try:
-            workspace = publish_workspace(out_dir, config_path, env)
+            workspace = publish_workspace(out_dir, config_settings, env)
         except (OSError, ValueError) as exc:
             reason = _one_line(f"could not prepare the publish step: {exc}")
             return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
@@ -676,12 +740,12 @@ def run_stage(
                 notes.append("Dry run: screenshots were not uploaded.")
             elif settings.get("upload", True):
                 code, stdout, stderr = _run_group(
-                    publish_args, workspace, _harden_git(publish_env(dict(env))), publish_timeout
+                    publish_args, workspace, _harden_git(publish_env(dict(env))), publish_timeout, cancel
                 )
                 write_text(artifact_dir / "ui-diff.publish.stdout.txt", stdout)
                 write_text(artifact_dir / "ui-diff.publish.stderr.txt", stderr)
                 if code != 0:
-                    reason = _failure_reason(code, stdout, stderr, publish_timeout)
+                    reason = _failure_reason(code, stdout, stderr, publish_timeout, cancel)
                     if code == EXIT_GIT_ACCESS:
                         reason = (
                             f"the GitHub App could not push to the {branch} branch of {repo} "
@@ -693,43 +757,54 @@ def run_stage(
                 status = "text-only"
                 notes.append("Screenshots are not uploaded on this deployment (visual_outline.ui_diff.upload is off).")
             if status == "text-only":
-                code, stdout, stderr = _run_group(publish_args + ["--no-upload"], workspace, _harden_git(env), publish_timeout)
+                code, stdout, stderr = _run_group(
+                    publish_args + ["--no-upload"], workspace, _harden_git(env), publish_timeout, cancel
+                )
                 write_text(artifact_dir / "ui-diff.render.stderr.txt", stderr)
                 if code != 0:
-                    reason = _failure_reason(code, stdout, stderr, publish_timeout)
+                    reason = _failure_reason(code, stdout, stderr, publish_timeout, cancel)
                     return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
             try:
                 markdown = (published / "comment.md").read_text(encoding="utf-8")
             except OSError as exc:
                 reason = f"ui-diff wrote no comment ({exc.__class__.__name__})"
                 return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
+            report = published / "report.json"
+            if report.is_file():
+                try:
+                    write_text(artifact_dir / "ui-diff.report.json", report.read_text(encoding="utf-8"))
+                except OSError:
+                    pass
         finally:
             shutil.rmtree(str(workspace), ignore_errors=True)
     finally:
         slots.release()
     write_text(artifact_dir / "ui-diff.comment.md", markdown)
-    report = out_dir / "report.json"
-    if report.is_file():
-        try:
-            write_text(artifact_dir / "ui-diff.report.json", report.read_text(encoding="utf-8"))
-        except OSError:
-            pass
     section = build_section(markdown, notes, head_sha, clock() - started)
     return Outcome(section, status, "; ".join(notes))
+
+
+#: How long a cancelled stage may take to stop: a poll, ui-diff's SIGTERM grace, the SIGKILL wait.
+CANCEL_WAIT_SECONDS = POLL_SECONDS + 20 + 10 + 30
 
 
 class Job(object):
     """``run_stage`` on a thread, so the reviewers do not wait for the browser.
 
-    ``result`` joins it; whatever escapes the stage becomes a failure outcome.
+    ``target`` gets the job's cancel event. ``result`` joins it; ``cancel``
+    stops it (its processes included); whatever escapes the stage becomes a
+    failure outcome.
     """
 
-    def __init__(self, target: Callable[[], Outcome], head_sha: str, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self, target: Callable[[threading.Event], Outcome], head_sha: str, clock: Callable[[], float] = time.monotonic
+    ) -> None:
         self._target = target
         self._head_sha = head_sha
         self._clock = clock
         self._started = clock()
         self._outcome: Optional[Outcome] = None
+        self._cancel = threading.Event()
         self._thread = threading.Thread(target=self._run, name="ui-diff", daemon=True)
 
     def start(self) -> "Job":
@@ -738,7 +813,7 @@ class Job(object):
 
     def _run(self) -> None:
         try:
-            self._outcome = self._target()
+            self._outcome = self._target(self._cancel)
         except Exception as exc:  # noqa: BLE001 - the stage is best effort
             reason = _one_line(f"{exc.__class__.__name__}: {exc}")
             self._outcome = Outcome(failure_section(reason, self._head_sha, self._clock() - self._started), "failed", reason)
@@ -749,6 +824,13 @@ class Job(object):
         if self._thread.is_alive():
             return None
         return self._outcome
+
+    def cancel(self, timeout: float = CANCEL_WAIT_SECONDS) -> bool:
+        """Stop the stage and wait for it; True once the thread has ended."""
+        self._cancel.set()
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
 
 
 def _run_budget(settings: Dict[str, Any]) -> float:

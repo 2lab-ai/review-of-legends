@@ -107,7 +107,6 @@ export function projectRepositorySettings(payload) {
     max_added: Number.isInteger(source.max_added) && source.max_added > 0 ? source.max_added : MAX_ADDED,
     note: text(source.note, 300) || BASELINE_NOTE,
     error: text(source.error, 300),
-    ui_diff_available: source.ui_diff_available === true,
   };
 }
 

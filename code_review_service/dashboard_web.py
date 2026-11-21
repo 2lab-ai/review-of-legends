@@ -2266,7 +2266,6 @@ def create_app(
             "allowed_owners": svc.repository_owners(config),
             "max_added": MAX_ADDED_REPOSITORIES,
             "note": BASELINE_OFF_NOTE if config.get("review_existing_open_prs_on_first_run") else BASELINE_NOTE,
-            "ui_diff_available": ui_diff.ui_diff_available(config),
         }
 
     def _outline_value(row: Any) -> Any:

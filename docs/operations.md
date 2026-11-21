@@ -693,7 +693,9 @@ reader; it never carries findings or a verdict, which is the reviewers' job.
 - **Per repository.** Which repositories get the outline: the admin's choice on the dashboard
   (Settings → Repositories, below), else `visual_outline.repositories` in the config
   (`{"owner/name": {"enabled": false, "ui_diff": true}}`, names must be in `repositories`), else
-  `visual_outline.enabled`. The daemon reads the answer at the start of every review attempt.
+  `visual_outline.enabled`. The daemon reads the answer at the start of every review attempt. A
+  repository switched on from the dashboard gets the outline even when the config has no
+  `visual_outline` block: the shipped prompt and the reviewers' runner are the defaults.
 
 #### UI diff (ui-diff)
 
@@ -722,8 +724,9 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   `PLAYWRIGHT_BROWSERS_PATH` under `cache_dir`, the host's git config left out, plus
   `visual_outline.ui_diff.env`. Only `publish` — ui-diff's own code — gets the App's installation
   token (for `gh` and the push). It runs in a fresh temporary repository outside the clone, with a
-  copy of `.ui-diff` that keeps regular files only (no symlinks), git hooks switched off, and a copy
-  of the ui-diff config without its `publish` block; remote, branch, repository and image link base
+  copy of `.ui-diff` that keeps regular files only (no symlink, FIFO or file over 64 MiB), git hooks
+  switched off, and the ui-diff config as read before the PR's code ran, without its `publish`
+  block; remote, branch, repository and image link base
   are passed on the command line, so a repository's config cannot point the upload anywhere else
   or allow a public upload.
 - **Trust.** This is still the PR's code running on the review host as the daemon's user, without
@@ -735,9 +738,14 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
 - **Pushing needs Contents: write.** The default App has Contents: read; without write, the push is
   refused (ui-diff exits 3) and the section is posted text-only (changed captures, percentages,
   summary) with a note saying why. `upload: false` posts text-only on purpose.
-- **Failures** — no config, a dev server that never answers, a timeout (ui-diff gets SIGTERM, then
-  its process group and the groups of the installs and dev servers it started get SIGKILL) — post
-  a one-line ⚠️ section instead; nothing here
+- **Processes.** ui-diff starts installs and dev servers detached, in their own process groups.
+  While it runs the daemon records every descendant's group every 2 seconds; when it ends, those
+  groups get SIGKILL, so a dev server it left behind does not outlive the run. A run past its
+  timeout gets SIGTERM first (ui-diff stops its own servers), then SIGKILL. A review that cannot
+  wait any longer (past `timeout_seconds` + 2 × `publish_timeout_seconds` and a slot wait) stops the
+  UI diff the same way before it removes the clone.
+- **Failures** — no config, a dev server that never answers, a timeout — post a one-line ⚠️
+  section instead; nothing here
   touches the review, quorum or approval. When the outline agent produced nothing, the UI diff is
   posted on a marker comment marked `<!-- review-of-legends:outline-pending -->`, which does not
   count as an outline, so the next review still drafts one.

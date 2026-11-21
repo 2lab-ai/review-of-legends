@@ -3692,7 +3692,7 @@ def visual_outline_exists(client: GitHubClient, number: int, marker: str) -> boo
         body = str(comment.get("body", ""))
         # A comment that carries only a UI diff (the outline agent produced
         # nothing then) still wants its outline.
-        if marker in body and not ui_diff.outline_is_pending(body):
+        if marker in body and ui_diff.OUTLINE_PENDING not in body:
             return True
     return False
 
@@ -3804,12 +3804,12 @@ def run_visual_outline_agent(
     language: str = "",
 ) -> str | None:
     """The outline Markdown, or None when the run produced nothing usable."""
-    outline_config = config.get("visual_outline") or {}
     # Whether this repository gets an outline is the caller's decision
     # (ui_diff.repository_settings: the dashboard, the config's repositories,
-    # then visual_outline.enabled); without a block there is nothing to run.
-    if not isinstance(config.get("visual_outline"), dict):
-        return None
+    # then visual_outline.enabled). Without a visual_outline block the defaults
+    # below apply (the shipped prompt, the reviewers' runner), so a dashboard
+    # switch works on a deployment that never configured one.
+    outline_config = config.get("visual_outline") if isinstance(config.get("visual_outline"), dict) else {}
 
     prompt_path = expand_path(outline_config.get("prompt_path", "../agents/visual-outline.md"), config_dir)
     outline_prompt = prompt_path.read_text(encoding="utf-8")
@@ -3943,7 +3943,7 @@ def start_ui_diff_job(
     except OSError:
         pass
 
-    def target() -> ui_diff.Outcome:
+    def target(cancel: threading.Event) -> ui_diff.Outcome:
         return ui_diff.run_stage(
             config,
             Path(config_dir),
@@ -3955,6 +3955,7 @@ def start_ui_diff_job(
             log=log,
             write_text=write_private_text,
             upload=upload,
+            cancel=cancel,
         )
 
     return ui_diff.Job(target, str((pr.get("head") or {}).get("sha") or "")).start()
@@ -6940,8 +6941,13 @@ def review_pr(
             try:
                 outcome = job.result(ui_diff.join_timeout(config))
                 if outcome is None:
-                    log(f"{repo} pr #{number}: ui-diff still running after the wait; not posting it")
-                    return
+                    # Past every budget: stop it (its processes too) before the
+                    # clone it works in is removed, then post what it says.
+                    log(f"{repo} pr #{number}: ui-diff still running after the wait; stopping it")
+                    outcome = job.result(0) if job.cancel() else None
+                    if outcome is None:
+                        log(f"{repo} pr #{number}: ui-diff did not stop; removing the clone without its section")
+                        return
                 log(f"{repo} pr #{number}: ui-diff {outcome.status}" + (f": {outcome.detail}" if outcome.detail else ""))
                 if outcome.section is None:
                     return
