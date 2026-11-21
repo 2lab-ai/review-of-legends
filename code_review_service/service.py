@@ -1117,7 +1117,9 @@ def policy_applies(command: Any, policy: dict[str, Any] | None) -> bool:
     return "--model" in args
 
 
-def runner_commands(config: dict[str, Any], agents: list[dict[str, Any]] | None = None) -> list[Any]:
+def runner_commands(
+    config: dict[str, Any], agents: list[dict[str, Any]] | None = None, outline_enabled: bool | None = None
+) -> list[Any]:
     """Every runner argv this review will actually execute.
 
     ``agents`` is the repository's selection (``agents_for_repo``); an opt-in
@@ -1139,19 +1141,23 @@ def runner_commands(config: dict[str, Any], agents: list[dict[str, Any]] | None 
     summary = config.get("executive_summary") or {}
     if summary.get("enabled", False):
         commands.append((summary.get("runner") or default).get("command"))
-    # The outline may be on for one repository only (visual_outline.repositories):
-    # its runner then decides publication everywhere, on the safe side.
-    if ui_diff.any_repository_enabled(config):
+    # ``outline_enabled`` is this review's answer (ui_diff.repository_settings,
+    # the dashboard included); without one, an outline on for any repository
+    # in the config counts, on the safe side.
+    if ui_diff.any_repository_enabled(config) if outline_enabled is None else outline_enabled:
         outline = config.get("visual_outline") or {}
         commands.append((outline.get("runner") or default).get("command"))
     return commands or [default.get("command")]
 
 
 def policy_applies_everywhere(
-    config: dict[str, Any], policy: dict[str, Any] | None, agents: list[dict[str, Any]] | None = None
+    config: dict[str, Any],
+    policy: dict[str, Any] | None,
+    agents: list[dict[str, Any]] | None = None,
+    outline_enabled: bool | None = None,
 ) -> bool:
     """``policy_applies`` over every argv of the review: publish only when all run it."""
-    return all(policy_applies(command, policy) for command in runner_commands(config, agents))
+    return all(policy_applies(command, policy) for command in runner_commands(config, agents, outline_enabled))
 
 
 def render_runner_command(command: list[Any], values: dict[str, str], policy: dict[str, Any] | None) -> list[str]:
@@ -3925,8 +3931,12 @@ def start_ui_diff_job(
     run_dir: Path,
     repo: str,
     pr: dict[str, Any],
+    upload: bool = True,
 ) -> ui_diff.Job:
-    """Start the UI diff of one PR head on a thread; ``finish_ui_diff`` joins it."""
+    """Start the UI diff of one PR head on a thread; ``finish_ui_diff`` joins it.
+
+    ``upload=False`` (a dry run) renders the section text-only and pushes nothing.
+    """
     artifact_dir = prepare_review_artifact_dir(source_dir, run_dir)
     try:
         os.chmod(str(artifact_dir), 0o700)
@@ -3944,6 +3954,7 @@ def start_ui_diff_job(
             publish_env=ui_diff_publish_environ(config),
             log=log,
             write_text=write_private_text,
+            upload=upload,
         )
 
     return ui_diff.Job(target, str((pr.get("head") or {}).get("sha") or "")).start()
@@ -6817,7 +6828,7 @@ def review_pr(
         # ``ladder`` is what every runner argv receives; ``policy`` is what the PR
         # and the attempt publish, and it is withheld unless every argv runs it.
         ladder = policy
-        if not policy_applies_everywhere(config, policy, agents):
+        if not policy_applies_everywhere(config, policy, agents, outline_enabled=outline_settings["enabled"]):
             # e.g. the Codex CLI rollback argv on any agent: it runs its own model.
             # Publishing the resolved ladder would name a model that never ran.
             log(f"{client.repo} pr #{number}: a runner argv does not take a model policy; not publishing one")
@@ -7058,7 +7069,9 @@ def review_pr(
             # browser, minutes of work) and is joined before the clone is removed.
             if outline_settings["ui_diff_effective"]:
                 try:
-                    ui_diff_job = start_ui_diff_job(config, config_path.parent, source_dir, run_dir, repo, pr)
+                    ui_diff_job = start_ui_diff_job(
+                        config, config_path.parent, source_dir, run_dir, repo, pr, upload=not dry_run
+                    )
                     log(f"{repo} pr #{number}: ui-diff started beside the reviewers")
                 except Exception as exc:  # noqa: BLE001 - the UI diff never costs the review
                     log(f"{repo} pr #{number}: ui-diff could not start; continuing without it: {exc}")
@@ -7536,6 +7549,11 @@ def review_pr(
             cleanup_review_run_dir(run_dir, config)
             return True
         finally:
+            if sys.exc_info()[0] is not None and status_open:
+                # The attempt failed: the merge check must not stay pending while
+                # the UI diff below is joined (minutes); the outer finally then
+                # finds nothing open.
+                required_status("error", "review did not finish; check the dashboard")
             finish_ui_diff()
             cleanup_review_run_dir(run_dir, config)
     finally:

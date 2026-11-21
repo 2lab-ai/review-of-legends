@@ -37,10 +37,17 @@ FAKE_UI_DIFF = textwrap.dedent(
     record = Path(os.environ.get("FAKE_RECORD") or Path(__file__).with_name("record.jsonl"))
     behaviour = json.loads(Path(__file__).with_name("behaviour.json").read_text())
     with record.open("a") as handle:
-        handle.write(json.dumps({"args": args, "env": dict(os.environ)}) + "\\n")
+        handle.write(json.dumps({"args": args, "env": dict(os.environ), "cwd": os.getcwd()}) + "\\n")
     out = Path(args[args.index("--out") + 1])
     out.mkdir(parents=True, exist_ok=True)
     if command == "run":
+        if behaviour.get("spawn_child"):
+            import subprocess
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True)
+            Path(behaviour["spawn_child"]).write_text(str(child.pid))
+        if behaviour.get("plant_symlink"):
+            (out / "compare").mkdir(parents=True, exist_ok=True)
+            os.symlink(behaviour["plant_symlink"], out / "compare" / "secret.png")
         if behaviour.get("run_sleep"):
             time.sleep(behaviour["run_sleep"])
         if behaviour.get("run_exit"):
@@ -186,6 +193,13 @@ class RepositorySettingsTest(unittest.TestCase):
                                "runner": {"command": ["codex", "exec"]}},
         }
         self.assertIn(["codex", "exec"], svc.runner_commands(config))
+        # The review's own answer (the dashboard included) decides when given.
+        config["visual_outline"]["repositories"] = {}
+        self.assertNotIn(["codex", "exec"], svc.runner_commands(config))
+        self.assertIn(["codex", "exec"], svc.runner_commands(config, outline_enabled=True))
+        policy = {"model": "m", "source": "config"}
+        self.assertFalse(svc.policy_applies_everywhere(config, policy, outline_enabled=True))
+        self.assertTrue(svc.policy_applies_everywhere(config, policy, outline_enabled=False))
 
 
 class SectionTest(unittest.TestCase):
@@ -325,6 +339,92 @@ class RunStageTest(unittest.TestCase):
         self.assertEqual((outcome.status, outcome.section), ("skipped", None))
         self.assertEqual(self.records(), [])
 
+    def test_a_head_whose_fork_was_deleted_is_never_run(self) -> None:
+        self.behaviour()
+        pr = _pr()
+        pr["head"]["repo"] = None
+        outcome = self.run_stage(_config(self.tmp), pr)
+        self.assertEqual((outcome.status, outcome.section), ("skipped", None))
+        self.assertIn("deleted", outcome.detail)
+        self.assertEqual(self.records(), [])
+
+    def test_publish_runs_outside_the_clone_with_regular_files_only(self) -> None:
+        secret = self.tmp / "app-key.pem"
+        secret.write_text("PRIVATE KEY", encoding="utf-8")
+        self.behaviour(plant_symlink=str(secret))
+        config = _config(self.tmp)
+        config["visual_outline"]["ui_diff"]["configs"][REPO]["publish"] = {"allowPublicRepo": True, "remote": "evil"}
+        outcome = self.run_stage(config)
+        self.assertEqual(outcome.status, "ok", outcome.detail)
+        run, publish = self.records()
+        self.assertEqual(Path(run["cwd"]).resolve(), self.source.resolve())
+        workspace = Path(publish["cwd"])
+        self.assertNotEqual(workspace.resolve(), self.source.resolve())
+        self.assertFalse(str(workspace.resolve()).startswith(str(self.source.resolve())))
+        args = publish["args"]
+        self.assertEqual(Path(args[args.index("--out") + 1]).parent.resolve(), workspace.resolve())
+        self.assertFalse(workspace.exists(), "the publish workspace is removed afterwards")
+        self.assertEqual(publish["env"]["GIT_CONFIG_KEY_0"], "core.hooksPath")
+
+    def test_the_publish_copy_drops_symlinks_and_the_publish_block(self) -> None:
+        out = self.source / ".ui-diff"
+        (out / "compare").mkdir(parents=True)
+        (out / "compare" / "home.png").write_bytes(b"png")
+        secret = self.tmp / "app-key.pem"
+        secret.write_text("PRIVATE KEY", encoding="utf-8")
+        os.symlink(str(secret), str(out / "compare" / "secret.png"))
+        os.symlink(str(self.tmp), str(out / "linked-dir"))
+        config_path = self.source / "ui-diff.config.json"
+        config_path.write_text(json.dumps({"routes": ["/"], "publish": {"allowPublicRepo": True}}), encoding="utf-8")
+        workspace = ui_diff.publish_workspace(out, config_path, {"PATH": os.environ.get("PATH", "")})
+        try:
+            self.assertTrue((workspace / ".git").is_dir())
+            self.assertEqual((workspace / ".ui-diff" / "compare" / "home.png").read_bytes(), b"png")
+            self.assertFalse((workspace / ".ui-diff" / "compare" / "secret.png").exists())
+            self.assertFalse((workspace / ".ui-diff" / "linked-dir").exists())
+            copied = json.loads((workspace / "ui-diff.config.json").read_text(encoding="utf-8"))
+            self.assertEqual(copied, {"routes": ["/"]})
+        finally:
+            import shutil
+            shutil.rmtree(str(workspace), ignore_errors=True)
+
+    def test_a_dry_run_never_hands_out_the_credential(self) -> None:
+        self.behaviour()
+        calls = []
+
+        def write(path: Path, text: str) -> None:
+            path.write_text(text, encoding="utf-8")
+
+        outcome = ui_diff.run_stage(
+            _config(self.tmp), self.tmp, self.source, self.artifacts, REPO, _pr(),
+            lambda env: calls.append(env) or env, self.logs.append, write, upload=False,
+        )
+        self.assertEqual(outcome.status, "text-only")
+        self.assertEqual(calls, [])
+        self.assertIn("Dry run", outcome.section)
+        self.assertIn("--no-upload", self.records()[-1]["args"])
+
+    def test_a_timeout_also_stops_the_detached_children(self) -> None:
+        pid_file = self.tmp / "child.pid"
+        self.behaviour(run_sleep=30, spawn_child=str(pid_file))
+        outcome = self.run_stage(_config(self.tmp, timeout_seconds=2))
+        self.assertEqual(outcome.status, "failed")
+        child = int(pid_file.read_text())
+        import time as _time
+        for _ in range(50):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            # A killed child stays a zombie until reaped by init; ps shows it as Z.
+            state = os.popen(f"ps -o stat= -p {child}").read().strip()
+            if not state or state.startswith("Z"):
+                break
+            _time.sleep(0.1)
+        else:
+            os.kill(child, 9)
+            self.fail("the detached child outlived the timeout")
+
     def test_no_config_anywhere_is_explained(self) -> None:
         self.behaviour()
         config = _config(self.tmp)
@@ -385,6 +485,8 @@ class ReviewIntegrationTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
+        self.uploads: list[bool] = []
+        self.stage_delay = 0.0
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -415,6 +517,10 @@ class ReviewIntegrationTest(unittest.TestCase):
 
         def fake_stage(config, config_dir, source_dir, artifact_dir, repo, pr, publish_env, log, write_text, **kw):
             stages.append((repo, pr["head"]["sha"], source_dir.exists()))
+            self.uploads.append(kw.get("upload", True))
+            if self.stage_delay:
+                import time as _time
+                _time.sleep(self.stage_delay)
             if stage is not None:
                 return stage
             return ui_diff.Outcome(ui_diff.build_section("### UI diff — 1 changed", [], HEAD, 2), "ok")
@@ -489,6 +595,16 @@ class ReviewIntegrationTest(unittest.TestCase):
             self.review(client, self.config(), dry_run=True)
         self.assertEqual([call for call in client.calls if call[0] in ("update", "create")], [])
         self.assertTrue(any("### UI diff — 1 changed" in str(call) for call in printed.call_args_list))
+        self.assertEqual(self.uploads, [False], "a dry run never uploads")
+
+    def test_a_ui_diff_still_running_after_the_wait_is_not_posted(self) -> None:
+        client = _Client()
+        self.stage_delay = 1.0
+        with mock.patch.object(svc.ui_diff, "join_timeout", lambda config: 0.05):
+            posted, stages = self.review(client, self.config())
+        self.assertTrue(posted)
+        self.assertEqual(len(stages), 1)
+        self.assertEqual([call for call in client.calls if call[0] in ("update", "create")], [])
 
 
 if __name__ == "__main__":

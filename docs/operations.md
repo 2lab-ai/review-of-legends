@@ -721,16 +721,23 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   first), `LANG`, `TMPDIR`, `CI=1`, a private `HOME`, `npm_config_cache` and
   `PLAYWRIGHT_BROWSERS_PATH` under `cache_dir`, the host's git config left out, plus
   `visual_outline.ui_diff.env`. Only `publish` — ui-diff's own code — gets the App's installation
-  token (for `gh` and the push), and its remote, branch, repository and image link base are passed
-  on the command line, so a repository's config cannot point the upload anywhere else.
+  token (for `gh` and the push). It runs in a fresh temporary repository outside the clone, with a
+  copy of `.ui-diff` that keeps regular files only (no symlinks), git hooks switched off, and a copy
+  of the ui-diff config without its `publish` block; remote, branch, repository and image link base
+  are passed on the command line, so a repository's config cannot point the upload anywhere else
+  or allow a public upload.
 - **Trust.** This is still the PR's code running on the review host as the daemon's user, without
-  a sandbox: turn the UI diff on only for private repositories whose PR authors you already trust
-  with that host (as with a self-hosted CI runner). A PR from a fork is never run.
+  a sandbox: it can read whatever that user can, the App key included. Turn the UI diff on only
+  for private repositories whose PR authors you already trust with that host (as with a
+  self-hosted CI runner). Only a head that GitHub places in the repository itself runs: a fork's
+  PR, or one whose fork was deleted, never does. `once --dry-run` renders the section text-only
+  and pushes nothing.
 - **Pushing needs Contents: write.** The default App has Contents: read; without write, the push is
   refused (ui-diff exits 3) and the section is posted text-only (changed captures, percentages,
   summary) with a note saying why. `upload: false` posts text-only on purpose.
-- **Failures** — no config, a dev server that never answers, a timeout (the run is stopped with
-  SIGTERM, then its process group with SIGKILL) — post a one-line ⚠️ section instead; nothing here
+- **Failures** — no config, a dev server that never answers, a timeout (ui-diff gets SIGTERM, then
+  its process group and the groups of the installs and dev servers it started get SIGKILL) — post
+  a one-line ⚠️ section instead; nothing here
   touches the review, quorum or approval. When the outline agent produced nothing, the UI diff is
   posted on a marker comment marked `<!-- review-of-legends:outline-pending -->`, which does not
   count as an outline, so the next review still drafts one.

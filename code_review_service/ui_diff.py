@@ -23,8 +23,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -393,10 +395,52 @@ def run_environ(config: Dict[str, Any], config_dir: Path, base: Optional[Dict[st
     return env
 
 
+def _descendant_groups(root_pid: int) -> List[int]:
+    """The process groups of every descendant of ``root_pid`` (ps), best effort.
+
+    ui-diff starts installs and dev servers detached, each in its own group, so
+    killing ui-diff's own group does not reach them.
+    """
+    try:
+        listing = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,pgid="], capture_output=True, text=True, timeout=10, check=False
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    children: Dict[int, List[Tuple[int, int]]] = {}
+    for line in listing.splitlines():
+        parts = line.split()
+        if len(parts) != 3 or not all(part.isdigit() for part in parts):
+            continue
+        pid, ppid, pgid = (int(part) for part in parts)
+        children.setdefault(ppid, []).append((pid, pgid))
+    groups: List[int] = []
+    stack = [root_pid]
+    seen = set()
+    while stack:
+        parent = stack.pop()
+        for pid, pgid in children.get(parent, []):
+            if pid in seen:
+                continue
+            seen.add(pid)
+            stack.append(pid)
+            if pgid > 1 and pgid not in groups:
+                groups.append(pgid)
+    return groups
+
+
+def _kill_groups(groups: List[int], sig: int) -> None:
+    for group in groups:
+        try:
+            os.killpg(group, sig)
+        except OSError:
+            pass
+
+
 def _run_group(args: List[str], cwd: Path, env: Dict[str, str], timeout: int) -> Tuple[Optional[int], str, str]:
     """Run ``args`` in its own session; on timeout SIGTERM it (ui-diff stops the
-    dev servers it started), then SIGKILL the group. ``(exit, stdout, stderr)``,
-    exit None on timeout."""
+    dev servers it started), then SIGKILL its group and every group its
+    descendants made. ``(exit, stdout, stderr)``, exit None on timeout."""
     proc = subprocess.Popen(
         args,
         cwd=str(cwd),
@@ -411,17 +455,23 @@ def _run_group(args: List[str], cwd: Path, env: Dict[str, str], timeout: int) ->
         out, err = proc.communicate(timeout=timeout)
         return proc.returncode, out or "", err or ""
     except subprocess.TimeoutExpired:
-        for sig, grace in ((signal.SIGTERM, 20), (signal.SIGKILL, 10)):
-            try:
-                os.killpg(proc.pid, sig)
-            except OSError:
-                pass
-            try:
-                out, err = proc.communicate(timeout=grace)
-                return None, out or "", err or ""
-            except subprocess.TimeoutExpired:
-                continue
-        return None, "", ""
+        # Read the tree while ui-diff is still its root: once it dies its
+        # detached children are reparented and can no longer be told apart.
+        groups = [proc.pid] + [group for group in _descendant_groups(proc.pid) if group != proc.pid]
+        _kill_groups([proc.pid], signal.SIGTERM)
+        try:
+            # wait, not communicate: a child still holding the pipes would keep
+            # communicate from returning for the whole grace.
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            groups += [group for group in _descendant_groups(proc.pid) if group not in groups]
+        _kill_groups(groups, signal.SIGKILL)
+        out, err = "", ""
+        try:
+            out, err = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        return None, out or "", err or ""
 
 
 def _last_json(text: str) -> Dict[str, Any]:
@@ -483,6 +533,58 @@ def config_file_for(config: Dict[str, Any], source_dir: Path, repo: str) -> Tupl
     return own, "config"
 
 
+def _harden_git(env: Dict[str, str]) -> Dict[str, str]:
+    """``env`` with git hooks switched off, added to whatever GIT_CONFIG_* it carries."""
+    hardened = dict(env)
+    try:
+        count = int(hardened.get("GIT_CONFIG_COUNT") or 0)
+    except ValueError:
+        count = 0
+    hardened[f"GIT_CONFIG_KEY_{count}"] = "core.hooksPath"
+    hardened[f"GIT_CONFIG_VALUE_{count}"] = os.devnull
+    hardened["GIT_CONFIG_COUNT"] = str(count + 1)
+    return hardened
+
+
+def publish_workspace(out_dir: Path, config_path: Path, env: Dict[str, str]) -> Path:
+    """A fresh repository for ``ui-diff publish``, outside the clone the PR's code ran in.
+
+    The PR's install scripts could write the clone's ``.git`` (hooks, config)
+    and ``.ui-diff`` (symlinks); publish holds the token. So it runs in a new
+    ``git init`` with a copy of ``.ui-diff`` that keeps regular files only, and
+    a copy of the ui-diff config without its ``publish`` block (the daemon
+    passes remote, branch and link base itself; a repository cannot allow a
+    public upload).
+    """
+    workspace = Path(tempfile.mkdtemp(prefix="rol-ui-diff-publish-"))
+    try:
+        init = subprocess.run(
+            ["git", "init", "-q", str(workspace)], env=env, capture_output=True, text=True, timeout=60, check=False
+        )
+        if init.returncode != 0:
+            raise OSError(f"git init failed: {init.stderr.strip()[:200]}")
+        target = workspace / ".ui-diff"
+        source = Path(out_dir)
+        for directory, subdirs, files in os.walk(str(source), followlinks=False):
+            relative = Path(directory).relative_to(source)
+            (target / relative).mkdir(parents=True, exist_ok=True)
+            subdirs[:] = [name for name in subdirs if not os.path.islink(os.path.join(directory, name))]
+            for name in files:
+                path = os.path.join(directory, name)
+                if os.path.islink(path) or not os.path.isfile(path):
+                    continue
+                shutil.copyfile(path, str(target / relative / name), follow_symlinks=False)
+        settings = json.loads(Path(config_path).read_text(encoding="utf-8"))
+        if not isinstance(settings, dict):
+            raise ValueError("the ui-diff config is not a JSON object")
+        settings.pop("publish", None)
+        (workspace / CONFIG_FILENAME).write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    except BaseException:
+        shutil.rmtree(str(workspace), ignore_errors=True)
+        raise
+    return workspace
+
+
 def run_stage(
     config: Dict[str, Any],
     config_dir: Path,
@@ -494,11 +596,13 @@ def run_stage(
     log: Callable[[str], None],
     write_text: Callable[[Path, str], None],
     clock: Callable[[], float] = time.monotonic,
+    upload: bool = True,
 ) -> Outcome:
     """Capture, diff and publish one PR head; never raises for an expected failure.
 
     ``publish_env`` adds the GitHub credential to an environment (only the
     publish step gets it). ``write_text`` writes a private artifact file.
+    ``upload=False`` (a dry run) renders text-only and pushes nothing.
     """
     started = clock()
     settings = ui_diff_block(config)
@@ -506,8 +610,12 @@ def run_stage(
     head_sha = str((pr.get("head") or {}).get("sha") or "")
     base_sha = str((pr.get("base") or {}).get("sha") or "")
     head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name")
-    if head_repo and _repo_key(head_repo) != _repo_key(repo):
-        return Outcome(None, "skipped", f"head is in {head_repo}, not {repo}: ui-diff never runs a fork's code")
+    # Only a head that GitHub places in this very repository: a fork's head, or
+    # one whose fork was deleted (head.repo null), is someone else's code.
+    if not head_repo or _repo_key(head_repo) != _repo_key(repo):
+        return Outcome(
+            None, "skipped", f"the head is not in {repo} (head repository: {head_repo or 'deleted'}); ui-diff never runs it"
+        )
     if not head_sha or not base_sha:
         return Outcome(None, "skipped", "the PR carries no base or head commit")
     config_path, config_source = config_file_for(config, source_dir, repo)
@@ -547,44 +655,58 @@ def run_stage(
             return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
         notes: List[str] = []
         branch = str(settings.get("assets_branch") or DEFAULT_ASSETS_BRANCH)
+        try:
+            workspace = publish_workspace(out_dir, config_path, env)
+        except (OSError, ValueError) as exc:
+            reason = _one_line(f"could not prepare the publish step: {exc}")
+            return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
+        published = workspace / ".ui-diff"
         publish_args = command + [
-            "publish", "--config", str(config_path), "--out", str(out_dir), "--pr", str(number), "--no-comment",
+            "publish", "--config", str(workspace / CONFIG_FILENAME), "--out", str(published), "--pr", str(number),
+            "--no-comment",
             # Pinned here so a repository's own config cannot point the upload
             # (and the credential) or the image links anywhere else.
             "--repo", repo, "--remote", f"https://github.com/{repo}.git", "--branch", branch,
             "--link-base", f"https://github.com/{repo}/raw/{branch}",
         ]
-        status = "ok"
-        if settings.get("upload", True):
-            code, stdout, stderr = _run_group(publish_args, Path(source_dir), publish_env(dict(env)), publish_timeout)
-            write_text(artifact_dir / "ui-diff.publish.stdout.txt", stdout)
-            write_text(artifact_dir / "ui-diff.publish.stderr.txt", stderr)
-            if code != 0:
-                reason = _failure_reason(code, stdout, stderr, publish_timeout)
-                if code == EXIT_GIT_ACCESS:
-                    reason = (
-                        f"the GitHub App could not push to the {branch} branch of {repo} "
-                        "(it needs the Contents: write permission)"
-                    )
-                notes.append(f"Screenshots were not uploaded: {reason}.")
+        try:
+            status = "ok"
+            if not upload:
                 status = "text-only"
-        else:
-            status = "text-only"
-            notes.append("Screenshots are not uploaded on this deployment (visual_outline.ui_diff.upload is off).")
-        if status == "text-only":
-            code, stdout, stderr = _run_group(publish_args + ["--no-upload"], Path(source_dir), dict(env), publish_timeout)
-            write_text(artifact_dir / "ui-diff.render.stderr.txt", stderr)
-            if code != 0:
-                reason = _failure_reason(code, stdout, stderr, publish_timeout)
+                notes.append("Dry run: screenshots were not uploaded.")
+            elif settings.get("upload", True):
+                code, stdout, stderr = _run_group(
+                    publish_args, workspace, _harden_git(publish_env(dict(env))), publish_timeout
+                )
+                write_text(artifact_dir / "ui-diff.publish.stdout.txt", stdout)
+                write_text(artifact_dir / "ui-diff.publish.stderr.txt", stderr)
+                if code != 0:
+                    reason = _failure_reason(code, stdout, stderr, publish_timeout)
+                    if code == EXIT_GIT_ACCESS:
+                        reason = (
+                            f"the GitHub App could not push to the {branch} branch of {repo} "
+                            "(it needs the Contents: write permission)"
+                        )
+                    notes.append(f"Screenshots were not uploaded: {reason}.")
+                    status = "text-only"
+            else:
+                status = "text-only"
+                notes.append("Screenshots are not uploaded on this deployment (visual_outline.ui_diff.upload is off).")
+            if status == "text-only":
+                code, stdout, stderr = _run_group(publish_args + ["--no-upload"], workspace, _harden_git(env), publish_timeout)
+                write_text(artifact_dir / "ui-diff.render.stderr.txt", stderr)
+                if code != 0:
+                    reason = _failure_reason(code, stdout, stderr, publish_timeout)
+                    return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
+            try:
+                markdown = (published / "comment.md").read_text(encoding="utf-8")
+            except OSError as exc:
+                reason = f"ui-diff wrote no comment ({exc.__class__.__name__})"
                 return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
+        finally:
+            shutil.rmtree(str(workspace), ignore_errors=True)
     finally:
         slots.release()
-    comment_file = out_dir / "comment.md"
-    try:
-        markdown = comment_file.read_text(encoding="utf-8")
-    except OSError as exc:
-        reason = f"ui-diff wrote no comment ({exc.__class__.__name__})"
-        return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
     write_text(artifact_dir / "ui-diff.comment.md", markdown)
     report = out_dir / "report.json"
     if report.is_file():
