@@ -690,7 +690,10 @@ def sandbox_profile(
     if not isinstance(block, dict):
         return None
     service_root = Path(config_dir).resolve().parent
+    # Other runs' caches and temp directories; this run's own are granted below.
     deny = _secret_paths(config, config_dir, block) + [cache_root(config, config_dir)]
+    if scratch is not None:
+        deny.append(Path(str(scratch)).parent)
     deny_write: List[Any] = [service_root] + list(block.get("deny_write") or [])
     # Everything the unsandboxed publish step executes must be out of the run
     # step's reach: the directories on PATH, and every program it starts.
@@ -737,11 +740,7 @@ def sandbox_profile(
     lines += [f"(deny file-write* (literal {_quote(str(path))}))" for path in dict.fromkeys(allow)]
     # Their parent directories may be stat()ed (realpath, mkdir -p walk up the
     # tree), never listed or read.
-    ancestors: List[str] = []
-    for path in allow:
-        for parent in Path(path).parents:
-            if str(parent) != os.sep and str(parent) not in ancestors:
-                ancestors.append(str(parent))
+    ancestors = dict.fromkeys(str(parent) for path in allow for parent in Path(path).parents if str(parent) != os.sep)
     lines += [f"(allow file-read-metadata (literal {_quote(path)}))" for path in ancestors]
     return "\n".join(lines) + "\n"
 
@@ -1208,7 +1207,12 @@ def run_stage(
     # directory and the clone, nothing of the review's run directory.
     # Under a short root, whatever the work directory's depth: browsers put Unix
     # sockets under TMPDIR (a 104-byte path limit on macOS, 108 on Linux).
-    run_tmp = tempfile.mkdtemp(prefix="ud-", dir=_scratch_root())
+    try:
+        scratch_parent = scratch_root()
+        run_tmp = tempfile.mkdtemp(prefix="ud-", dir=str(scratch_parent))
+    except OSError as exc:
+        reason = _one_line(f"could not make the UI diff's temp directory: {exc}")
+        return Outcome(failure_section(reason, head_sha, clock() - started), "failed", reason)
     try:
         try:
             profile = sandbox_profile(config, config_dir, source=source, scratch=Path(run_tmp), repo=repo, cache=cache)
@@ -1324,10 +1328,23 @@ def run_stage(
             log(f"{repo} pr #{number}: ui-diff left {run_tmp} behind (could not remove it); remove it by hand")
 
 
-def _scratch_root() -> str:
-    """Where a run's temp directory goes: ``/tmp`` (``/private/tmp`` on macOS),
-    short enough for any socket a browser puts under it."""
-    return os.path.realpath("/tmp") if os.path.isdir("/tmp") else os.path.realpath(tempfile.gettempdir())
+#: The common parent of every run's temp directory, directly under /tmp so the
+#: paths stay short; the sandbox denies it and grants each run its own child.
+SCRATCH_PARENT = "rol-ud"
+
+
+def scratch_root() -> Path:
+    """``/tmp/rol-ud`` (``/private/tmp/rol-ud`` on macOS) as a checked plain
+    directory of mode 0700, short enough for any socket a browser puts under a
+    run's TMPDIR; the configured temp directory when /tmp cannot take it."""
+    for base in ("/tmp", tempfile.gettempdir()):
+        root = Path(os.path.realpath(base)) / SCRATCH_PARENT
+        try:
+            _plain_dir(root, repair=True)
+            return root
+        except (OSError, ValueError):
+            continue
+    raise OSError("no writable temp directory for the UI diff")
 
 
 #: How long a cancelled stage may take to stop: a poll, ui-diff's SIGTERM grace, the SIGKILL wait.

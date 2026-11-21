@@ -343,6 +343,8 @@ class SandboxTest(unittest.TestCase):
         # The granted roots cannot be swapped out from under the daemon.
         for path in (run + "/source", run + "/ud-x", repo_cache):
             self.assertIn(f'(deny file-write* (literal "{path}"))', after)
+        # Other runs' temp directories (the scratch parent) are denied; this one granted.
+        self.assertIn(f'(deny file-read* file-write* (subpath "{run}"))', lines)
         # The run directory itself (the service's artifacts) is not granted: its
         # entry may be stat()ed on the way to the clone, nothing more.
         self.assertIn(f'(allow file-read-metadata (literal "{run}"))', profile)
@@ -453,6 +455,16 @@ class SandboxTest(unittest.TestCase):
         path = ui_diff._run_path(settings, {"PATH": "../../../bin:/opt/tools/bin:.:bin"})
         self.assertEqual(path.split(os.pathsep)[:2], ["/usr/local/bin", "/opt/tools/bin"])
         self.assertTrue(all(os.path.isabs(entry) for entry in path.split(os.pathsep)))
+
+    def test_the_scratch_root_is_short_private_and_falls_back(self) -> None:
+        root = ui_diff.scratch_root()
+        self.assertEqual(root.name, ui_diff.SCRATCH_PARENT)
+        self.assertLess(len(str(root)), 30)
+        self.assertEqual(os.lstat(str(root)).st_mode & 0o777, 0o700)
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(ui_diff, "_plain_dir", side_effect=[OSError("read-only"), None]), \
+                    mock.patch.object(ui_diff.tempfile, "gettempdir", return_value=tmp):
+                self.assertEqual(ui_diff.scratch_root(), Path(os.path.realpath(tmp)) / ui_diff.SCRATCH_PARENT)
 
     def test_without_a_sandbox_a_symlinked_cache_is_kept(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -981,12 +993,14 @@ class RunStageTest(unittest.TestCase):
         artifact = work / "pr-7-run" / "artifacts" / "agent-answer.txt"
         sibling = work / "pr-8-run" / "source" / "theirs.txt"
         other_cache = Path(os.path.realpath(ui_diff.repository_cache_root(config, service, "acme-corp/other"))) / "home" / "x"
-        for path in (own, artifact, sibling, other_cache):
+        other_run = Path(tempfile.mkdtemp(prefix="ud-", dir=str(ui_diff.scratch_root()))) / "worktree.txt"
+        self.addCleanup(lambda: __import__("shutil").rmtree(str(other_run.parent), ignore_errors=True))
+        for path in (own, artifact, sibling, other_cache, other_run):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("original")
         own_cache = ui_diff.prepare_cache(config, service, REPO) / "home" / "mine.txt"
         (self.tmp / "tool" / "behaviour.json").write_text(json.dumps(
-            {"probe": [str(own), str(own_cache), str(artifact), str(sibling), str(other_cache)]}
+            {"probe": [str(own), str(own_cache), str(artifact), str(sibling), str(other_cache), str(other_run)]}
         ))
         outcome = ui_diff.run_stage(config, service, self.source, work / "pr-7-run" / "artifacts", REPO, _pr(),
                                     lambda env: env, self.logs.append, lambda p, t: p.write_text(t))
@@ -994,7 +1008,7 @@ class RunStageTest(unittest.TestCase):
         seen = next(record for record in self.records() if record["args"] == ["probe"])["seen"]
         self.assertEqual(seen[f"{own} write"], "ok")
         self.assertEqual(seen[f"{own_cache} write"], "ok")
-        for path in (artifact, sibling, other_cache):
+        for path in (artifact, sibling, other_cache, other_run):
             self.assertEqual((seen[f"{path} read"], seen[f"{path} write"]), ("PermissionError", "PermissionError"), path)
             self.assertEqual(path.read_text(), "original")
 
