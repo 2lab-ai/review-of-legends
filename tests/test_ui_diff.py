@@ -135,6 +135,74 @@ FAKE_UI_DIFF = textwrap.dedent(
 )
 
 
+FAKE_DOCKER = textwrap.dedent(
+    """
+    import io, json, os, shutil, subprocess, sys, tarfile
+    from pathlib import Path
+    # A docker CLI stand-in: each container is a directory; /work and /cache map into it.
+    state = Path(os.environ["DOCKER_FAKE_STATE"])
+    args = sys.argv[1:]
+    with (state / "docker.jsonl").open("a") as handle:
+        handle.write(json.dumps(args) + "\\n")
+    behaviour = json.loads((state / "docker-behaviour.json").read_text()) if (state / "docker-behaviour.json").exists() else {}
+
+    def mapped(text, root):
+        for prefix in ("/work", "/cache"):
+            if text == prefix or text.startswith(prefix + "/"):
+                return str(root / prefix.lstrip("/")) + text[len(prefix):]
+        return text
+
+    if args[0] == "create":
+        name = args[args.index("--name") + 1]
+        image = args.index(os.environ["DOCKER_FAKE_IMAGE"])
+        options, command = args[1:image], args[image + 1:]
+        env = dict(options[i + 1].split("=", 1) for i in range(len(options)) if options[i] == "-e")
+        workdir = options[options.index("-w") + 1]
+        root = state / name
+        (root / "work").mkdir(parents=True)
+        (root / "spec.json").write_text(json.dumps({"env": env, "command": command, "workdir": workdir}))
+        sys.exit(0)
+    if args[0] == "cp":
+        src, dst = args[1], args[2]
+        if dst == "-":
+            name, path = src.split(":", 1)
+            local = state / name / path.lstrip("/")
+            out = io.BytesIO()
+            with tarfile.open(fileobj=out, mode="w") as archive:
+                if behaviour.get("evil_tar"):
+                    def add(info, data=b""):
+                        info.size = len(data)
+                        archive.addfile(info, io.BytesIO(data) if data else None)
+                    add(tarfile.TarInfo(".ui-diff/../escaped.txt"), b"escaped")
+                    add(tarfile.TarInfo("/absolute.txt"), b"absolute")
+                    link = tarfile.TarInfo(".ui-diff/link.png"); link.type = tarfile.SYMTYPE; link.linkname = "/etc/passwd"
+                    add(link)
+                    hard = tarfile.TarInfo(".ui-diff/hard.png"); hard.type = tarfile.LNKTYPE; hard.linkname = ".ui-diff/report.json"
+                    add(hard)
+                    add(tarfile.TarInfo(".ui-diff/run/compare/home.png"), b"png")
+                else:
+                    archive.add(str(local), arcname=Path(path).name)
+            sys.stdout.buffer.write(out.getvalue())
+            sys.exit(0)
+        name, path = dst.split(":", 1)
+        shutil.copytree(src, state / name / path.lstrip("/") / Path(src).name, symlinks=True)
+        sys.exit(0)
+    if args[0] == "start":
+        name = args[-1]
+        root = state / name
+        spec = json.loads((root / "spec.json").read_text())
+        env = {key: mapped(value, root) for key, value in spec["env"].items()}
+        env["PATH"] = os.environ.get("PATH", "")
+        (root / "cache").mkdir(exist_ok=True)
+        sys.exit(subprocess.call([mapped(arg, root) for arg in spec["command"]], cwd=mapped(spec["workdir"], root), env=env))
+    if args[0] == "rm":
+        shutil.rmtree(state / args[-1], ignore_errors=True)
+        sys.exit(0)
+    sys.exit(125)
+    """
+)
+
+
 def _gone(pid: int, wait: float = 5.0) -> bool:
     """True once ``pid`` is dead (a zombie counts: init has not reaped it yet); kills it otherwise."""
     import time as _time
@@ -1051,6 +1119,143 @@ class RunStageTest(unittest.TestCase):
         outcome = ui_diff.Job(boom, HEAD).start().result(5)
         self.assertEqual(outcome.status, "failed")
         self.assertIn("RuntimeError: worker died", outcome.section)
+
+
+class ContainerTest(unittest.TestCase):
+    """The run step in a container (a fake docker CLI): what reaches it, what comes back."""
+
+    IMAGE = "acme/ui-diff:test"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(os.path.realpath(self._tmp.name))
+        self.source = self.tmp / "run" / "source"
+        self.source.mkdir(parents=True)
+        (self.source / "index.html").write_text("<html></html>")
+        self.artifacts = self.tmp / "run" / "artifacts"
+        self.artifacts.mkdir()
+        self.logs: list = []
+        self.docker = self.tmp / "docker-state"
+        self.docker.mkdir()
+        cli = self.tmp / "bin" / "docker"
+        cli.parent.mkdir()
+        cli.write_text(f"#!{sys.executable}\n" + FAKE_DOCKER)
+        cli.chmod(0o755)
+        self.config = _config(self.tmp)
+        settings = self.config["visual_outline"]["ui_diff"]
+        settings["container"] = {"image": self.IMAGE, "docker": str(cli), "command": list(settings["command"]),
+                                 "memory": "3g", "cpus": "2"}
+        settings["env"] = {"FAKE_RECORD": str(self.tmp / "record.jsonl")}
+        self.env = mock.patch.dict(os.environ, {"DOCKER_FAKE_STATE": str(self.docker), "DOCKER_FAKE_IMAGE": self.IMAGE,
+                                                "GITHUB_TOKEN": "host-token"})
+        self.env.start()
+
+    def tearDown(self) -> None:
+        self.env.stop()
+        self._tmp.cleanup()
+
+    def behaviour(self, **values) -> None:
+        (self.tmp / "behaviour.json").write_text(json.dumps(values), encoding="utf-8")
+
+    def records(self) -> list:
+        path = self.tmp / "record.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def docker_calls(self) -> list:
+        return [json.loads(line) for line in (self.docker / "docker.jsonl").read_text().splitlines()]
+
+    def run_stage(self, **kwargs) -> ui_diff.Outcome:
+        return ui_diff.run_stage(
+            self.config, self.tmp / "svc" / "config", self.source, self.artifacts, REPO, _pr(),
+            lambda env: {**env, "GH_TOKEN": "token-for-publish"}, self.logs.append,
+            lambda path, text: path.write_text(text), **kwargs,
+        )
+
+    def test_the_run_happens_in_a_locked_down_container_and_publish_on_the_host(self) -> None:
+        self.behaviour()
+        outcome = self.run_stage()
+        self.assertEqual(outcome.status, "ok", outcome.detail)
+        calls = self.docker_calls()
+        self.assertEqual([call[0] for call in calls], ["create", "cp", "start", "cp", "rm"])
+        create = calls[0]
+        for flag in (["--cap-drop", "ALL"], ["--security-opt", "no-new-privileges"], ["--memory", "3g"], ["--cpus", "2"],
+                     ["--user", f"{os.getuid()}:{os.getgid()}"]):
+            index = create.index(flag[0])
+            self.assertEqual(create[index:index + 2], flag)
+        volumes = [create[i + 1] for i, arg in enumerate(create) if arg == "-v"]
+        self.assertEqual(volumes, ["rol-ui-diff-acme-corp-web:/cache"], "no host path is mounted")
+        self.assertNotIn("docker.sock", " ".join(create))
+        env = [create[i + 1] for i, arg in enumerate(create) if arg == "-e"]
+        self.assertFalse([item for item in env if item.startswith(("GH_TOKEN", "GITHUB_TOKEN"))])
+        tail = create[create.index(self.IMAGE) + 1:]
+        self.assertEqual(tail[tail.index("--out") + 1], "/work/source/.ui-diff")
+        self.assertEqual(tail[tail.index("--config") + 1], "/work/source/ui-diff.config.json")
+        self.assertEqual(calls[1][1:], [str(self.source), f"{create[create.index('--name') + 1]}:/work/"])
+        run, publish = self.records()
+        self.assertEqual(run["args"][0], "run")
+        self.assertNotIn("GITHUB_TOKEN", run["env"])
+        self.assertEqual(publish["args"][0], "publish")
+        self.assertEqual(publish["env"]["GH_TOKEN"], "token-for-publish")
+        self.assertFalse(Path(publish["cwd"]).is_relative_to(self.source), "publish works outside the clone")
+        self.assertEqual(calls[-1][:2], ["rm", "-f"])
+        self.assertEqual(sorted(p.name for p in self.docker.iterdir()), ["docker.jsonl"], "the container is gone")
+
+    def test_only_regular_files_under_the_output_come_back(self) -> None:
+        self.behaviour()
+        (self.docker / "docker-behaviour.json").write_text(json.dumps({"evil_tar": True}))
+        outcome = self.run_stage()
+        self.assertEqual(outcome.status, "ok", outcome.detail)
+        self.assertEqual(self.records()[-1]["args"][0], "publish", "publish ran on what came back")
+        self.assertFalse((self.tmp / "escaped.txt").exists())
+        self.assertFalse((self.tmp / "run" / "escaped.txt").exists())
+        self.assertFalse(Path("/absolute.txt").exists())
+
+    def test_extraction_drops_links_and_names_outside_the_output(self) -> None:
+        import io, tarfile
+        archive = self.tmp / "out.tar"
+        with tarfile.open(str(archive), "w") as stream:
+            def add(name, data=b"", kind=tarfile.REGTYPE, link=""):
+                info = tarfile.TarInfo(name)
+                info.type, info.linkname, info.size = kind, link, len(data)
+                stream.addfile(info, io.BytesIO(data) if data else None)
+            add(".ui-diff/../escaped.txt", b"x")
+            add("/abs.txt", b"x")
+            add("other/file.txt", b"x")
+            add(".ui-diff/link.png", kind=tarfile.SYMTYPE, link="/etc/passwd")
+            add(".ui-diff/hard.png", kind=tarfile.LNKTYPE, link=".ui-diff/run/home.png")
+            add(".ui-diff/run/home.png", b"png")
+        dest = self.tmp / "dest"
+        dest.mkdir()
+        self.assertEqual(ui_diff.extract_output(archive, dest), 1)
+        found = sorted(str(path.relative_to(dest)) for path in dest.rglob("*") if path.is_file())
+        self.assertEqual(found, ["run/home.png"])
+        self.assertFalse((self.tmp / "escaped.txt").exists())
+
+    def test_a_run_past_its_timeout_removes_the_container(self) -> None:
+        self.behaviour(run_sleep=30)
+        self.config["visual_outline"]["ui_diff"]["timeout_seconds"] = 2
+        outcome = self.run_stage()
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("timed out", outcome.section)
+        self.assertEqual(self.docker_calls()[-1][:2], ["rm", "-f"])
+
+    def test_a_failed_create_says_why(self) -> None:
+        self.behaviour()
+        self.config["visual_outline"]["ui_diff"]["container"]["image"] = "acme/missing:1"
+        outcome = self.run_stage()
+        self.assertEqual(outcome.status, "failed")
+        self.assertEqual(self.records(), [], "nothing ran")
+        self.assertEqual(self.docker_calls()[-1][:2], ["rm", "-f"])
+
+    def test_the_container_block_is_validated(self) -> None:
+        base = {"repositories": [REPO]}
+        for bad in ([], {}, {"image": ""}, {"image": "-x"}, {"image": "a", "memory": "lots"},
+                    {"image": "a", "command": []}, {"image": "a", "pids_limit": 0}, {"image": "a", "mount": "/"}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                ui_diff.validate({**base, "visual_outline": {"ui_diff": {"container": bad}}})
+        ui_diff.validate({**base, "visual_outline": {"ui_diff": {"container": {
+            "image": "rol-ui-diff:3075b4c", "docker": "/usr/local/bin/docker", "memory": "3g", "cpus": "1.5",
+            "pids_limit": 2048, "command": ["node", "/opt/ui-diff/skills/ui-diff/bin/ui-diff.mjs"]}}}})
 
 
 class _Client:
