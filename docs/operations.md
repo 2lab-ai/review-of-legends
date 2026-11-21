@@ -749,7 +749,14 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   readable and writable again. Both are checked with `lstat` first and granted as checked, never
   re-resolved: a cache directory a PR's code swapped for a symlink is replaced by a fresh
   directory, a run directory that is not a plain directory fails the stage. The publish copy is
-  made under `cache_dir/publish`, which the run step can neither read nor write: under a sandbox the caches are kept per
+  made under `cache_dir/publish`, which the run step can neither read nor write. Every ancestor of
+  a protected directory, the two granted roots and the clone directory are pinned (no rename,
+  no replacement by a symlink). Beyond files, the profile refuses launchd job creation,
+  LaunchServices opens, AppleEvents, the keychain service and `osascript`/`automator`/
+  `shortcuts`/`open`; a program the PR's own code builds to send AppleEvents still needs macOS
+  Automation consent, which a headless review daemon does not hold. Publish also runs sandboxed,
+  with the secret paths unreadable, so a report the PR's code tampered with cannot make it upload
+  the App key: under a sandbox the caches are kept per
   repository (`cache_dir/repositories/<owner>/<name>`), so one repository's PR code cannot plant
   a package or a browser build another repository's run picks up. A protected program inside one
   of those two writable places fails the stage instead of running unprotected. Publish holds the
@@ -757,8 +764,8 @@ it on (`ui_diff: true` per repository, as above) and the deployment says how to 
   run step's processes were swept, inside the same slot. Set
   it on any host where a PR author must not reach other credentials. A configured sandbox fails
   closed: without `sandbox-exec` the PR's code is not run and the section says why. The work
-  directory and `cache_dir` must not sit under a `deny` path. Publish runs ui-diff's own code
-  outside the sandbox; everything it executes is write-protected from the run step.
+  directory and `cache_dir` must not sit under a `deny` path. This is an allow-default profile
+  that closes the paths and services above, not a full jail.
 - **Pushing needs Contents: write.** The default App has Contents: read; without write, the push is
   refused (ui-diff exits 3) and the section is posted text-only (changed captures, percentages,
   summary) with a note saying why. `upload: false` posts text-only on purpose.
